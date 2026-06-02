@@ -205,15 +205,22 @@ class CausalWanSelfAttention(nn.Module):
             sf = start_frame.to(torch.int32).reshape(1, 1)
             combined = build_rope_grids(
                 freqs_cos, freqs_sin, self.sign_pattern, sf,
-                F=f, H=h, W=w, head_dim=d).view(seq_len, 2 * d)
+                F=f, H=h, W=w, head_dim=d)[:seq_len]
             if cache_key is not None:
                 rope_grid_cache[cache_key] = combined
 
-        out = causal_rope_rotation(
-            x[0, :seq_len], combined,
-            head_start=head_start, head_end=head_end, head_dim=d)
+        n_local = head_end - head_start
+        P = 128
+        pad = (P - seq_len % P) % P
+        x_local = x[0, :seq_len, head_start:head_end, :]
+        x_padded = torch.nn.functional.pad(x_local, (0, 0, 0, 0, 0, pad))
+        combined_padded = torch.nn.functional.pad(combined, (0, 0, 0, pad))
 
-        return out.unsqueeze(0)
+        out = causal_rope_rotation(
+            x_padded, combined_padded,
+            num_heads=n_local, head_dim=d)
+
+        return out[:seq_len].unsqueeze(0)
 
     def _qkv_rope(self, x, grid_sizes, freqs_cos, freqs_sin, current_start,
                   rope_grid_cache=None, kv_cache=None):
