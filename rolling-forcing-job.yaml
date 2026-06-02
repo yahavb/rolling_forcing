@@ -122,11 +122,11 @@ spec:
             claims:
               - name: m-trn2
             requests:
-              cpu: 88
-              memory: 880Gi
+              cpu: 24
+              memory: 256Gi
             limits:
-              cpu: 88
-              memory: 880Gi
+              cpu: 24
+              memory: 256Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
