@@ -23,7 +23,7 @@ import torch.nn as nn
 from kernels.kv_cache_copy import cache_copy, kv_cache_copy
 from kernels.restore_layout import restore_layout
 from kernels.rope import causal_rope_rotation, build_rope_grids
-from kernels.self_attention import wan_flash_self_attn
+from kernels.self_attention_nst import wan_flash_self_attn
 from utils import _compile
 from utils import parallel_state as ps
 
