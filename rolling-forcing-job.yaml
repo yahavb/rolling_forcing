@@ -14,8 +14,8 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: s-lnc1-trn2
-          resourceClaimTemplateName: s-lnc1-trn2
+        - name: m-trn2
+          resourceClaimTemplateName: m-trn2
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -89,7 +89,7 @@ spec:
 
               # ─── Launch e2e pipeline (TP=4 x SP=2 = 8 ranks) ───────────
               echo "============================================"
-              echo "  Rolling Forcing: TP=4 SP=2 on s-lnc1-trn2"
+              echo "  Rolling Forcing: TP=4 SP=2 on m-trn2"
               echo "============================================"
 
               PROFILE_E2E_PIPELINE=1 \
@@ -120,13 +120,13 @@ spec:
               echo "═══════════════════════════════════════════"
           resources:
             claims:
-              - name: s-lnc1-trn2
+              - name: m-trn2
             requests:
-              cpu: 44
-              memory: 440Gi
+              cpu: 88
+              memory: 880Gi
             limits:
-              cpu: 44
-              memory: 440Gi
+              cpu: 88
+              memory: 880Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
