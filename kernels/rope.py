@@ -32,33 +32,28 @@ def causal_rope_rotation(
     N = head_end - head_start
     D = head_dim
 
-    x_heads = x[:seq_len, head_start:head_end, :]
+    x_heads = x[:seq_len, head_start:head_end, :].float()
 
-    cos_table = cos_sin[:seq_len, :D]
-    sin_table = cos_sin[:seq_len, D:]
+    cos_table = cos_sin[:seq_len, :D].unsqueeze(1).expand(seq_len, N, D)
+    sin_table = cos_sin[:seq_len, D:].unsqueeze(1).expand(seq_len, N, D)
 
-    cos_expanded = cos_table.unsqueeze(1).expand(seq_len, N, D)
-    sin_expanded = sin_table.unsqueeze(1).expand(seq_len, N, D)
+    x_cos = x_heads * cos_table
 
-    x_cos = x_heads.float() * cos_expanded
-
-    x_paired = x_heads.float().view(seq_len, N, D // 2, 2)
+    x_paired = x_heads.view(seq_len, N, D // 2, 2)
     x_even = x_paired[:, :, :, 0]
     x_odd = x_paired[:, :, :, 1]
 
-    sin_paired = sin_expanded.view(seq_len, N, D // 2, 2)
+    sin_paired = sin_table.view(seq_len, N, D // 2, 2)
     sin_even = sin_paired[:, :, :, 0]
     sin_odd = sin_paired[:, :, :, 1]
 
-    x_sin = torch.zeros_like(x_cos)
-    x_sin.view(seq_len, N, D // 2, 2)[:, :, :, 0] = x_odd * sin_even
-    x_sin.view(seq_len, N, D // 2, 2)[:, :, :, 1] = x_even * sin_odd
+    x_sin = torch.stack([x_odd * sin_even, x_even * sin_odd], dim=-1)
+    x_sin = x_sin.view(seq_len, N, D)
 
     out = (x_cos + x_sin).to(x.dtype)
     return out
 
 
-@_compile
 def build_rope_grids(
     freqs_cos,
     freqs_sin,
@@ -74,7 +69,7 @@ def build_rope_grids(
     s0 = c - 2 * (c // 3)
     s1 = c // 3
 
-    sf = start_frame.view(-1)[0].int()
+    sf = start_frame.view(-1)[0].item()
 
     frame_cos = freqs_cos[sf:sf + F, :s0]
     frame_sin = freqs_sin[sf:sf + F, :s0]
@@ -85,26 +80,24 @@ def build_rope_grids(
     w_cos = freqs_cos[:W, s0 + s1:s0 + 2 * s1]
     w_sin = freqs_sin[:W, s0 + s1:s0 + 2 * s1]
 
-    cos_grid = torch.zeros(F, H, W, c, dtype=torch.float32, device=freqs_cos.device)
-    cos_grid[:, :, :, :s0] = frame_cos.view(F, 1, 1, s0).expand(F, H, W, s0)
-    cos_grid[:, :, :, s0:s0 + s1] = h_cos.view(1, H, 1, s1).expand(F, H, W, s1)
-    cos_grid[:, :, :, s0 + s1:] = w_cos.view(1, 1, W, s1).expand(F, H, W, s1)
+    cos_grid = torch.cat([
+        frame_cos.view(F, 1, 1, s0).expand(F, H, W, s0),
+        h_cos.view(1, H, 1, s1).expand(F, H, W, s1),
+        w_cos.view(1, 1, W, s1).expand(F, H, W, s1),
+    ], dim=-1)
 
-    sin_grid = torch.zeros(F, H, W, c, dtype=torch.float32, device=freqs_sin.device)
-    sin_grid[:, :, :, :s0] = frame_sin.view(F, 1, 1, s0).expand(F, H, W, s0)
-    sin_grid[:, :, :, s0:s0 + s1] = h_sin.view(1, H, 1, s1).expand(F, H, W, s1)
-    sin_grid[:, :, :, s0 + s1:] = w_sin.view(1, 1, W, s1).expand(F, H, W, s1)
+    sin_grid = torch.cat([
+        frame_sin.view(F, 1, 1, s0).expand(F, H, W, s0),
+        h_sin.view(1, H, 1, s1).expand(F, H, W, s1),
+        w_sin.view(1, 1, W, s1).expand(F, H, W, s1),
+    ], dim=-1)
 
     sign = sign_pattern[:H, :D]
 
-    cos_expanded = cos_grid.unsqueeze(-1).expand(F, H, W, c, 2)
-    cos_flat = cos_expanded.reshape(F, H, W, D)
+    cos_flat = cos_grid.unsqueeze(-1).expand(F, H, W, c, 2).reshape(F, H, W, D)
 
-    sin_expanded = sin_grid.unsqueeze(-1).expand(F, H, W, c, 2)
-    sin_flat = sin_expanded.reshape(F, H, W, D)
-    sin_signed = sin_flat * sign.view(1, H, 1, D).expand(F, H, W, D)
+    sin_flat = sin_grid.unsqueeze(-1).expand(F, H, W, c, 2).reshape(F, H, W, D)
+    sin_signed = sin_flat * sign.view(1, H, 1, D)
 
     combined = torch.cat([cos_flat, sin_signed], dim=-1)
-    combined = combined.reshape(F * H, W * 2 * D)
-
-    return combined
+    return combined.reshape(F * H, W * 2 * D)
