@@ -147,8 +147,6 @@ spec:
               value: "--model-type=transformer"
             - name: NEURON_FALLBACK_ENABLED
               value: "0"
-            - name: NEURON_LOGICAL_NC_CONFIG
-              value: "1"
             - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
               value: "0"
             - name: HF_TOKEN
