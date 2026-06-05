@@ -29,8 +29,8 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: m-trn2
-          resourceClaimTemplateName: m-trn2
+        - name: s-lnc1-trn2
+          resourceClaimTemplateName: s-lnc1-trn2
       containers:
         - name: app
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -111,7 +111,7 @@ spec:
               torchrun --nproc_per_node 8 serve.py
           resources:
             claims:
-              - name: m-trn2
+              - name: s-lnc1-trn2
             requests:
               cpu: 24
               memory: 256Gi
