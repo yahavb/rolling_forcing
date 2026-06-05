@@ -101,54 +101,49 @@ def load_models(rank, world):
 # ─── Streaming decode (same fast path as e2e_pipeline.py) ────────────────────
 
 def stream_generate(pipe, vae, prompt_embeds, noise, rank, world):
-    """Yield (pixel_frames_list, chunk_idx) per DiT block."""
+    """Yield (chunk_device_tensors, chunk_idx) per DiT block.
+
+    Returns the on-device decoded tensors (before postprocess/CPU move)
+    so that gather can happen on-device.
+    """
     gen = pipe.inference_rolling_forcing_stream(noise, {"prompt_embeds": prompt_embeds})
 
     for chunk_idx, chunk in enumerate(gen):
         chunk_latent = w_shard(chunk, rank, world)
         chunk_device = vae.decode_to_pixel_device(
             chunk_latent, use_cache=True, chunk_idx=chunk_idx)
-        chunk_video = vae.postprocess_pixels(chunk_device)
-        yield chunk_video, chunk_idx
+        yield chunk_device, chunk_idx
 
 
-def full_generate(pipe, vae, prompt_embeds, noise, rank, world):
-    """Full video generation, returns concatenated pixel tensor."""
-    video_chunks = []
-    vae.model.clear_cache()
-    for chunk_video, _ in stream_generate(pipe, vae, prompt_embeds, noise, rank, world):
-        video_chunks.append(chunk_video)
-    return torch.cat(video_chunks, dim=1)
+def gather_and_postprocess(chunk_device, rank, world):
+    """Gather width shards on-device, then postprocess to CPU frames on rank 0.
 
-
-# ─── Pixel tensor to frames/video ───────────────────────────────────────────
-
-def pixels_to_frames(video_tensor):
-    """Convert [1, T, C, H, W_local] float tensor to list of PIL Images.
-
-    For width-sharded VAE, we need to gather across ranks first.
-    But in the e2e_pipeline path, each rank has its local shard.
-    On rank 0, we gather all shards.
+    chunk_device is a list of on-device tensors from VAE decode.
+    Each tensor is [1, C, T_chunk, H, W_local] on neuron device.
+    We cat them, gather across width, then move to CPU.
+    Returns PIL frames list on rank 0, None on other ranks.
     """
-    video = (video_tensor * 0.5 + 0.5).clamp(0, 1)
-    video = video[0]  # [T, C, H, W]
-    video = video.permute(0, 2, 3, 1)  # [T, H, W, C]
+    # Cat the per-frame outputs into one tensor [1, C, T, H, W_local]
+    device_tensor = torch.cat(chunk_device, dim=2)
+
+    if world > 1:
+        gathered = [torch.empty_like(device_tensor) for _ in range(world)]
+        dist.all_gather(gathered, device_tensor.contiguous())
+        if rank == 0:
+            full_tensor = torch.cat(gathered, dim=-1)  # cat along W
+        else:
+            return None
+    else:
+        full_tensor = device_tensor
+
+    # Now move to CPU and convert to frames
+    # full_tensor: [1, C, T, H, W] on device
+    video = full_tensor.cpu().float()
+    video = video[0]  # [C, T, H, W]
+    video = video.permute(1, 2, 3, 0)  # [T, H, W, C]
+    video = (video * 0.5 + 0.5).clamp(0, 1)
     video_np = (255.0 * video).to(torch.uint8).numpy()
     return [Image.fromarray(video_np[i]) for i in range(video_np.shape[0])]
-
-
-def gather_width_shards(local_tensor, rank, world):
-    """All-gather width-sharded pixel tensors to get full frame on rank 0."""
-    if world == 1:
-        return local_tensor
-
-    # local_tensor: [1, T, C, H, W_local]
-    gathered = [torch.empty_like(local_tensor) for _ in range(world)]
-    dist.all_gather(gathered, local_tensor.contiguous())
-
-    if rank == 0:
-        return torch.cat(gathered, dim=-1)  # cat along W
-    return None
 
 
 # ─── Worker loop (ranks 1+) ─────────────────────────────────────────────────
@@ -191,15 +186,10 @@ def worker_loop(text_encoder, pipe, vae, rank, world):
 
             # Run generation (all ranks participate in DiT + VAE collectives)
             vae.model.clear_cache()
-            if cmd_val == CMD_STREAM:
-                for chunk_video, chunk_idx in stream_generate(
-                    pipe, vae, prompt_embeds, noise, rank, world
-                ):
-                    # Gather width shards so rank 0 has full frames
-                    gather_width_shards(chunk_video, rank, world)
-            else:
-                video = full_generate(pipe, vae, prompt_embeds, noise, rank, world)
-                gather_width_shards(video, rank, world)
+            for chunk_device, chunk_idx in stream_generate(
+                pipe, vae, prompt_embeds, noise, rank, world
+            ):
+                gather_and_postprocess(chunk_device, rank, world)
 
 
 # ─── Server (rank 0) ────────────────────────────────────────────────────────
@@ -254,16 +244,13 @@ def run_server(text_encoder, pipe, vae, rank, world):
 
                 vae.model.clear_cache()
                 frame_count = 0
-                num_frame_per_block = pipe.num_frame_per_block
                 # Estimate total pixel frames (4x temporal upsampling)
                 total_pixel_frames = (num_frames - 1) * 4 + 1
 
-                for chunk_video, chunk_idx in stream_generate(
+                for chunk_device, chunk_idx in stream_generate(
                     pipe, vae, prompt_embeds, noise, rank, world
                 ):
-                    # Gather full-width frames on rank 0
-                    full_video = gather_width_shards(chunk_video, rank, world)
-                    frames = pixels_to_frames(full_video)
+                    frames = gather_and_postprocess(chunk_device, rank, world)
 
                     for frame in frames:
                         buf = BytesIO()
@@ -307,9 +294,14 @@ def run_server(text_encoder, pipe, vae, rank, world):
             ).to(NEURON_DEVICE)
 
             vae.model.clear_cache()
-            video = full_generate(pipe, vae, prompt_embeds, noise, rank, world)
-            full_video = gather_width_shards(video, rank, world)
-            frames = pixels_to_frames(full_video)
+            all_frames = []
+            for chunk_device, chunk_idx in stream_generate(
+                pipe, vae, prompt_embeds, noise, rank, world
+            ):
+                frames = gather_and_postprocess(chunk_device, rank, world)
+                if frames:
+                    all_frames.extend(frames)
+            frames = all_frames
 
             # Encode frames
             frames_b64 = []
@@ -399,15 +391,17 @@ def main():
         ).to(NEURON_DEVICE)
 
         vae.model.clear_cache()
-        for chunk_video, chunk_idx in stream_generate(
+        for chunk_device, chunk_idx in stream_generate(
             pipe, vae, prompt_embeds, noise, rank, world
         ):
+            # Run gather to match serving code path (triggers all collective compilation)
+            gather_and_postprocess(chunk_device, rank, world)
             if rank == 0:
                 torch.neuron.synchronize()
                 elapsed = (time.perf_counter() - t0) * 1000
-                frames = chunk_video.shape[1] if chunk_video.dim() >= 2 else 0
+                n_frames = len(chunk_device)
                 logger.info("  warmup block %2d: %d frames (%.1f s elapsed)",
-                            chunk_idx, frames, elapsed / 1000)
+                            chunk_idx, n_frames, elapsed / 1000)
                 t0 = time.perf_counter()
 
         dist.barrier()
