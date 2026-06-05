@@ -39,6 +39,12 @@ from models.vae import (
     init_vae_parallel_group,
 )
 from utils import w_shard
+from utils.flops import (
+    TFLOPSMeter,
+    compute_dit_flops_per_step,
+    compute_t5_flops,
+    compute_vae_flops_approx,
+)
 from utils.logging_utils import configure_logging, get_logger
 from utils.rng import restore_cpu_rng
 from utils.video import gather_and_save
@@ -140,6 +146,29 @@ def main():
     dist.barrier()
 
     profile = os.environ.get("PROFILE_E2E_PIPELINE", "0") == "1"
+    measure_tflops = os.environ.get("MEASURE_TFLOPS", "0") == "1"
+
+    meter = None
+    if measure_tflops and rank == 0:
+        meter = TFLOPSMeter(num_cores=world)
+
+    # Precompute FLOPs estimates for DiT/T5/VAE
+    num_denoising_steps = 5  # from rolling_forcing_dmd.yaml denoising_step_list
+    frame_seq_length = pipe.frame_seq_length
+    num_frames_per_block = pipe.num_frame_per_block
+    dit_flops_per_step = compute_dit_flops_per_step(
+        dim=pipe.generator.model.dim,
+        ffn_dim=pipe.generator.model.ffn_dim,
+        num_heads=pipe.generator.model.num_heads,
+        num_layers=pipe.generator.model.num_layers,
+        text_len=pipe.generator.model.text_len,
+        num_frames=args.num_output_frames,
+        frame_seq_length=frame_seq_length,
+    )
+    t5_flops = compute_t5_flops()
+    vae_flops_per_chunk = compute_vae_flops_approx(
+        num_frames=num_frames_per_block,
+    )
 
     for prompt_idx, prompt in enumerate(prompts):
         sample_name = f"prompt_{prompt_idx:03d}.pt"
@@ -154,20 +183,46 @@ def main():
             logger.info("[prompt %3d/%d] %s...",
                         prompt_idx, len(prompts), prompt[:60])
 
-        if profile:
+        if profile or meter:
             torch.neuron.synchronize()
             t = time.perf_counter()
         prompt_embeds = encode_one_prompt(text_encoder, prompt)
-        if profile:
+        if profile or meter:
             torch.neuron.synchronize()
-            t5_ms = (time.perf_counter() - t) * 1000
-            logger.info("  T5:          %7.1f ms", t5_ms)
+            t5_elapsed = time.perf_counter() - t
+            if profile:
+                logger.info("  T5:          %7.1f ms", t5_elapsed * 1000)
+            if meter:
+                meter.record(f"T5 (prompt {prompt_idx})", t5_elapsed, t5_flops)
+
+        if meter:
+            torch.neuron.synchronize()
+            dit_vae_start = time.perf_counter()
 
         video_local = stream_decode_prompt(
             pipe, vae, prompt_embeds, noise, rank, world, profile=profile)
 
+        if meter:
+            torch.neuron.synchronize()
+            dit_vae_elapsed = time.perf_counter() - dit_vae_start
+            # DiT: rolling forcing has (num_blocks + num_denoising_steps - 1) windows
+            num_blocks = args.num_output_frames // num_frames_per_block
+            num_windows = num_blocks + num_denoising_steps - 1
+            total_dit_flops = dit_flops_per_step * num_windows
+            # VAE: one chunk per streaming yield (num_blocks total)
+            total_vae_flops = vae_flops_per_chunk * num_blocks
+            meter.record(
+                f"DiT+VAE (prompt {prompt_idx})",
+                dit_vae_elapsed,
+                total_dit_flops + total_vae_flops,
+            )
+
         out_path = os.path.join(args.output_folder, f"prompt_{prompt_idx:03d}.mp4")
         gather_and_save(video_local, out_path, args.fps, rank, world)
+
+    if meter:
+        report_path = os.path.join(args.output_folder, "tflops_report.json")
+        meter.save(report_path)
 
     destroy_t5_parallel_group()
     destroy_parallel_groups()

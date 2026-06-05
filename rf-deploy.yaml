@@ -1,23 +1,38 @@
-apiVersion: batch/v1
-kind: Job
+apiVersion: v1
+kind: Service
 metadata:
-  name: rolling-forcing
+  name: rf
   namespace: default
 spec:
-  backoffLimit: 0
+  selector:
+    app: rf
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rf
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rf
   template:
     metadata:
       labels:
-        app: rolling-forcing
+        app: rf
     spec:
-      restartPolicy: Never
       nodeSelector:
         node-type: trn2
       resourceClaims:
         - name: m-trn2
           resourceClaimTemplateName: m-trn2
       containers:
-        - name: inference
+        - name: app
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
           imagePullPolicy: IfNotPresent
           command:
@@ -40,11 +55,13 @@ spec:
                 "omegaconf==2.3.0" \
                 "ftfy==6.3.1" \
                 "regex==2026.5.9" \
-                "av==17.0.1"
+                "av==17.0.1" \
+                "fastapi" \
+                "uvicorn[standard]" \
+                "pillow"
 
               # ─── Model weights: Wan2.1-T2V-1.3B (T5 + VAE) ─────────────
               WAN_TAR="/var/mdl/rolling_forcing/Wan2.1-T2V-1.3B.tar"
-              WAN_LOCAL="/tmp/rolling_forcing/wan_models/Wan2.1-T2V-1.3B"
 
               if [[ -f "$WAN_TAR" ]]; then
                 echo "Extracting Wan2.1-T2V-1.3B from S3 cache..."
@@ -61,7 +78,6 @@ spec:
                 mkdir -p "$(dirname $WAN_TAR)"
                 cp /tmp/Wan2.1-T2V-1.3B.tar "$WAN_TAR"
                 rm -f /tmp/Wan2.1-T2V-1.3B.tar
-                echo "Cached Wan2.1-T2V-1.3B to S3!"
               fi
 
               # ─── Model weights: Rolling-forcing DMD checkpoint ──────────
@@ -82,88 +98,17 @@ spec:
                 mkdir -p "$(dirname $DMD_TAR)"
                 cp /tmp/rolling_forcing_dmd.tar "$DMD_TAR"
                 rm -f /tmp/rolling_forcing_dmd.tar
-                echo "Cached DMD checkpoint to S3!"
               fi
 
               echo "Model weights ready."
 
-              # ─── Neuron Profiler: capture device-level traces ────────
-              export NEURON_RT_INSPECT_ENABLE=1
-              export NEURON_RT_INSPECT_OUTPUT_DIR=/tmp/neuron_profile
-              export NEURON_RT_INSPECT_DEVICE_PROFILE=session
-              mkdir -p /tmp/neuron_profile
-
-              # ─── Launch e2e pipeline (TP=4 x SP=2 = 8 ranks) ───────────
+              # ─── Launch serve.py (TP=4 x SP=2 = 8 ranks) ───────────────
               echo "============================================"
-              echo "  Rolling Forcing: TP=4 SP=2 on m-trn2"
-              echo "  Neuron Profiler + TFLOPS/MFU measurement"
+              echo "  Rolling Forcing Serving: TP=4 SP=2"
+              echo "  Using e2e_pipeline fast path"
               echo "============================================"
 
-              PROFILE_E2E_PIPELINE=1 MEASURE_TFLOPS=1 \
-                torchrun --nproc_per_node 8 e2e_pipeline.py \
-                --prompt_file prompts/example_prompts.txt \
-                --output_folder videos_pipeline \
-                --config_path configs/rolling_forcing_dmd.yaml \
-                --checkpoint_path checkpoints/rolling_forcing_dmd.pt \
-                --tp_degree 4 \
-                --num_output_frames 126 \
-                --chunk-size 3 \
-                --fps 16 \
-                --use_ema 2>&1 || true
-
-              # ─── Neuron Explorer: analyze traces ───────────────────────
-              NTFF_DIR=$(find /tmp/neuron_profile -mindepth 2 -maxdepth 2 -type d 2>/dev/null | head -1)
-              if [[ -n "$NTFF_DIR" ]]; then
-                echo ""
-                echo "============================================"
-                echo "  NEURON EXPLORER ANALYSIS"
-                echo "============================================"
-
-                neuron-explorer view -d "$NTFF_DIR" \
-                  --output-format summary-text \
-                  --ignore-dma-trace 2>&1 | tee /tmp/neuron_explorer_summary.txt || true
-
-                neuron-explorer view -d "$NTFF_DIR" \
-                  --output-format json \
-                  --output-file /tmp/neuron_explorer_profile.json \
-                  --ignore-dma-trace 2>&1 || true
-
-                echo ""
-                echo "=== NEFF COUNT AND SIZE DISTRIBUTION ==="
-                NEFF_COUNT=$(find "$NTFF_DIR" -name '*.neff' | wc -l)
-                echo "Total NEFFs: $NEFF_COUNT"
-                find "$NTFF_DIR" -name '*.neff' -exec ls -l '{}' ';' | awk '{print $5}' | sort -n | awk '
-                  BEGIN { count=0; sum=0 }
-                  { sizes[count++]=$1; sum+=$1 }
-                  END {
-                    if (count == 0) { print "No NEFFs found"; exit }
-                    printf "Total size: %.2f MB\n", sum/1024/1024
-                    printf "Min: %d bytes  Max: %d bytes (%.2f MB)\n", sizes[0], sizes[count-1], sizes[count-1]/1024/1024
-                    printf "Median: %d bytes  Mean: %.0f bytes\n", sizes[int(count/2)], sum/count
-                  }'
-              else
-                echo "WARNING: No NTFF directory found — profiling may not have captured traces"
-              fi
-
-              # ─── Collect outputs ────────────────────────────────────────
-              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-              ARCHIVE_DIR="/var/mdl/rolling_forcing/runs/${TIMESTAMP}"
-              mkdir -p "$ARCHIVE_DIR"
-
-              if [[ -d videos_pipeline ]]; then
-                cp videos_pipeline/*.mp4 "$ARCHIVE_DIR/" 2>/dev/null || true
-                cp videos_pipeline/tflops_report.json "$ARCHIVE_DIR/" 2>/dev/null || true
-              fi
-              cp /tmp/neuron_explorer_summary.txt "$ARCHIVE_DIR/" 2>/dev/null || true
-              cp /tmp/neuron_explorer_profile.json "$ARCHIVE_DIR/" 2>/dev/null || true
-              cp -r /tmp/neuron_profile "$ARCHIVE_DIR/profiles" 2>/dev/null || true
-
-              echo "Archived to $ARCHIVE_DIR"
-              ls -la "$ARCHIVE_DIR/" 2>/dev/null || true
-
-              echo "═══════════════════════════════════════════"
-              echo "  Done! Rolling Forcing profiling complete"
-              echo "═══════════════════════════════════════════"
+              torchrun --nproc_per_node 8 serve.py
           resources:
             claims:
               - name: m-trn2
@@ -195,6 +140,18 @@ spec:
               value: "0"
             - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
               value: "0"
+            - name: TP_DEGREE
+              value: "4"
+            - name: DEFAULT_NUM_FRAMES
+              value: "126"
+            - name: DEFAULT_FPS
+              value: "16"
+            - name: CONFIG_PATH
+              value: "configs/rolling_forcing_dmd.yaml"
+            - name: CHECKPOINT_PATH
+              value: "checkpoints/rolling_forcing_dmd.pt"
+            - name: WARMUP_FRAMES
+              value: "21"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -205,6 +162,34 @@ spec:
                 secretKeyRef:
                   name: github-token
                   key: GITHUB_TOKEN
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 30
+            timeoutSeconds: 100
+            failureThreshold: 475
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 600
+            periodSeconds: 300
+            successThreshold: 1
+            failureThreshold: 1000
+            timeoutSeconds: 60
       volumes:
         - name: dshm
           emptyDir:
