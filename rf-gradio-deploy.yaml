@@ -50,7 +50,7 @@ spec:
               subPath: rf_gradio_app.py
           env:
             - name: DEFAULT_NUM_FRAMES
-              value: "126"
+              value: "21"
           ports:
             - containerPort: 8000
               protocol: TCP
