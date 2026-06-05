@@ -183,6 +183,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 local_attn_size=local_attn_size,
                 sink_size=sink_size,
                 num_layers=num_layers,
+                frame_length=frame_seq_length,
             )
         self.generator = generator
         self.tp_degree = ps.get_world_size("attn-tp") if ps.is_registered("attn-tp") else 1

@@ -77,7 +77,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 frame_length=1560):
         super().__init__()
 
         assert model_type == 't2v'
@@ -112,7 +113,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             AttentionBlock(
                 't2v_cross_attn', dim, ffn_dim, num_heads,
                 local_attn_size, sink_size, qk_norm, cross_attn_norm,
-                eps, layer_idx)
+                eps, layer_idx, frame_length=frame_length)
             for layer_idx in range(num_layers)
         ])
 
@@ -246,6 +247,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             local_attn_size=-1,
             sink_size=0,
             num_layers=None,
+            frame_length=1560,
     ):
         super().__init__()
 
@@ -254,6 +256,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         kwargs = dict(
             local_attn_size=local_attn_size, sink_size=sink_size,
             torch_dtype=torch.bfloat16,
+            frame_length=frame_length,
         )
         if num_layers is not None:
             kwargs["num_layers"] = num_layers

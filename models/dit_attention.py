@@ -66,7 +66,8 @@ class CausalWanSelfAttention(nn.Module):
                  sink_size=1,
                  qk_norm=True,
                  eps=1e-6,
-                 layer_idx=0):
+                 layer_idx=0,
+                 frame_length=1560):
         assert dim % num_heads == 0
         assert qk_norm, "qk_norm must be True"
         super().__init__()
@@ -75,7 +76,7 @@ class CausalWanSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.local_attn_size = local_attn_size
         self.eps = eps
-        self.frame_length = 1560
+        self.frame_length = frame_length
         self.max_attention_size = 21 * self.frame_length
         self.block_length = 3 * self.frame_length
         self.kv_cache_logical_size = 24 * self.frame_length
@@ -593,7 +594,8 @@ class CausalWanAttentionBlock(nn.Module):
                  qk_norm=True,
                  cross_attn_norm=False,
                  eps=1e-6,
-                 layer_idx=0):
+                 layer_idx=0,
+                 frame_length=1560):
         super().__init__()
         assert cross_attn_type == 't2v_cross_attn'
         assert cross_attn_norm
@@ -607,7 +609,8 @@ class CausalWanAttentionBlock(nn.Module):
         self.norm2 = WanLayerNorm(dim, eps)
 
         self.self_attn = CausalWanSelfAttention(
-            dim, num_heads, local_attn_size, sink_size, qk_norm, eps, layer_idx)
+            dim, num_heads, local_attn_size, sink_size, qk_norm, eps, layer_idx,
+            frame_length=frame_length)
         self.cross_attn = WanT2VCrossAttention(
             dim, num_heads, (-1, -1), qk_norm, eps, layer_idx=layer_idx)
 
