@@ -47,6 +47,8 @@ def main():
     parser.add_argument("--tp_degree", type=int, default=1,
                         help="Tensor-parallel degree for self-attention. "
                              "sp_degree is derived as world_size // tp_degree.")
+    parser.add_argument("--latent_h", type=int, default=60)
+    parser.add_argument("--latent_w", type=int, default=104)
     args = parser.parse_args()
 
     os.environ.setdefault("NEURON_FALLBACK_ENABLED", "0")
@@ -81,7 +83,7 @@ def main():
                 hash(torch.random.get_rng_state().numpy().tobytes()))
 
     noise = torch.randn(
-        1, args.num_output_frames, 16, 60, 104, dtype=torch.bfloat16
+        1, args.num_output_frames, 16, args.latent_h, args.latent_w, dtype=torch.bfloat16
     ).to("neuron")
     conditional_dict = {"prompt_embeds": prompt_embeds.to("neuron")}
 

@@ -66,6 +66,8 @@ def parse_args():
     p.add_argument("--rng_state_path", type=str, default=None,
                    help="Directory of per-prompt CPU RNG states, or a single .pt file.")
     p.add_argument("--output_folder", type=str, default="videos")
+    p.add_argument("--latent_h", type=int, default=60)
+    p.add_argument("--latent_w", type=int, default=104)
     p.add_argument("--chunk-size", type=int, default=3,
                    help="VAE streaming chunk size (frames per decode call).")
     p.add_argument("--fps", type=int, default=16)
@@ -175,7 +177,7 @@ def main():
         restore_cpu_rng(args.rng_state_path, sample_name=sample_name,
                         verbose=(rank == 0))
         noise = torch.randn(
-            1, args.num_output_frames, 16, 60, 104, dtype=torch.bfloat16,
+            1, args.num_output_frames, 16, args.latent_h, args.latent_w, dtype=torch.bfloat16,
         ).to("neuron")
         vae.model.clear_cache()
 

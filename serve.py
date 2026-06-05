@@ -60,6 +60,8 @@ DEFAULT_FPS = int(os.environ.get("DEFAULT_FPS", "16"))
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "configs/rolling_forcing_dmd.yaml")
 CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", "checkpoints/rolling_forcing_dmd.pt")
 WARMUP_FRAMES = int(os.environ.get("WARMUP_FRAMES", "21"))
+LATENT_H = int(os.environ.get("LATENT_H", "60"))
+LATENT_W = int(os.environ.get("LATENT_W", "104"))
 
 # Commands for rank coordination
 CMD_STREAM = 2
@@ -181,7 +183,7 @@ def worker_loop(text_encoder, pipe, vae, rank, world):
             # Generate noise (deterministic)
             torch.manual_seed(seed)
             noise = torch.randn(
-                1, num_frames, 16, 60, 104, dtype=torch.bfloat16,
+                1, num_frames, 16, LATENT_H, LATENT_W, dtype=torch.bfloat16,
             ).to(NEURON_DEVICE)
 
             # Run generation (all ranks participate in DiT + VAE collectives)
@@ -239,7 +241,7 @@ def run_server(text_encoder, pipe, vae, rank, world):
                 # Noise (same seed as workers)
                 torch.manual_seed(seed)
                 noise = torch.randn(
-                    1, num_frames, 16, 60, 104, dtype=torch.bfloat16,
+                    1, num_frames, 16, LATENT_H, LATENT_W, dtype=torch.bfloat16,
                 ).to(NEURON_DEVICE)
 
                 vae.model.clear_cache()
@@ -290,7 +292,7 @@ def run_server(text_encoder, pipe, vae, rank, world):
 
             torch.manual_seed(seed)
             noise = torch.randn(
-                1, num_frames, 16, 60, 104, dtype=torch.bfloat16,
+                1, num_frames, 16, LATENT_H, LATENT_W, dtype=torch.bfloat16,
             ).to(NEURON_DEVICE)
 
             vae.model.clear_cache()
@@ -387,7 +389,7 @@ def main():
 
         torch.manual_seed(42)
         noise = torch.randn(
-            1, WARMUP_FRAMES, 16, 60, 104, dtype=torch.bfloat16,
+            1, WARMUP_FRAMES, 16, LATENT_H, LATENT_W, dtype=torch.bfloat16,
         ).to(NEURON_DEVICE)
 
         vae.model.clear_cache()

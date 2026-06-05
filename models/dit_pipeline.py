@@ -117,6 +117,7 @@ def build_dit_pipeline(config_path, checkpoint_path, tp_degree, use_ema):
         warp_denoising_step=getattr(config, "warp_denoising_step", True),
         model_name=getattr(config, "model_name", "Wan2.1-T2V-1.3B"),
         timestep_shift=getattr(config, "timestep_shift", 5.0),
+        frame_seq_length=getattr(config, "frame_seq_length", 1560),
     )
 
     if checkpoint_path:

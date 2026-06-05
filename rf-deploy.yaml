@@ -147,11 +147,15 @@ spec:
             - name: DEFAULT_FPS
               value: "16"
             - name: CONFIG_PATH
-              value: "configs/rolling_forcing_dmd.yaml"
+              value: "configs/rolling_forcing_dmd_320x576.yaml"
             - name: CHECKPOINT_PATH
               value: "checkpoints/rolling_forcing_dmd.pt"
             - name: WARMUP_FRAMES
               value: "21"
+            - name: LATENT_H
+              value: "40"
+            - name: LATENT_W
+              value: "72"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
