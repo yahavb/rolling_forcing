@@ -113,11 +113,11 @@ spec:
             claims:
               - name: s-lnc1-trn2
             requests:
-              cpu: 12
-              memory: 122Gi
+              cpu: 36
+              memory: 366Gi
             limits:
-              cpu: 12
-              memory: 122Gi
+              cpu: 36
+              memory: 366Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
