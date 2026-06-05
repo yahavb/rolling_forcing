@@ -385,7 +385,13 @@ def main():
             logger.info("Warmup: generating %d frames to trigger compilation...", WARMUP_FRAMES)
 
         warmup_prompt = "A cat walking on the beach at sunset"
+
+        if rank == 0:
+            t0 = time.perf_counter()
         prompt_embeds = encode_one_prompt(text_encoder, warmup_prompt)
+        if rank == 0:
+            torch.neuron.synchronize()
+            logger.info("  T5: %.1f ms", (time.perf_counter() - t0) * 1000)
 
         torch.manual_seed(42)
         noise = torch.randn(
@@ -396,7 +402,13 @@ def main():
         for chunk_video, chunk_idx in stream_generate(
             pipe, vae, prompt_embeds, noise, rank, world
         ):
-            pass  # just trigger compilation
+            if rank == 0:
+                torch.neuron.synchronize()
+                elapsed = (time.perf_counter() - t0) * 1000
+                frames = chunk_video.shape[1] if chunk_video.dim() >= 2 else 0
+                logger.info("  warmup block %2d: %d frames (%.1f s elapsed)",
+                            chunk_idx, frames, elapsed / 1000)
+                t0 = time.perf_counter()
 
         dist.barrier()
         if rank == 0:
