@@ -24,23 +24,21 @@ import nki
 from torch_neuronx import wrap_nki
 
 
-_FRAME_SEQLEN = 1560
-_L_CU = 3 * _FRAME_SEQLEN
-_L_DN = 15 * _FRAME_SEQLEN
-
-
 @wrap_nki
 @nki.jit
-def restore_layout(gathered: nl.ndarray, N: int = 2):
+def restore_layout(gathered: nl.ndarray, N: int = 2, nfpb: int = 3, max_frames: int = 15, frame_seqlen: int = 1560):
     L_full, dim = gathered.shape
+    L_cu = nfpb * frame_seqlen
+    L_dn = max_frames * frame_seqlen
+
     kernel_assert(
-        L_full == _L_CU + _L_DN,
-        f"restore_layout expects L_full = {_L_CU + _L_DN}, got {L_full}",
+        L_full == L_cu + L_dn,
+        f"restore_layout expects L_full = {L_cu + L_dn}, got {L_full}",
     )
 
     L_full_N = L_full // N
-    L_cu_N = _L_CU // N
-    L_dn_N = _L_DN // N
+    L_cu_N = L_cu // N
+    L_dn_N = L_dn // N
 
     out = nl.ndarray(shape=(L_full, dim), dtype=gathered.dtype, buffer=nl.shared_hbm)
 
@@ -50,7 +48,7 @@ def restore_layout(gathered: nl.ndarray, N: int = 2):
             src=gathered[nl.ds(w * L_full_N, L_cu_N), :],
         )
         nisa.dma_copy(
-            dst=out[nl.ds(_L_CU + w * L_dn_N, L_dn_N), :],
+            dst=out[nl.ds(L_cu + w * L_dn_N, L_dn_N), :],
             src=gathered[nl.ds(w * L_full_N + L_cu_N, L_dn_N), :],
         )
 
