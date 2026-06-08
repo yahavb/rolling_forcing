@@ -14,8 +14,8 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: s-lnc1-trn2
-          resourceClaimTemplateName: s-lnc1-trn2
+        - name: m-trn2
+          resourceClaimTemplateName: m-trn2
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -101,12 +101,10 @@ spec:
                 torchrun --nproc_per_node 8 e2e_pipeline.py \
                 --prompt_file prompts/example_prompts.txt \
                 --output_folder videos_pipeline \
-                --config_path configs/rolling_forcing_dmd_320x576.yaml \
+                --config_path configs/rolling_forcing_dmd.yaml \
                 --checkpoint_path checkpoints/rolling_forcing_dmd.pt \
                 --tp_degree 4 \
                 --num_output_frames 21 \
-                --latent_h 40 \
-                --latent_w 72 \
                 --chunk-size 3 \
                 --fps 16 \
                 --use_ema 2>&1 || true
@@ -196,13 +194,13 @@ spec:
               echo "═══════════════════════════════════════════"
           resources:
             claims:
-              - name: s-lnc1-trn2
+              - name: m-trn2
             requests:
-              cpu: 36
-              memory: 366Gi
+              cpu: 24
+              memory: 256Gi
             limits:
-              cpu: 36
-              memory: 366Gi
+              cpu: 24
+              memory: 256Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
