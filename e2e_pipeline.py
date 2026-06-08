@@ -150,6 +150,34 @@ def main():
     profile = os.environ.get("PROFILE_E2E_PIPELINE", "0") == "1"
     measure_tflops = os.environ.get("MEASURE_TFLOPS", "0") == "1"
 
+    # Native PyTorch Neuron profiler (captures NEFF+NTFF pairs post-warmup)
+    _profiler = None
+    _profile_dir = os.environ.get("NEURON_PROFILE_DIR", "/tmp/neuron_profile")
+    if os.environ.get("NEURON_PROFILE_ENABLE", "0") == "1":
+        try:
+            from torch.profiler import profile as torch_profile, ProfilerActivity
+            from torch_neuronx.profiling import NeuronConfig, ProfileMode, NeuronProfiler
+            os.makedirs(_profile_dir, exist_ok=True)
+            _neuron_config = NeuronConfig(
+                modes=[ProfileMode.DEVICE, ProfileMode.RUNTIME],
+                profile_output_dir=_profile_dir,
+                neff_cache_dir=os.environ.get(
+                    "TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache"),
+            )
+            _exporter = NeuronProfiler(_neuron_config)
+            _profiler = torch_profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+                experimental_config=_neuron_config,
+                on_trace_ready=_exporter.export_trace,
+            )
+            _profiler.__enter__()
+            if rank == 0:
+                logger.info("Native Neuron profiler started → %s", _profile_dir)
+        except (ImportError, Exception) as e:
+            if rank == 0:
+                logger.warning("Could not start native profiler: %s", e)
+            _profiler = None
+
     meter = None
     if measure_tflops and rank == 0:
         meter = TFLOPSMeter(num_cores=world)
@@ -225,6 +253,16 @@ def main():
     if meter:
         report_path = os.path.join(args.output_folder, "tflops_report.json")
         meter.save(report_path)
+
+    if _profiler is not None:
+        try:
+            torch.neuron.synchronize()
+            _profiler.__exit__(None, None, None)
+            if rank == 0:
+                logger.info("Neuron profiler stopped. Artifacts in: %s", _profile_dir)
+        except Exception as e:
+            if rank == 0:
+                logger.warning("Error stopping profiler: %s", e)
 
     destroy_t5_parallel_group()
     destroy_parallel_groups()
