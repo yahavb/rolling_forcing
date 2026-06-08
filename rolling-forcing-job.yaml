@@ -14,8 +14,8 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: m-trn2
-          resourceClaimTemplateName: m-trn2
+        - name: s-lnc1-trn2
+          resourceClaimTemplateName: s-lnc1-trn2
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -87,46 +87,59 @@ spec:
 
               echo "Model weights ready."
 
-              # ─── Neuron Profiler: capture device-level traces ────────
-              export NEURON_RT_INSPECT_ENABLE=1
-              export NEURON_RT_INSPECT_OUTPUT_DIR=/tmp/neuron_profile
-              export NEURON_RT_INSPECT_DEVICE_PROFILE=session
-              mkdir -p /tmp/neuron_profile
+              # ─── Native PyTorch Neuron profiler (captures NEFF+NTFF pairs) ────
+              export NEURON_PROFILE_ENABLE=1
+              export NEURON_PROFILE_DIR=/tmp/neuron_profile
 
               # ─── Launch e2e pipeline (TP=4 x SP=2 = 8 ranks) ───────────
               echo "============================================"
-              echo "  Rolling Forcing: TP=4 SP=2 on m-trn2"
-              echo "  Neuron Profiler + TFLOPS/MFU measurement"
+              echo "  Rolling Forcing: TP=4 SP=2"
+              echo "  Native Neuron Profiler + TFLOPS/MFU"
               echo "============================================"
 
               PROFILE_E2E_PIPELINE=1 MEASURE_TFLOPS=1 \
                 torchrun --nproc_per_node 8 e2e_pipeline.py \
                 --prompt_file prompts/example_prompts.txt \
                 --output_folder videos_pipeline \
-                --config_path configs/rolling_forcing_dmd.yaml \
+                --config_path configs/rolling_forcing_dmd_320x576.yaml \
                 --checkpoint_path checkpoints/rolling_forcing_dmd.pt \
                 --tp_degree 4 \
-                --num_output_frames 126 \
+                --num_output_frames 21 \
+                --latent_h 40 \
+                --latent_w 72 \
                 --chunk-size 3 \
                 --fps 16 \
                 --use_ema 2>&1 || true
 
               # ─── Neuron Explorer: analyze traces ───────────────────────
-              NTFF_DIR=$(find /tmp/neuron_profile -mindepth 2 -maxdepth 2 -type d 2>/dev/null | head -1)
-              if [[ -n "$NTFF_DIR" ]]; then
+              PROFILE_DEST="/tmp/neuron_profile"
+              if [[ -d "$PROFILE_DEST" && -n "$(ls -A $PROFILE_DEST 2>/dev/null)" ]]; then
                 echo ""
                 echo "============================================"
                 echo "  NEURON EXPLORER ANALYSIS"
                 echo "============================================"
 
+                # Copy NEFFs into session dirs so explorer can match NEFF+NTFF pairs
+                if [[ -d "$PROFILE_DEST/neffs" ]]; then
+                  for session_dir in $(find "$PROFILE_DEST" -name "*.ntff" -printf '%h\n' 2>/dev/null | sort -u); do
+                    cp "$PROFILE_DEST/neffs/"*.neff "$session_dir/" 2>/dev/null || true
+                  done
+                  echo "Copied NEFFs into session directories"
+                fi
+
+                NTFF_DIR=$(find "$PROFILE_DEST" -name "*.ntff" -printf '%h\n' 2>/dev/null | head -1)
+
+                echo "=== neuron-explorer view (summary-text) ==="
                 neuron-explorer view -d "$NTFF_DIR" \
                   --output-format summary-text \
-                  --ignore-dma-trace 2>&1 | tee /tmp/neuron_explorer_summary.txt || true
+                  2>&1 | tee /tmp/neuron_explorer_summary.txt || true
 
+                echo ""
+                echo "=== neuron-explorer view (JSON) ==="
                 neuron-explorer view -d "$NTFF_DIR" \
                   --output-format json \
                   --output-file /tmp/neuron_explorer_profile.json \
-                  --ignore-dma-trace 2>&1 || true
+                  2>&1 | tee /tmp/neuron_explorer_view.log || true
 
                 echo ""
                 echo "=== NEFF COUNT AND SIZE DISTRIBUTION ==="
@@ -138,27 +151,44 @@ spec:
                   END {
                     if (count == 0) { print "No NEFFs found"; exit }
                     printf "Total size: %.2f MB\n", sum/1024/1024
-                    printf "Min: %d bytes  Max: %d bytes (%.2f MB)\n", sizes[0], sizes[count-1], sizes[count-1]/1024/1024
-                    printf "Median: %d bytes  Mean: %.0f bytes\n", sizes[int(count/2)], sum/count
+                    printf "Min: %d bytes\n", sizes[0]
+                    printf "Max: %d bytes (%.2f MB)\n", sizes[count-1], sizes[count-1]/1024/1024
+                    printf "Median: %d bytes\n", sizes[int(count/2)]
+                    printf "Mean: %.0f bytes\n", sum/count
+                    printf "\nSize buckets:\n"
+                    small=0; med=0; large=0; xlarge=0
+                    for(i=0;i<count;i++) {
+                      if(sizes[i]<10000) small++
+                      else if(sizes[i]<100000) med++
+                      else if(sizes[i]<1000000) large++
+                      else xlarge++
+                    }
+                    printf "  <10KB  (tiny):   %d\n", small
+                    printf "  10-100KB (small): %d\n", med
+                    printf "  100KB-1MB (med):  %d\n", large
+                    printf "  >1MB  (large):    %d\n", xlarge
                   }'
               else
-                echo "WARNING: No NTFF directory found — profiling may not have captured traces"
+                echo "WARNING: No profile directory found for neuron-explorer"
               fi
 
-              # ─── Collect outputs ────────────────────────────────────────
+              # ─── Archive to S3 ────────────────────────────────────────
               TIMESTAMP=$(date +%Y%m%d_%H%M%S)
               ARCHIVE_DIR="/var/mdl/rolling_forcing/runs/${TIMESTAMP}"
+              echo ""
+              echo "============================================"
+              echo "  ARCHIVING to S3: $ARCHIVE_DIR"
+              echo "============================================"
               mkdir -p "$ARCHIVE_DIR"
-
               if [[ -d videos_pipeline ]]; then
                 cp videos_pipeline/*.mp4 "$ARCHIVE_DIR/" 2>/dev/null || true
                 cp videos_pipeline/tflops_report.json "$ARCHIVE_DIR/" 2>/dev/null || true
               fi
               cp /tmp/neuron_explorer_summary.txt "$ARCHIVE_DIR/" 2>/dev/null || true
               cp /tmp/neuron_explorer_profile.json "$ARCHIVE_DIR/" 2>/dev/null || true
-              cp -r /tmp/neuron_profile "$ARCHIVE_DIR/profiles" 2>/dev/null || true
-
-              echo "Archived to $ARCHIVE_DIR"
+              cp /tmp/neuron_explorer_view.log "$ARCHIVE_DIR/" 2>/dev/null || true
+              cp -r "$PROFILE_DEST" "$ARCHIVE_DIR/profiles" 2>/dev/null || true
+              echo "Archive complete!"
               ls -la "$ARCHIVE_DIR/" 2>/dev/null || true
 
               echo "═══════════════════════════════════════════"
@@ -166,13 +196,13 @@ spec:
               echo "═══════════════════════════════════════════"
           resources:
             claims:
-              - name: m-trn2
+              - name: s-lnc1-trn2
             requests:
-              cpu: 24
-              memory: 256Gi
+              cpu: 36
+              memory: 366Gi
             limits:
-              cpu: 24
-              memory: 256Gi
+              cpu: 36
+              memory: 366Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
