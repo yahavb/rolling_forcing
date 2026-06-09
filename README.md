@@ -1,186 +1,105 @@
-# Rolling Forcing on Trn2
-
-The Neuron Science Team has implemented distributed **Rolling Forcing**
-Text-to-Video inference on AWS Trn2.
-The pipeline runs end-to-end on a single Trn2 chip (8 NeuronCores at LNC=1),
-sharded as:
-
-| Stage | Script | Parallelism (8 ranks) |
-| --- | --- | --- |
-| T5 prompt encoder | `encode_prompt.py` | TP=8 |
-| DiT denoising (rolling forcing) | `generate_latents.py` | TP=4 × SP=2 |
-| VAE decoder | `decode_latents.py` | W-shard × 8 |
-| All three fused | `e2e_pipeline.py` | TP=8 -> TP=4 × SP=2 -> W=8 |
-
-We measured the following video generation performance (warm cache):
-
-| Stage | Latency |
-| --- | --- |
-| T5 prompt encoding | 30.5 ms |
-| DiT denoising (12 frames) | 1315.4 ms |
-| VAE decoding (12 frames) | 485.6 ms |
-| **Generation frame rate** | **6.66 fps** |
+<p align="center">
+<h1 align="center">Rolling Forcing</h1>
+<h3 align="center">Autoregressive Long Video Diffusion in Real Time</h3>
+</p>
+<p align="center">
+  <p align="center">
+    <a href="https://kunhao-liu.github.io/">Kunhao Liu</a><sup>1</sup>
+    ·
+    <a href="https://wbhu.github.io/">Wenbo Hu</a><sup>2</sup>
+    ·
+    <a href="https://bluestyle97.github.io/">Jiale Xu</a><sup>2</sup>
+    ·
+    <a href="http://www.linkedin.com/in/YingShanProfile">Ying Shan</a><sup>2</sup>
+    ·
+    <a href="https://personal.ntu.edu.sg/shijian.lu/">Shijian Lu</a><sup>1</sup><br>
+    <sup>1</sup>Nanyang Technological University <sup>2</sup>ARC Lab, Tencent PCG
+  </p>
+  <h3 align="center"><a href="https://arxiv.org/abs/2509.25161"><img src="https://img.shields.io/badge/ArXiv-Paper-brown"></a> <a href="https://kunhao-liu.github.io/Rolling_Forcing_Webpage/"><img src="https://img.shields.io/badge/Project-Webpage-bron"></a> <a href="https://github.com/TencentARC/RollingForcing"><img src="https://img.shields.io/badge/GitHub-Code-blue"></a> <a href="https://huggingface.co/TencentARC/RollingForcing"><img src="https://img.shields.io/badge/HuggingFace-Model-yellow"></a> <a href="https://huggingface.co/spaces/TencentARC/RollingForcing"><img src="https://img.shields.io/badge/HuggingFace-Demo-yellow"></a></h3>
+</p>
 
 
-## 1. Install dependencies
+## TL;DR: ***REAL-TIME*** streaming generation of ***MULTI-MINUTE*** videos!
 
-> Assumes a Trn2 host with the Neuron driver, runtime, and tools already
-> installed (`aws-neuronx-dkms`, `aws-neuronx-runtime-lib`,
-> `aws-neuronx-collectives`, `aws-neuronx-tools`). If not, follow the
-> [Neuron SDK setup guide](https://awsdocs-neuron.readthedocs-hosted.com/)
-> first.
+https://github.com/user-attachments/assets/7b43ded2-7f29-41a1-8244-a1fc49c418e5
 
-We use [`uv`](https://github.com/astral-sh/uv) for venv + install (much
-faster than `pip` for the multi-GiB Neuron wheels).
+- **Real-Time at 16 FPS**: Stream high-quality video directly from text on a single GPU.
+- **Minute-Long Videos**: Generate coherent, multi-minute sequences with dramatically reduced drift.
+- **Rolling-Window Strategy**: Denoise frames together in a rolling window for mutual refinement, breaking the chain of error accumulation.
+- **Long-Term Memory**: The novel Attention Sink anchors your video, preserving global context over thousands of frames.
+- **State-of-the-Art Performance**: Outperforms all comparable open-source models in quality and consistency.
 
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh   # if not already installed
 
-cd rolling_forcing_neuron_science_team
-uv venv --python 3.12
-source .venv/bin/activate
-
-# 1. AWS Neuron toolchain (public stable repo) — torch-neuronx, NKI, neuronx-cc.
-uv pip install \
-    --prerelease=allow --index-strategy unsafe-best-match \
-    --extra-index-url https://pip.repos.neuron.amazonaws.com \
-    torch-neuronx neuronx-cc nki
-
-# 2. Modeling dependencies.
-uv pip install \
-    "diffusers==0.37.1" \
-    "transformers==5.8.1" \
-    "huggingface-hub==1.16.4" \
-    "click" \
-    "einops==0.8.2" \
-    "omegaconf==2.3.0" \
-    "ftfy==6.3.1" \
-    "regex==2026.5.9" \
-    "av==17.0.1"
+## Installation
+Create a conda environment and install dependencies:
+```
+conda create -n rolling_forcing python=3.10 -y
+conda activate rolling_forcing
+pip install -r requirements.txt
+pip install flash-attn --no-build-isolation
 ```
 
-Verify the install:
-
-```bash
-python -c "import torch, torch_neuronx, nki; print(torch.__version__, nki.__version__)"
+## Quick Start
+### Download checkpoints
+```
+huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B --local-dir-use-symlinks False --local-dir wan_models/Wan2.1-T2V-1.3B
+huggingface-cli download TencentARC/RollingForcing checkpoints/rolling_forcing_dmd.pt --local-dir .
 ```
 
-> **Note:** The versions tested with this drop are the alpha-channel
-> wheels:
-> ```
-> torch-neuronx        2.11.3.0.17324+4b683e9.dev
-> neuronx-cc           2.0.256271.0a0+34d9d159
-> nki                  0.4.0b4+25816723762.geeb7644d
-> neuron-torch-mlir    20260507.107
-> ```
-> Reach out to the authors if you'd like access to these exact alpha-channel wheels.
-
-
-## 2. Get model weights
-
-Two checkpoint sets are required: the public **Wan2.1-T2V-1.3B** weights
-(used by T5 and VAE) and the **rolling-forcing DMD** distilled DiT weights.
-
-### Wan2.1-T2V-1.3B (T5 encoder + VAE decoder)
-
-Pull from Hugging Face into `wan_models/`:
-
-```bash
-hf download Wan-AI/Wan2.1-T2V-1.3B \
-    --local-dir wan_models/Wan2.1-T2V-1.3B
+### CLI inference
+Example inference script:
+```
+python inference.py \
+    --config_path configs/rolling_forcing_dmd.yaml \
+    --output_folder videos/rolling_forcing_dmd \
+    --checkpoint_path checkpoints/rolling_forcing_dmd.pt \
+    --data_path prompts/example_prompts.txt \
+    --num_output_frames 126 \
+    --use_ema
 ```
 
-Layout after download:
+### Gradio demo (minimal UI)
+Run a local web demo that takes a text prompt and shows the generated video.
 
+1) Ensure the Wan base model and checkpoint above are downloaded.
+2) Launch the app:
 ```
-wan_models/Wan2.1-T2V-1.3B/
-├── Wan2.1_VAE.pth                       # VAE
-├── models_t5_umt5-xxl-enc-bf16.pth      # T5 encoder
-├── config.json
-├── google/                              # T5 tokenizer/spm
-└── ...
+python app.py \
+  --config_path configs/rolling_forcing_dmd.yaml \
+  --checkpoint_path checkpoints/rolling_forcing_dmd.pt
 ```
+Then open the printed local URL in your browser.
 
-### Rolling-forcing DMD checkpoint (DiT)
-
-Pull from Hugging Face into `checkpoints/`:
-
-```bash
-hf download TencentARC/RollingForcing \
-    checkpoints/rolling_forcing_dmd.pt \
-    --local-dir .
+## Training
+### Download training prompts, ODE-initialized checkpoint, and teacher model
 ```
-
-Final layout:
-
-```
-checkpoints/
-└── rolling_forcing_dmd.pt
+huggingface-cli download gdhe17/Self-Forcing checkpoints/ode_init.pt --local-dir .
+huggingface-cli download gdhe17/Self-Forcing vidprom_filtered_extended.txt --local-dir prompts
+huggingface-cli download Wan-AI/Wan2.1-T2V-14B --local-dir wan_models/Wan2.1-T2V-14B
 ```
 
-
-## 3. Get the deterministic CPU RNG states
-
-The diffusion noise tensors are reproduced from saved per-prompt CPU RNG
-states (`cpu_rng_states/prompt_NNN.pt`). They are used by
-`generate_latents.py` and `e2e_pipeline.py` via `--rng_state_path` to
-reproduce reference videos exactly.
-To request them, please contact the authors.
-
-Place the files at:
-
+### Train Rolling Forcing on a single machine with 8 GPUs
 ```
-cpu_rng_states/
-├── prompt_000.pt
-├── prompt_001.pt
-└── ...
+torchrun --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint 127.0.0.1:29500 \
+  train.py \
+  -- \
+  --config_path configs/rolling_forcing_dmd.yaml \
+  --logdir logs/rolling_forcing_dmd
 ```
 
-
-## 4. Run
-
-All three stages share the same 8-rank `torchrun` launch pattern. Run from
-inside `rolling_forcing_neuron_science_team/` with the venv active.
-
-### Option A — all stages in one launch (`e2e_pipeline.py`)
-
-```bash
-bash scripts/run_e2e_pipeline_distributed.sh
+## Citation
+If you find this codebase useful for your research, please kindly cite our paper and consider giving this repo a star.
+```bibtex
+@article{liu2025rolling,
+  title={Rolling Forcing: Autoregressive Long Video Diffusion in Real Time},
+  author={Liu, Kunhao and Hu, Wenbo and Xu, Jiale and Shan, Ying and Lu, Shijian},
+  journal={arXiv preprint arXiv:2509.25161},
+  year={2025}
+}
 ```
 
-This loops over the prompts in `prompts/example_prompts.txt` and writes
-`videos_pipeline/prompt_NNN.mp4`.
-
-### Option B — per-stage runs (useful for debugging / profiling)
-
-```bash
-# 1. T5 → text_embeds/prompt_NNN.pt
-bash scripts/run_encode_prompt_distributed.sh
-
-# 2. DiT → output_latent.pt
-bash scripts/run_generate_latents_distributed.sh
-
-# 3. VAE → output.mp4
-bash scripts/run_decode_latents_distributed.sh
-```
-
-## Layout
-
-```
-rolling_forcing_neuron_science_team/
-├── encode_prompt.py            # T5 stage entry
-├── generate_latents.py         # DiT stage entry
-├── decode_latents.py           # VAE stage entry
-├── e2e_pipeline.py             # Fused T5 + DiT + VAE entry
-├── kernels/                    # NKI flash-attn / cache / RoPE / halo kernels
-├── models/                     # T5, DiT, VAE — sharded for TP/SP/W
-├── utils/                      # logging, parallel state, scheduler, video I/O
-├── scripts/                    # 4× torchrun launchers
-├── configs/                    # rolling-forcing config YAMLs
-└── prompts/                    # sample prompt file
-```
-
-
-## License
-
-Apache 2.0. See per-file headers.
+## Acknowledgements
+- [Self Forcing](https://github.com/guandeh17/Self-Forcing): the codebase and algorithm we built upon. Thanks for their wonderful work.
+- [Wan](https://github.com/Wan-Video/Wan2.1): the base model we built upon. Thanks for their wonderful work.
