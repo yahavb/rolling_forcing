@@ -12,6 +12,12 @@ denoising_step_list:
 - 200
 warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
 ts_schedule: false
+# frame_seq_length = (latent_h/2) * (latent_w/2) patched tokens per frame (runtime uses h*w).
+# TP4xSP4 (16 ranks) requires every sharded token-run (F * frame_seq_length) divisible by 16.
+# 1560 (=30*52, from latent 60x104 / 480x832) is div by 8 but NOT 16 -> SP4 asserts fail.
+# 1680 (=30*56, from latent 60x112 / 480x896) is div by 16 -> works for SP2 AND SP4 with
+# NO model-code changes. MUST be run with --latent_w 112 so runtime h*w matches this.
+frame_seq_length: 1680
 num_train_timestep: 1000
 timestep_shift: 5.0
 guidance_scale: 3.0

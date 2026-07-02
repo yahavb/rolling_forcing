@@ -1,8 +1,13 @@
 # Rolling Forcing — Neuron 3-run benchmark (companion to ~/StreamDiffusionV2/sd-job.yaml)
 #
-# Same benchmark *shape* as sd-job.yaml so the two are comparable, but wired to
-# Rolling Forcing's actual entry point and topology. Key differences from sd-job:
-#   - Topology : TP=4 x SP=2 = 8 ranks  -> torchrun --nproc_per_node 8 on the s-lnc1-trn2 claim
+# SCALE-OUT EXPERIMENT: compare TP4xSP2 (8 ranks) vs TP4xSP4 (16 ranks) in ONE pod
+# to measure the SP2->SP4 fps speedup. tp_degree is pinned at 4 (12 heads only divide
+# by 4 and 4 is a legal collective group); the extra 8 cores go to SP (context/sequence
+# parallel). Both passes run at 480x896 (latent_w=112, frame_seqlen=1680) because SP4
+# needs every F*frame_seqlen divisible by 16 and the default 832-wide (1560) is not.
+# Key differences from sd-job:
+#   - Topology : TP=4 x SP=4 = 16 ranks -> torchrun --nproc_per_node 16 on m-lnc1-trn2
+#                (count:2 -> 2 chips x 8 cores). A baseline pass runs 8 ranks first.
 #   - Entry    : e2e_pipeline.py (T5 -> DiT -> VAE fused). NO --warmup/--iters flags;
 #                it emits per-stage "T5: <N> ms" + DiT/VAE logs and tflops_report.json,
 #                NOT sd's median=/built= markers.
@@ -13,8 +18,8 @@
 # Model under test (current Neuron implementation):
 #   - DiT base : Wan-AI/Wan2.1-T2V-1.3B  (T5 encoder + VAE decoder)
 #   - DiT ckpt : TencentARC/RollingForcing -> checkpoints/rolling_forcing_dmd.pt (DMD-distilled)
-#   - Runtime  : TP-4 x SP-2 (8 NeuronCores, LNC=1), bf16, eager + NKI kernels
-#   - Shape    : num_output_frames=21, chunk-size=3, fps=16
+#   - Runtime  : TP-4 x SP-{2,4} (8 or 16 NeuronCores, LNC=1), bf16, eager + NKI kernels
+#   - Shape    : num_output_frames=21, chunk-size=3, fps=16, latent 60x112 (480x896)
 #
 # Mandatory 3-run methodology (ONE pod):
 #   [1/3] WARMUP  : compile-if-cold / load NEFFs (not timed)
@@ -41,8 +46,10 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: m-trn2
-          resourceClaimTemplateName: m-trn2
+        # 16 NeuronCores (2 chips x 8, LNC=1) so ONE pod can run BOTH the TP4xSP2
+        # 8-rank baseline and the TP4xSP4 16-rank test at the same resolution.
+        - name: m-lnc1-trn2
+          resourceClaimTemplateName: m-lnc1-trn2
       containers:
         - name: bench
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -119,14 +126,24 @@ spec:
 
               LOCAL_RESULTS="/tmp/results"; mkdir -p "$LOCAL_RESULTS"
 
-              # BENCH_CMD: TP=4 x SP=2 = 8-rank entrypoint. e2e_pipeline.py has no
-              # --warmup/--iters; it logs per-stage "T5: <N> ms" + DiT/VAE and (with
-              # MEASURE_TFLOPS=1) writes <output_folder>/tflops_report.json.
-              BENCH_CMD="torchrun --nproc_per_node 8 e2e_pipeline.py \
+              # ── TOPOLOGY: this job compares TP4xSP2 (8 ranks) vs TP4xSP4 (16 ranks) ──
+              # tp_degree is fixed at 4 (Wan2.1-1.3B has 12 heads; only 4 divides them and
+              # is a legal collective group). sp_degree = nproc/4, derived by e2e_pipeline.py.
+              # BOTH runs use --latent_w 112 (480x896, frame_seqlen=1680) because SP4 needs
+              # every F*frame_seqlen divisible by 16 and 1560 (the 832-wide default) is not.
+              # Running both at 112 keeps the SP2->SP4 speedup an apples-to-apples ratio.
+              # NOTE: this re-baselines 8-core at 896 wide; it is NOT the historical 8.1 fps
+              # number (that was 832 wide / frame_seqlen 1560).
+              NPROC="${NPROC:-16}"          # 16 = TP4xSP4 main run; baseline pass sets 8
+              LATENT_W="${LATENT_W:-112}"
+              # e2e_pipeline.py has no --warmup/--iters; it logs per-stage "T5: <N> ms" +
+              # DiT/VAE and (with MEASURE_TFLOPS=1) writes <output_folder>/tflops_report.json.
+              BENCH_CMD="torchrun --nproc_per_node ${NPROC} e2e_pipeline.py \
                 --prompt_file prompts/example_prompts.txt \
                 --config_path configs/rolling_forcing_dmd.yaml \
                 --checkpoint_path checkpoints/rolling_forcing_dmd.pt \
                 --tp_degree 4 \
+                --latent_w ${LATENT_W} \
                 --num_output_frames 21 \
                 --chunk-size 3 \
                 --fps 16 \
@@ -298,9 +315,45 @@ spec:
               set +e +o pipefail
               trap 'echo "(trap) benchmark section exited rc=$? — proceeding to archive"' ERR
 
+              # reusable steady-state median extractor (block>0 per prompt; rejects compile outliers)
+              median_fps() {  # $1 = clean.txt path ; prints "MEDIAN fps (min/max over N)"
+                awk '
+                  /block +[0-9]+:/ { bidx=$2; gsub(":","",bidx); if(bidx+0>0) v[n++]=$(NF-1) }
+                  END {
+                    if(n==0){ print "  no per-block fps lines"; exit }
+                    for(i=0;i<n;i++) for(j=i+1;j<n;j++) if(v[j]<v[i]){t=v[i];v[i]=v[j];v[j]=t}
+                    med=(n%2)?v[int(n/2)]:(v[n/2-1]+v[n/2])/2
+                    printf "  MEDIAN = %.2f fps over %d blocks (min %.2f / max %.2f)\n", med, n, v[0], v[n-1]
+                  }' "$1"
+              }
+
+              # ══ BASELINE PASS: TP4xSP2 (8 ranks) at the SAME 480x896 resolution ══
+              # This is the apples-to-apples denominator for the 16-rank speedup. It is a
+              # fresh 8-core number at latent_w=112 (NOT the historical 8.1 fps @ 832).
+              echo "════════════ BASELINE: TP4xSP2 (8 ranks, 480x896) ════════════"
+              ( export NPROC=8 LATENT_W=112
+                BASE_CMD="torchrun --nproc_per_node 8 e2e_pipeline.py \
+                  --prompt_file prompts/example_prompts.txt \
+                  --config_path configs/rolling_forcing_dmd.yaml \
+                  --checkpoint_path checkpoints/rolling_forcing_dmd.pt \
+                  --tp_degree 4 --latent_w 112 --num_output_frames 21 \
+                  --chunk-size 3 --fps 16 --use_ema"
+                echo "--- [baseline warmup] ---"
+                $BASE_CMD --output_folder /tmp/base_warmup 2>&1 \
+                  | grep -iE "Building|compil|loaded|FAILED|Error" || echo "baseline warmup done"
+                echo "--- [baseline clean fps] ---"
+                env -u NEURON_RT_INSPECT_ENABLE -u NEURON_RT_INSPECT_OUTPUT_DIR -u NEURON_RT_INSPECT_DEVICE_PROFILE \
+                  PROFILE_E2E_PIPELINE=1 MEASURE_TFLOPS=1 \
+                  $BASE_CMD --output_folder "$LOCAL_RESULTS/base_clean_out" 2>&1 \
+                  | tee "$LOCAL_RESULTS/base_clean.txt" \
+                  | grep -iE "T5:|block +[0-9]|fps|TFLOPS|MFU|FAILED|Error" || echo "BASELINE CLEAN FAILED"
+              )
+              echo "--- BASELINE (TP4xSP2, 8 ranks, 480x896) steady-state ---"
+              median_fps "$LOCAL_RESULTS/base_clean.txt" | tee "$LOCAL_RESULTS/base_fps.txt"
+
               echo "════════════ NEURON 3-RUN BENCHMARK (Rolling Forcing) ════════════"
-              echo "  model    : Wan2.1-T2V-1.3B + RollingForcing DMD ckpt, TP4xSP2 (8 cores), bf16, 21 frames"
-              echo "  topology : TP=4 x SP=2 = 8 ranks (s-lnc1-trn2 claim)"
+              echo "  model    : Wan2.1-T2V-1.3B + RollingForcing DMD ckpt, TP4xSP4 (16 cores), bf16, 21 frames"
+              echo "  topology : TP=4 x SP=4 = 16 ranks (m-lnc1-trn2 claim), 480x896 / frame_seqlen 1680"
               echo "=================================================================="
 
               echo "=== [1/3] WARMUP (compile-if-cold / load NEFFs; not timed) ==="
@@ -362,18 +415,21 @@ spec:
               echo "=== [5] per-NEFF engine utilization + MFU + optimization priority ==="
               per_neff_mfu
 
-              echo "=== HEADLINE COMPARISON (vs StreamDiffusionV2 sd-job) ==="
-              echo "  sd-job reports : median=<N>ms throughput=<N> frame/s  (whole 81-frame clip, 1 number)"
-              echo "  rf-job reports : per-block DiT/VAE ms + per-block fps + steady-state median fps"
-              echo "  --- RF clean steady-state ---"
+              echo "=== HEADLINE: TP4xSP2 (8 ranks) vs TP4xSP4 (16 ranks), both 480x896 ==="
+              echo "  --- BASELINE TP4xSP2 (8 ranks) ---"
+              cat "$LOCAL_RESULTS/base_fps.txt" 2>/dev/null || echo "  (baseline fps unavailable)"
+              echo "  --- MAIN TP4xSP4 (16 ranks) ---"
+              median_fps "$LOCAL_RESULTS/clean.txt" | tee "$LOCAL_RESULTS/main_fps.txt"
+              echo "  --- SPEEDUP (16-rank / 8-rank) ---"
               awk '
-                /block +[0-9]+:/ { bidx=$2; gsub(":","",bidx); if(bidx+0>0) v[n++]=$(NF-1) }
-                END {
-                  if(n==0) exit
-                  for(i=0;i<n;i++) for(j=i+1;j<n;j++) if(v[j]<v[i]){t=v[i];v[i]=v[j];v[j]=t}
-                  med=(n%2)?v[int(n/2)]:(v[n/2-1]+v[n/2])/2
-                  printf "    steady-state MEDIAN = %.2f fps\n", med
-                }' "$LOCAL_RESULTS/clean.txt" 2>/dev/null || true
+                function med(f,   v,n,i,j,t,m){ n=0
+                  while((getline line < f)>0){ if(line ~ /MEDIAN = /){ sub(/.*MEDIAN = /,"",line); sub(/ fps.*/,"",line); return line+0 } }
+                  return 0 }
+                BEGIN{
+                  b=med("'"$LOCAL_RESULTS/base_fps.txt"'"); m=med("'"$LOCAL_RESULTS/main_fps.txt"'")
+                  if(b>0 && m>0) printf "  SP2=%.2f fps -> SP4=%.2f fps  =>  %.2fx speedup\n", b, m, m/b
+                  else print "  (need both medians to compute speedup)"
+                }'
               grep -iE "Average:.*TFLOPS|MFU" "$LOCAL_RESULTS/clean.txt" | tail -3 || true
 
               # ─── persist EVERYTHING to one timestamped run dir on /var/mdl (S3) ───
@@ -419,7 +475,7 @@ spec:
               echo "═══════════════════════════════════════════"
           resources:
             claims:
-              - name: m-trn2
+              - name: m-lnc1-trn2
             requests:
               cpu: 24
               memory: 256Gi
