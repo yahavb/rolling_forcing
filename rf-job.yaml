@@ -485,12 +485,16 @@ spec:
           resources:
             claims:
               - name: m-lnc1-trn2
+            # Sized to fit the tighter node (ip-...-107-10: ~82Gi mem / ~48 vCPU free).
+            # RF's host-memory footprint is small — weights live in Neuron HBM, not host
+            # RAM — so the old 256Gi request only ever fit the roomier node. 64Gi limit
+            # minus the 24Gi memory-backed /dev/shm leaves ~40Gi for the process.
             requests:
-              cpu: 24
-              memory: 256Gi
+              cpu: 16
+              memory: 64Gi
             limits:
-              cpu: 24
-              memory: 256Gi
+              cpu: 16
+              memory: 64Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -536,7 +540,7 @@ spec:
         - name: dshm
           emptyDir:
             medium: Memory
-            sizeLimit: 32Gi
+            sizeLimit: 24Gi
         - name: 621547421844-ap-southeast-4-pvc
           persistentVolumeClaim:
             claimName: 621547421844-ap-southeast-4-pvc
