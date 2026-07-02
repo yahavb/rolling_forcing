@@ -443,11 +443,16 @@ spec:
               #   rf_results.tar.gz         <- everything, one tarball
               RUN_TS=$(date +%d%m%y%H%M%S)
               OUT="/var/mdl/rolling-forcing/runs/${RUN_TS}"
-              mkdir -p "$OUT/frames"
-              # 1) FRAMES — every mp4 from both runs (this is the actual model output)
+              # frames split by topology so you can tell the two apart:
+              #   frames/sp4_16rank/  <- main TP4xSP4 videos (clean + profiled runs)
+              #   frames/sp2_8rank/   <- baseline TP4xSP2 videos
+              mkdir -p "$OUT/frames/sp4_16rank" "$OUT/frames/sp2_8rank"
+              # 1) FRAMES — every mp4, kept separate per topology (this is the model output)
               find "$LOCAL_RESULTS/clean_out" "$LOCAL_RESULTS/profiled_out" /tmp/warmup_out \
-                -name '*.mp4' -exec cp {} "$OUT/frames/" \; 2>/dev/null || true
-              echo "frames saved: $(find "$OUT/frames" -name '*.mp4' 2>/dev/null | wc -l) mp4(s)"
+                -name '*.mp4' -exec cp {} "$OUT/frames/sp4_16rank/" \; 2>/dev/null || true
+              find "$LOCAL_RESULTS/base_clean_out" /tmp/base_warmup \
+                -name '*.mp4' -exec cp {} "$OUT/frames/sp2_8rank/" \; 2>/dev/null || true
+              echo "frames saved: sp4_16rank=$(find "$OUT/frames/sp4_16rank" -name '*.mp4' 2>/dev/null | wc -l) mp4(s), sp2_8rank=$(find "$OUT/frames/sp2_8rank" -name '*.mp4' 2>/dev/null | wc -l) mp4(s)"
               # 2) harmony upload bundle as a DIRECTORY (no untar needed before upload)
               if [[ -d "$LOCAL_RESULTS/harmony_bundle" ]]; then
                 cp -r "$LOCAL_RESULTS/harmony_bundle" "$OUT/" 2>/dev/null || echo "harmony dir persist skipped"
@@ -457,6 +462,10 @@ spec:
               cp "$LOCAL_RESULTS/tflops_report.json" "$OUT/" 2>/dev/null || true
               cp "$LOCAL_RESULTS/clean.txt"          "$OUT/" 2>/dev/null || true
               cp "$LOCAL_RESULTS/profiled.txt"       "$OUT/" 2>/dev/null || true
+              # baseline (TP4xSP2) logs + fps summaries for the SP2->SP4 comparison
+              cp "$LOCAL_RESULTS/base_clean.txt"     "$OUT/" 2>/dev/null || true
+              cp "$LOCAL_RESULTS/base_fps.txt"       "$OUT/" 2>/dev/null || true
+              cp "$LOCAL_RESULTS/main_fps.txt"       "$OUT/" 2>/dev/null || true
               # 4) general JSON trace, gzipped (700MB+, not part of harmony spec)
               TJSON=$(find "$PROFILE_DIR" -name 'trace.json' 2>/dev/null | head -1 || true)
               [[ -n "$TJSON" ]] && gzip -c "$TJSON" > "$OUT/trace.json.gz" 2>/dev/null || true
