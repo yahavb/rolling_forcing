@@ -253,6 +253,20 @@ class CausalInferencePipeline(torch.nn.Module):
         batch_size, num_frames, num_channels, height, width = noise.shape
         assert num_frames % self.num_frame_per_block == 0
         assert num_frames * height * width % self.world_size == 0
+        # frame_seq_length (drives KV-cache alloc, restore_layout, RoPE indexing) MUST equal
+        # the runtime patched tokens-per-frame (h/pH * w/pW). A mismatch silently corrupts
+        # cache slicing instead of failing. patch_size is (pT, pH, pW).
+        _pT, _pH, _pW = self.generator.model.patch_size
+        _runtime_frame_seqlen = (height // _pH) * (width // _pW)
+        assert _runtime_frame_seqlen == self.frame_seq_length, (
+            f"frame_seq_length={self.frame_seq_length} (config) != runtime h*w="
+            f"{_runtime_frame_seqlen} (latent {height}x{width} / patch {_pH}x{_pW}). "
+            f"For TP4xSP4 use latent_w=112 (frame_seq_length=1680); "
+            f"config and --latent_w must agree.")
+        assert self.frame_seq_length % self.world_size == 0, (
+            f"frame_seq_length={self.frame_seq_length} not divisible by world_size="
+            f"{self.world_size}; every F*frame_seq_length token-run would break the "
+            f"SP shard. 1680 works for world 8 and 16; 1560 fails at 16.")
         num_blocks = num_frames // self.num_frame_per_block
         num_output_frames = num_frames
 
