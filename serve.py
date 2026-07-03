@@ -362,6 +362,16 @@ def run_server(text_encoder, pipe, vae, rank, world):
 
     @app.get("/readiness")
     async def readiness():
+        # Report NOT ready while a generation holds the lock so Kubernetes pulls
+        # this pod out of the Service endpoints for the duration. New /generate
+        # calls then route to an idle replica instead of queueing behind the
+        # in-flight collective sequence (see generation_lock). Liveness (/health)
+        # stays healthy so the pod is not restarted mid-generation.
+        if generation_lock.locked():
+            raise HTTPException(
+                status_code=503,
+                detail={"status": "busy", "model_loaded": True, "tp_degree": TP_DEGREE},
+            )
         return {"status": "ready", "model_loaded": True, "tp_degree": TP_DEGREE}
 
     @app.get("/")
