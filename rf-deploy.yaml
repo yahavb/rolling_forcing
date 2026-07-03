@@ -29,8 +29,10 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: s-lnc1-trn2
-          resourceClaimTemplateName: s-lnc1-trn2
+        # 16 NeuronCores (2 chips x 8, LNC=1) for TP4xSP4. Benchmarked at 13.19 fps
+        # vs 8.75 fps at TP4xSP2 (8 cores) — 1.51x. See rf-job.yaml.
+        - name: m-lnc1-trn2
+          resourceClaimTemplateName: m-lnc1-trn2
       containers:
         - name: app
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -42,7 +44,9 @@ spec:
               set -euxo pipefail
 
               cd /tmp
-              git clone https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git
+              # TP4xSP4 lives on this branch: frame_seq_length=1200 + SP4 divisibility
+              # guard in dit_pipeline.py. main does NOT have them yet.
+              git clone -b "${BRANCH:-tp4-sp4-16core}" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git
               cd rolling_forcing
 
               # ─── Install deps ─────────────────────────────────────────────
@@ -102,22 +106,22 @@ spec:
 
               echo "Model weights ready."
 
-              # ─── Launch serve.py (TP=4 x SP=2 = 8 ranks) ───────────────
+              # ─── Launch serve.py (TP=4 x SP=4 = 16 ranks) ──────────────
               echo "============================================"
-              echo "  Rolling Forcing Serving: TP=4 SP=2"
-              echo "  Using e2e_pipeline fast path"
+              echo "  Rolling Forcing Serving: TP=4 SP=4 (16 cores)"
+              echo "  480x640 / frame_seqlen 1200 — benchmarked 13.19 fps"
               echo "============================================"
 
-              torchrun --nproc_per_node 8 serve.py
+              torchrun --nproc_per_node 16 serve.py
           resources:
             claims:
-              - name: s-lnc1-trn2
+              - name: m-lnc1-trn2
             requests:
-              cpu: 36
-              memory: 366Gi
+              cpu: 24
+              memory: 64Gi
             limits:
-              cpu: 36
-              memory: 366Gi
+              cpu: 24
+              memory: 64Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -146,16 +150,19 @@ spec:
               value: "21"
             - name: DEFAULT_FPS
               value: "16"
+            # frame_seq_length: 1200 lives here (480x640, div-by-16 for SP4)
             - name: CONFIG_PATH
-              value: "configs/rolling_forcing_dmd_320x576.yaml"
+              value: "configs/rolling_forcing_dmd.yaml"
             - name: CHECKPOINT_PATH
               value: "checkpoints/rolling_forcing_dmd.pt"
             - name: WARMUP_FRAMES
               value: "21"
+            # 480x640: latent_w=80 is div-by-16 (VAE width-shard) AND fits HBM.
+            # (72 would break SP4: 72%16=8; higher res OOM'd — see rf-job.yaml.)
             - name: LATENT_H
-              value: "40"
+              value: "60"
             - name: LATENT_W
-              value: "72"
+              value: "80"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -198,7 +205,7 @@ spec:
         - name: dshm
           emptyDir:
             medium: Memory
-            sizeLimit: 32Gi
+            sizeLimit: 24Gi
         - name: 621547421844-ap-southeast-4-pvc
           persistentVolumeClaim:
             claimName: 621547421844-ap-southeast-4-pvc
