@@ -205,6 +205,16 @@ def run_server(text_encoder, pipe, vae, rank, world):
 
     app = FastAPI(title="Rolling Forcing Video Generation (e2e_pipeline)")
 
+    # Only rank 0 drives the collective sequence (broadcast_command + the
+    # all_gather inside stream_generate). All 16 ranks execute those collectives
+    # in a fixed order, so two overlapping requests would interleave rank 0's
+    # broadcasts/gathers and desync the ranks ("mismatched collectives between
+    # peers" -> watchdog timeout -> group teardown). The stream endpoint yields
+    # the event loop between frames (await asyncio.sleep(0)), which is exactly
+    # what lets a second request slip in. This lock serializes every generation
+    # so the whole 16-rank collective sequence stays in lockstep.
+    generation_lock = asyncio.Lock()
+
     class GenerateRequest(BaseModel):
         prompt: str
         num_frames: Optional[int] = Field(default=None, ge=3, le=481)
@@ -232,47 +242,52 @@ def run_server(text_encoder, pipe, vae, rank, world):
         seed = request.seed or 0
 
         async def event_stream():
-            try:
-                broadcast_command(CMD_STREAM, num_frames, seed, request.prompt)
+            # Hold the lock for the whole stream: the 16-rank collective sequence
+            # (broadcast_command + per-block gathers) must not interleave with
+            # another request. If a generation is already running, this awaits its
+            # completion instead of desyncing the ranks.
+            async with generation_lock:
+                try:
+                    broadcast_command(CMD_STREAM, num_frames, seed, request.prompt)
 
-                # T5 encode (rank 0 participates)
-                prompt_embeds = encode_one_prompt(text_encoder, request.prompt)
+                    # T5 encode (rank 0 participates)
+                    prompt_embeds = encode_one_prompt(text_encoder, request.prompt)
 
-                # Noise (same seed as workers)
-                torch.manual_seed(seed)
-                noise = torch.randn(
-                    1, num_frames, 16, LATENT_H, LATENT_W, dtype=torch.bfloat16,
-                ).to(NEURON_DEVICE)
+                    # Noise (same seed as workers)
+                    torch.manual_seed(seed)
+                    noise = torch.randn(
+                        1, num_frames, 16, LATENT_H, LATENT_W, dtype=torch.bfloat16,
+                    ).to(NEURON_DEVICE)
 
-                vae.model.clear_cache()
-                frame_count = 0
-                # Estimate total pixel frames (4x temporal upsampling)
-                total_pixel_frames = (num_frames - 1) * 4 + 1
+                    vae.model.clear_cache()
+                    frame_count = 0
+                    # Estimate total pixel frames (4x temporal upsampling)
+                    total_pixel_frames = (num_frames - 1) * 4 + 1
 
-                for chunk_device, chunk_idx in stream_generate(
-                    pipe, vae, prompt_embeds, noise, rank, world
-                ):
-                    frames = gather_and_postprocess(chunk_device, rank, world)
+                    for chunk_device, chunk_idx in stream_generate(
+                        pipe, vae, prompt_embeds, noise, rank, world
+                    ):
+                        frames = gather_and_postprocess(chunk_device, rank, world)
 
-                    for frame in frames:
-                        buf = BytesIO()
-                        frame.save(buf, format="PNG")
-                        frame_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                        for frame in frames:
+                            buf = BytesIO()
+                            frame.save(buf, format="PNG")
+                            frame_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-                        data = {
-                            "frame_index": frame_count,
-                            "frame": frame_b64,
-                            "total_frames": total_pixel_frames,
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
-                        frame_count += 1
-                        await asyncio.sleep(0)
+                            data = {
+                                "frame_index": frame_count,
+                                "frame": frame_b64,
+                                "total_frames": total_pixel_frames,
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+                            frame_count += 1
+                            await asyncio.sleep(0)
 
-                yield f"data: {json.dumps({'done': True})}\n\n"
+                    yield f"data: {json.dumps({'done': True})}\n\n"
 
-            except Exception as e:
-                logger.error("Stream error: %s", e, exc_info=True)
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                except Exception as e:
+                    logger.error("Stream error: %s", e, exc_info=True)
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -285,7 +300,11 @@ def run_server(text_encoder, pipe, vae, rank, world):
 
         start_time = time.time()
 
-        try:
+        # Serialize against /generate/stream and other /generate calls: all
+        # generation shares one 16-rank collective sequence that must not
+        # interleave (see generation_lock above).
+        async with generation_lock:
+          try:
             broadcast_command(CMD_GENERATE, num_frames, seed, request.prompt)
 
             prompt_embeds = encode_one_prompt(text_encoder, request.prompt)
@@ -333,7 +352,7 @@ def run_server(text_encoder, pipe, vae, rank, world):
                 "num_frames": len(frames),
             }
 
-        except Exception as e:
+          except Exception as e:
             logger.error("Generate error: %s", e, exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
