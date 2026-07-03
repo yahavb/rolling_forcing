@@ -44,9 +44,8 @@ spec:
               set -euxo pipefail
 
               cd /tmp
-              # TP4xSP4 lives on this branch: frame_seq_length=1200 + SP4 divisibility
-              # guard in dit_pipeline.py. main does NOT have them yet.
-              git clone -b "${BRANCH:-tp4-sp4-16core}" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git
+              # TP4xSP4 (frame_seq_length=1200 + SP4 divisibility guard) is merged to main.
+              git clone -b "${BRANCH:-main}" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git
               cd rolling_forcing
 
               # ─── Install deps ─────────────────────────────────────────────
