@@ -3,7 +3,7 @@
 # SCALE-OUT EXPERIMENT: compare TP4xSP2 (8 ranks) vs TP4xSP4 (16 ranks) in ONE pod
 # to measure the SP2->SP4 fps speedup. tp_degree is pinned at 4 (12 heads only divide
 # by 4 and 4 is a legal collective group); the extra 8 cores go to SP (context/sequence
-# parallel). Both passes run at 480x896 (latent_w=112, frame_seqlen=1680) because SP4
+# parallel). Both passes run at 480x768 (latent_w=96, frame_seqlen=1440) because SP4
 # needs every F*frame_seqlen divisible by 16 and the default 832-wide (1560) is not.
 # Key differences from sd-job:
 #   - Topology : TP=4 x SP=4 = 16 ranks -> torchrun --nproc_per_node 16 on m-lnc1-trn2
@@ -19,7 +19,7 @@
 #   - DiT base : Wan-AI/Wan2.1-T2V-1.3B  (T5 encoder + VAE decoder)
 #   - DiT ckpt : TencentARC/RollingForcing -> checkpoints/rolling_forcing_dmd.pt (DMD-distilled)
 #   - Runtime  : TP-4 x SP-{2,4} (8 or 16 NeuronCores, LNC=1), bf16, eager + NKI kernels
-#   - Shape    : num_output_frames=21, chunk-size=3, fps=16, latent 60x112 (480x896)
+#   - Shape    : num_output_frames=21, chunk-size=3, fps=16, latent 60x96 (480x768)
 #
 # Mandatory 3-run methodology (ONE pod):
 #   [1/3] WARMUP  : compile-if-cold / load NEFFs (not timed)
@@ -129,13 +129,14 @@ spec:
               # ── TOPOLOGY: this job compares TP4xSP2 (8 ranks) vs TP4xSP4 (16 ranks) ──
               # tp_degree is fixed at 4 (Wan2.1-1.3B has 12 heads; only 4 divides them and
               # is a legal collective group). sp_degree = nproc/4, derived by e2e_pipeline.py.
-              # BOTH runs use --latent_w 112 (480x896, frame_seqlen=1680) because SP4 needs
+              # BOTH runs use --latent_w 96 (480x768, frame_seqlen=1440) because SP4 needs
               # every F*frame_seqlen divisible by 16 and 1560 (the 832-wide default) is not.
-              # Running both at 112 keeps the SP2->SP4 speedup an apples-to-apples ratio.
-              # NOTE: this re-baselines 8-core at 896 wide; it is NOT the historical 8.1 fps
-              # number (that was 832 wide / frame_seqlen 1560).
+              # Running both at 96 keeps the SP2->SP4 speedup an apples-to-apples ratio.
+              # NOTE: this re-baselines 8-core at 768 wide; it is NOT the historical 8.1 fps
+              # number (that was 832 wide / frame_seqlen 1560). 768 < 832 also fits HBM
+              # (896 OOM'd: KV cache = frame_seqlen*24*heads*head_dim grew past 24GB/stack).
               NPROC="${NPROC:-16}"          # 16 = TP4xSP4 main run; baseline pass sets 8
-              LATENT_W="${LATENT_W:-112}"
+              LATENT_W="${LATENT_W:-96}"
               # e2e_pipeline.py has no --warmup/--iters; it logs per-stage "T5: <N> ms" +
               # DiT/VAE and (with MEASURE_TFLOPS=1) writes <output_folder>/tflops_report.json.
               BENCH_CMD="torchrun --nproc_per_node ${NPROC} e2e_pipeline.py \
@@ -327,16 +328,16 @@ spec:
                   }' "$1"
               }
 
-              # ══ BASELINE PASS: TP4xSP2 (8 ranks) at the SAME 480x896 resolution ══
+              # ══ BASELINE PASS: TP4xSP2 (8 ranks) at the SAME 480x768 resolution ══
               # This is the apples-to-apples denominator for the 16-rank speedup. It is a
-              # fresh 8-core number at latent_w=112 (NOT the historical 8.1 fps @ 832).
-              echo "════════════ BASELINE: TP4xSP2 (8 ranks, 480x896) ════════════"
-              ( export NPROC=8 LATENT_W=112
+              # fresh 8-core number at latent_w=96 (NOT the historical 8.1 fps @ 832).
+              echo "════════════ BASELINE: TP4xSP2 (8 ranks, 480x768) ════════════"
+              ( export NPROC=8 LATENT_W=96
                 BASE_CMD="torchrun --nproc_per_node 8 e2e_pipeline.py \
                   --prompt_file prompts/example_prompts.txt \
                   --config_path configs/rolling_forcing_dmd.yaml \
                   --checkpoint_path checkpoints/rolling_forcing_dmd.pt \
-                  --tp_degree 4 --latent_w 112 --num_output_frames 21 \
+                  --tp_degree 4 --latent_w 96 --num_output_frames 21 \
                   --chunk-size 3 --fps 16 --use_ema"
                 echo "--- [baseline warmup] ---"
                 $BASE_CMD --output_folder /tmp/base_warmup 2>&1 \
@@ -348,12 +349,12 @@ spec:
                   | tee "$LOCAL_RESULTS/base_clean.txt" \
                   | grep -iE "T5:|block +[0-9]|fps|TFLOPS|MFU|FAILED|Error" || echo "BASELINE CLEAN FAILED"
               )
-              echo "--- BASELINE (TP4xSP2, 8 ranks, 480x896) steady-state ---"
+              echo "--- BASELINE (TP4xSP2, 8 ranks, 480x768) steady-state ---"
               median_fps "$LOCAL_RESULTS/base_clean.txt" | tee "$LOCAL_RESULTS/base_fps.txt"
 
               echo "════════════ NEURON 3-RUN BENCHMARK (Rolling Forcing) ════════════"
               echo "  model    : Wan2.1-T2V-1.3B + RollingForcing DMD ckpt, TP4xSP4 (16 cores), bf16, 21 frames"
-              echo "  topology : TP=4 x SP=4 = 16 ranks (m-lnc1-trn2 claim), 480x896 / frame_seqlen 1680"
+              echo "  topology : TP=4 x SP=4 = 16 ranks (m-lnc1-trn2 claim), 480x768 / frame_seqlen 1440"
               echo "=================================================================="
 
               echo "=== [1/3] WARMUP (compile-if-cold / load NEFFs; not timed) ==="
@@ -415,7 +416,7 @@ spec:
               echo "=== [5] per-NEFF engine utilization + MFU + optimization priority ==="
               per_neff_mfu
 
-              echo "=== HEADLINE: TP4xSP2 (8 ranks) vs TP4xSP4 (16 ranks), both 480x896 ==="
+              echo "=== HEADLINE: TP4xSP2 (8 ranks) vs TP4xSP4 (16 ranks), both 480x768 ==="
               echo "  --- BASELINE TP4xSP2 (8 ranks) ---"
               cat "$LOCAL_RESULTS/base_fps.txt" 2>/dev/null || echo "  (baseline fps unavailable)"
               echo "  --- MAIN TP4xSP4 (16 ranks) ---"
@@ -490,11 +491,11 @@ spec:
             # RAM — so the old 256Gi request only ever fit the roomier node. 64Gi limit
             # minus the 24Gi memory-backed /dev/shm leaves ~40Gi for the process.
             requests:
-              cpu: 16
-              memory: 64Gi
+              cpu: 70
+              memory: 640Gi
             limits:
-              cpu: 16
-              memory: 64Gi
+              cpu: 70
+              memory: 640Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
