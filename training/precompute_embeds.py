@@ -31,10 +31,16 @@ import os
 from omegaconf import OmegaConf
 import torch
 
-# WanTextEncoder loads UMT5 on CPU (device=torch.device('cpu')) and its forward
-# returns {"prompt_embeds": context[B, 512, 4096]} — the exact dict the trainer
-# consumes. Importing works because we run from cwd=training/.
-from utils.wan_wrapper import WanTextEncoder
+# Import the T5 submodules DIRECTLY — NOT utils.wan_wrapper, NOT the `wan` top-level
+# package. `wan/__init__.py` eagerly imports image2video/text2video, which pull in
+# torchvision (absent from the training image, and unneeded for text encoding).
+# These two submodules are torchvision-free. We replicate WanTextEncoder's exact
+# build + forward below so the embeds are byte-identical to in-loop T5.
+from wan.modules.tokenizers import HuggingfaceTokenizer
+from wan.modules.t5 import umt5_xxl
+
+_T5_CKPT = "wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth"
+_T5_TOKENIZER_DIR = "wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/"
 
 
 def main():
@@ -57,15 +63,30 @@ def main():
     prompts = [p for p in prompts if p.strip() != ""]
     print(f"precomputing embeds for {len(prompts)} prompts (CPU, 1 process)")
 
-    # Bare CPU text encoder — no Neuron, no compile, no distributed.
-    encoder = WanTextEncoder().eval().requires_grad_(False)
+    # Bare CPU UMT5 encoder — no Neuron, no compile, no distributed. This mirrors
+    # WanTextEncoder.__init__ EXACTLY (umt5_xxl encoder_only, fp32, CPU; load the
+    # bf16-enc checkpoint; seq_len=512 whitespace tokenizer) so the embeds match.
+    text_encoder = umt5_xxl(
+        encoder_only=True,
+        return_tokenizer=False,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    ).eval().requires_grad_(False)
+    text_encoder.load_state_dict(
+        torch.load(_T5_CKPT, map_location="cpu", weights_only=False))
+    tokenizer = HuggingfaceTokenizer(
+        name=_T5_TOKENIZER_DIR, seq_len=512, clean="whitespace")
 
     @torch.no_grad()
     def encode(text):
-        # WanTextEncoder.forward zeroes padding past seq_len and returns
-        # {"prompt_embeds": [B, 512, 4096]}. B=1 here → [1, 512, 4096].
-        out = encoder(text_prompts=[text])["prompt_embeds"]
-        return out.detach().to(torch.bfloat16).cpu().contiguous()
+        # Replicates WanTextEncoder.forward: tokenize -> encode -> zero padding
+        # past each sequence's real length. Returns [1, 512, 4096] bf16 on CPU.
+        ids, mask = tokenizer([text], return_mask=True, add_special_tokens=True)
+        seq_lens = mask.gt(0).sum(dim=1).long()
+        context = text_encoder(ids, mask)
+        for u, v in zip(context, seq_lens):
+            u[v:] = 0.0
+        return context.detach().to(torch.bfloat16).cpu().contiguous()
 
     prompt_embeds = {}
     for i, pr in enumerate(prompts):
