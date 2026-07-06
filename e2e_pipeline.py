@@ -183,7 +183,9 @@ def main():
         meter = TFLOPSMeter(num_cores=world)
 
     # Precompute FLOPs estimates for DiT/T5/VAE
-    num_denoising_steps = 5  # from rolling_forcing_dmd.yaml denoising_step_list
+    # Derive step count from the pipeline (== len(denoising_step_list)); do NOT hardcode,
+    # so a re-distilled T=4 checkpoint reports correct window count / MFU.
+    num_denoising_steps = len(pipe.denoising_step_list)
     frame_seq_length = pipe.frame_seq_length
     num_frames_per_block = pipe.num_frame_per_block
     dit_flops_per_step = compute_dit_flops_per_step(

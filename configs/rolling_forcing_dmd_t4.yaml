@@ -1,0 +1,69 @@
+# T=4 DMD distillation config for Rolling Forcing (faster inference student).
+#
+# This is a TRAINING config (mirrors upstream ~/RollingForcing/configs/rolling_forcing_dmd.yaml)
+# with ONE substantive change vs the shipped T=5 recipe: a 4-entry denoising_step_list.
+#
+# WHY: inference cost per rolling window scales with (T+1) merged frames
+# (dit_pipeline.py: full_frames = (T+1)*num_frame_per_block). Dropping T 5->4 cuts the
+# DiT work per block ~18->15 frames (~0.83x) -> projects ~14 fps -> ~16-17 fps.
+# You CANNOT just truncate the shipped T=5 checkpoint at inference: the student only
+# predicts accurate x0 at the noise levels it was distilled on. Fewer steps => re-distill.
+#
+# denoising_step_list: 4 evenly-spaced levels. warp_denoising_step: true => NO trailing 0
+# (the config comment upstream: "need to remove - 0 ... if warp_denoising_step is true").
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+
+# ── everything below is IDENTICAL to the proven T=5 upstream training recipe ──
+generator_ckpt: checkpoints/ode_init.pt          # Self-Forcing ODE-init (gdhe17/Self-Forcing)
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-14B                         # teacher = BASE multi-step bidirectional 14B
+                                                  # (NOT a distilled few-step ckpt — that was SD bug B)
+text_encoder_fsdp_wrap_strategy: size
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0                               # real-score CFG
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+sharding_strategy: hybrid_full
+lr: 1.5e-06                                        # generator lr
+lr_critic: 4.0e-07                                 # critic lr (lower)
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+data_path: prompts/distill_poc_single.txt         # PROOF-OF-CONCEPT: single prompt (example 000,
+                                                  # the western/horse shot). Data-free DMD; a student
+                                                  # specialized to ONE prompt tolerates fewer steps
+                                                  # best. Compare its T=4 render against the existing
+                                                  # T=5 baseline rf_sp4_videos/prompt_000.mp4.
+                                                  # Swap to prompts/example_prompts.txt (15) or
+                                                  # vidprom_filtered_extended.txt for a broader model.
+batch_size: 1
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 64
+log_iters: 100
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5                          # generator updated once per 5 critic steps
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+distribution_loss: dmd
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 3                             # independent of T; keep at 3
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
