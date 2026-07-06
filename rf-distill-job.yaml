@@ -83,7 +83,12 @@ spec:
                 "regex" \
                 "easydict" \
                 "tensorboard" \
-                "imageio" "imageio-ffmpeg" "av"
+                "imageio" "imageio-ffmpeg" "av" \
+                "lmdb" "wandb"
+              # lmdb + wandb: trainer/__init__.py eagerly imports ALL trainers
+              # (diffusion/gan import wandb; dataset.py imports lmdb) even though we
+              # only run score_distillation with --disable-wandb. Verified the full
+              # train.py import chain resolves with exactly these added (local trace).
               # NOTE: do NOT pin numpy==1.24.4 (upstream RF pin). The image is Python 3.12,
               # which removed distutils; numpy 1.24.4 has no 3.12 wheel and its source build
               # needs distutils -> fails. The base torch-neuronx venv already ships a working
@@ -157,6 +162,13 @@ spec:
               # from the 16-rank training job, leaving room for the frozen 14B teacher.
               # The trainer reads these via PRECOMPUTED_EMBEDS and looks up embeds by prompt.
               cd training
+              # The trainer/precompute run from cwd=training/ (so `configs/` and the
+              # `utils`/`model`/`wan` packages resolve), but the config's data_path
+              # (prompts/...), generator_ckpt (checkpoints/...), and wan_wrapper's
+              # hardcoded wan_models/... are all relative to the REPO ROOT. Symlink
+              # those three data dirs in so every relative path resolves from here too.
+              for d in prompts checkpoints wan_models; do ln -sfn ../$d ./$d; done
+              ls -ld prompts checkpoints wan_models
               EMB=/tmp/embeds.pt
               python3 precompute_embeds.py \
                 --config_path ../configs/rolling_forcing_dmd_t4.yaml \
@@ -206,7 +218,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "main"
+              value: "rf-distill-t4"
             # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
             - name: NPROC
               value: "16"            # all 16 NeuronCores (2 chips x 8, LNC=1)
