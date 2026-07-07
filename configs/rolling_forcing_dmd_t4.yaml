@@ -107,3 +107,14 @@ num_training_frames: 21
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
+  # BOUND the causal self-attention window (frames) to cap the rollout attention
+  # scratchpad. Three-group placement freed co-residency (Tensors 11.2->6.6GB/core),
+  # but the student rollout's LAST block attends the FULL 21-frame window: scores =
+  # 3 frames(3600 tok) x 21 frames(25200 tok) x 12 heads x 2B = 2.18GB, overflowing
+  # the ~24GB budget on top of ~15GB rollout scratchpad. local_attn_size=-1 (unbounded)
+  # -> 12 frames caps KV span at 12*1200=14400 -> scores ~1.24GB (~0.9GB saved), clears
+  # it with headroom. Tradeoff: deploy caps context at 24 frames (dit_attention.py
+  # kv_cache_logical_size=24*frame_length) and we train at 21, so this trims the
+  # attention span from 21->12 frames vs deploy's effective 21. Acceptable for the T=4
+  # PoC (single prompt, does-it-converge); revisit for the shippable multi-prompt ckpt.
+  local_attn_size: 12
