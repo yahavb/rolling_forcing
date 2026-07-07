@@ -7,7 +7,16 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import repeat
 
-from .attention import flash_attention
+# Cross-attention here calls flash_attention directly, but upstream flash_attention
+# asserts q.device.type=='cuda' and needs the flash-attn wheel — neither exists on
+# Neuron (flash-attn is NOT installed; the job runs the SDPA fallback). The
+# attention() dispatcher in the same module already picks flash-attn WHEN AVAILABLE
+# and otherwise falls back to F.scaled_dot_product_attention (what SD's cross-attn
+# uses: neuron_layers WanT2VCrossAttention -> F.scaled_dot_product_attention). Alias
+# flash_attention -> attention so all call sites route through that dispatcher: on GPU
+# it still uses flash-attn (identical), on Neuron it uses SDPA. causal_model.py already
+# imports `attention` for self-attn for the same reason; this covers cross-attn.
+from .attention import attention as flash_attention
 
 __all__ = ['WanModel']
 
