@@ -123,8 +123,15 @@ class Trainer:
             if getattr(config, "generator_ckpt", False):
                 self._log(f"loading student init from {config.generator_ckpt}")
                 sd = torch.load(config.generator_ckpt, map_location="cpu")
-                sd = sd.get("generator", sd.get("model", sd))
-                self.generator.model.load_state_dict(sd, strict=True)
+                # ode_init.pt's "generator" dict is keyed for the WRAPPER
+                # (model.patch_embedding.weight, ...), so load into self.generator
+                # (WanDiffusionWrapper), NOT self.generator.model — exactly as the
+                # original trainer (distillation.py) does.
+                if "generator" in sd:
+                    sd = sd["generator"]
+                elif "model" in sd:
+                    sd = sd["model"]
+                self.generator.load_state_dict(sd, strict=True)
             self.generator = fsdp_wrap(
                 self.generator, sharding_strategy=config.sharding_strategy,
                 mixed_precision=config.mixed_precision, wrap_strategy="transformer",
