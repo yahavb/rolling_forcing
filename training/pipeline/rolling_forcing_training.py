@@ -59,6 +59,21 @@ class RollingForcingTrainingPipeline:
         m.frame_length = fseq
         m.block_length = self.num_frame_per_block * fseq
         m.max_attention_size = self.num_max_frames * fseq
+        # CRITICAL: the KV-cache slicing (frame_length/block_length/max_attention_size)
+        # is read from each CausalWanSelfAttention SUBMODULE's OWN attributes (see
+        # causal_model.py:115-117 + their uses in self-attn forward), NOT from the
+        # top-level model. Each submodule was built with the provisional 1560 default
+        # (block_length=3*1560=4680), so without propagating here the cache write tries
+        # to assign a 3*fseq(=3600 @60x80) tensor into a 4680-wide slice -> "expanded
+        # size 4680 must match existing size 3600". Push the real values into every
+        # attention submodule. (Inference sidesteps this by constructing attn with the
+        # correct frame_length; training builds at 1560 and syncs at rollout time.)
+        for blk in m.blocks:
+            attn = getattr(blk, "self_attn", None)
+            if attn is not None:
+                attn.frame_length = fseq
+                attn.block_length = self.num_frame_per_block * fseq
+                attn.max_attention_size = self.num_max_frames * fseq
 
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         rank = dist.get_rank() if dist.is_initialized() else 0
