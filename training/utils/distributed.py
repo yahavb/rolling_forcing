@@ -20,23 +20,33 @@ def fsdp_state_dict(model):
     return checkpoint
 
 
-def make_distill_groups(tp_degree):
+def make_distill_groups(tp_degree, teacher_tp=None, student_tp=None, fake_tp=None):
     """SD three-group placement (distill_sdv2.py three_group=True): give EACH net its
-    own tp_degree-rank group so each core holds ONE model (teacher | student | fake),
-    not all three co-resident. Cross-group transfer is via GLOBAL broadcast (Neuron
-    supports broadcast, not P2P): student bcasts x_t/t/x0; teacher & fake each score
-    and bcast their pred back. Ranks >= 3*tp are IDLE but MUST still join every WORLD
-    collective in lockstep (they are members of the world group only).
+    own rank group so each core holds ONE model (teacher | student | fake), not all
+    three co-resident. Cross-group transfer is via GLOBAL broadcast (Neuron supports
+    broadcast, not P2P): student bcasts x_t/t/x0; teacher & fake each score and bcast
+    their pred back. Ranks beyond the assigned groups are IDLE but MUST still join every
+    WORLD collective in lockstep.
+
+    ASYMMETRIC by default: the 14B teacher is ~10x the 1.3B student/critic and, unlike
+    SD's custom-TP teacher (splits activations too), RF's FSDP teacher holds FULL
+    activations per rank — so 4 ranks OOMs. Give the teacher MORE ranks. Default on a
+    16-core box: teacher=8, student=4, critic=4 (uses all 16; 14B bf16/8 = 3.5GB/core
+    vs 7GB at /4). Override via per-group *_tp; falls back to symmetric tp_degree.
 
     Returns a dict with per-group ProcessGroup handles + this rank's membership +
     the GLOBAL src rank of each group (for world-broadcasts)."""
     ws = dist.get_world_size()
     my_rank = dist.get_rank()
-    teacher_ranks = list(range(0, tp_degree))
-    student_ranks = list(range(tp_degree, 2 * tp_degree))
-    fake_ranks = list(range(2 * tp_degree, 3 * tp_degree))
-    assert ws >= 3 * tp_degree, (
-        f"three-group placement needs world>=3*tp ({3*tp_degree}); got world={ws}")
+    t_tp = teacher_tp if teacher_tp is not None else tp_degree
+    s_tp = student_tp if student_tp is not None else tp_degree
+    f_tp = fake_tp if fake_tp is not None else tp_degree
+    assert ws >= t_tp + s_tp + f_tp, (
+        f"three-group placement needs world>=teacher_tp+student_tp+fake_tp "
+        f"({t_tp}+{s_tp}+{f_tp}={t_tp+s_tp+f_tp}); got world={ws}")
+    teacher_ranks = list(range(0, t_tp))
+    student_ranks = list(range(t_tp, t_tp + s_tp))
+    fake_ranks = list(range(t_tp + s_tp, t_tp + s_tp + f_tp))
     # new_group is COLLECTIVE: every rank must call for all groups in the same order.
     teacher_pg = dist.new_group(ranks=teacher_ranks)
     student_pg = dist.new_group(ranks=student_ranks)

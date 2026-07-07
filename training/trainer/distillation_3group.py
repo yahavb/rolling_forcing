@@ -43,7 +43,14 @@ class Trainer:
         self.config = config
         self.step = 0
         launch_distributed_job()
-        self.groups = make_distill_groups(int(getattr(config, "tp_degree", 4)))
+        # ASYMMETRIC groups: the 14B teacher needs more ranks than the 1.3B student/critic
+        # (RF's FSDP teacher holds full activations per rank, so 4 OOMs). Default:
+        # teacher=8, student=4, critic=4 -> all 16 cores, 14B bf16/8 = 3.5GB/core.
+        self.groups = make_distill_groups(
+            int(getattr(config, "tp_degree", 4)),
+            teacher_tp=int(getattr(config, "teacher_tp", 8)),
+            student_tp=int(getattr(config, "student_tp", 4)),
+            fake_tp=int(getattr(config, "fake_tp", 4)))
         g = self.groups
         self.my_rank = g["my_rank"]
         self.world_size = g["world_size"]
@@ -59,7 +66,8 @@ class Trainer:
             config.seed = rs.item()
         set_seed(config.seed + self.my_rank)
 
-        self._log(f"placement: world={self.world_size} tp={g['tp_degree']} "
+        self._log(f"placement: world={self.world_size} "
+                  f"teacher_ranks={g['teacher_ranks']} student_ranks={g['student_ranks']} fake_ranks={g['fake_ranks']} "
                   f"rank={self.my_rank} teacher={self.in_teacher} student={self.in_student} fake={self.in_fake}")
 
         # ── precomputed embeds (no T5 on device) ──
