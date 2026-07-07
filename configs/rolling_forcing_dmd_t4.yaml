@@ -20,9 +20,15 @@ warp_denoising_step: true
 
 # ── everything below is IDENTICAL to the proven T=5 upstream training recipe ──
 generator_ckpt: checkpoints/ode_init.pt          # Self-Forcing ODE-init (gdhe17/Self-Forcing)
-generator_fsdp_wrap_strategy: size
-real_score_fsdp_wrap_strategy: size
-fake_score_fsdp_wrap_strategy: size
+# PER-BLOCK FSDP wrap (SD's fix for the 5.287GB whole-model all-gather OOM). "size"
+# wrap (min 5e7 params) leaves each Wan block < threshold -> FSDP wraps the whole 1.3B
+# net as ONE unit and all-gathers all 5.287GB fp32 in a single spike to run forward.
+# "transformer" wrap shards PER CausalWanAttentionBlock/WanAttentionBlock, so only one
+# block is gathered at a time (SD: `for blk in m.blocks: fully_shard(blk)`). See
+# distillation.py where transformer_module is passed.
+generator_fsdp_wrap_strategy: transformer
+real_score_fsdp_wrap_strategy: transformer
+fake_score_fsdp_wrap_strategy: transformer
 real_name: Wan2.1-T2V-14B                         # teacher = BASE multi-step bidirectional 14B
                                                   # (NOT a distilled few-step ckpt — that was SD bug B)
 text_encoder_fsdp_wrap_strategy: size

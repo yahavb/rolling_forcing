@@ -12,6 +12,8 @@ from utils.misc import (
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import CausVid, DMD, SiD
+from wan.modules.causal_model import CausalWanAttentionBlock
+from wan.modules.model import WanAttentionBlock
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import time
@@ -96,6 +98,18 @@ class Trainer:
             # Free the CPU-resident text encoder before it is ever moved/wrapped.
             self.model.text_encoder = None
 
+        # PER-BLOCK FSDP wrap (the SD fix for the 5.287GB all-gather OOM).
+        # With wrap_strategy="size" (min_num_params=5e7) the Wan blocks are individually
+        # < 50M params, so FSDP wraps each net as ONE shard-unit and must all-gather the
+        # ENTIRE 1.3B model (5.287GB fp32) onto the core in a single spike to run its
+        # forward — which OOM'd on top of the other resident models. SD shards PER BLOCK
+        # (distill_sdv2.py: `for blk in m.blocks: fully_shard(blk, ...)` +
+        # reshard_after_forward), so only ONE transformer block is gathered at a time and
+        # freed right after. The FSDP1 equivalent is transformer_auto_wrap_policy targeting
+        # the block classes. Generator=CausalWanAttentionBlock, teacher/critic=WanAttentionBlock;
+        # pass both so every net shards per-block regardless of causal/non-causal.
+        _wan_blocks = {CausalWanAttentionBlock, WanAttentionBlock}
+
         # Neuron fp32-master fix: generator and fake_score (critic) are TRAINABLE
         # and MUST keep fp32 master params (see fsdp_wrap docstring). real_score
         # (the frozen 14B teacher) and text_encoder are frozen and stay bf16.
@@ -104,6 +118,7 @@ class Trainer:
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
             wrap_strategy=config.generator_fsdp_wrap_strategy,
+            transformer_module=_wan_blocks,
             fp32_master=True
         )
 
@@ -114,7 +129,8 @@ class Trainer:
             self.model.real_score,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.real_score_fsdp_wrap_strategy
+            wrap_strategy=config.real_score_fsdp_wrap_strategy,
+            transformer_module=_wan_blocks
         )
 
         self.model.fake_score = fsdp_wrap(
@@ -122,6 +138,7 @@ class Trainer:
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
             wrap_strategy=config.fake_score_fsdp_wrap_strategy,
+            transformer_module=_wan_blocks,
             fp32_master=True
         )
 
