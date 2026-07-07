@@ -27,39 +27,65 @@ def sinusoidal_embedding_1d(dim, position):
 
 # @amp.autocast(enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
+    # REAL-VALUED cos/sin RoPE (no torch.polar/complex). Neuron has no native
+    # complex op, and NEURON_FALLBACK... hard-errors on the complex torch.cat used by
+    # the upstream implementation. This mirrors SD's neuron_layers.rope_params and this
+    # repo's own inference (models/dit_layers.rope_params): return cos & sin PACKED into
+    # a trailing dim -> shape [max_seq_len, dim//2, 2]. Packing lets the model's
+    # `torch.cat([...], dim=1)` freqs assembly stay unchanged (cat over the freq dim,
+    # the trailing [2] rides along) so downstream shapes/splits are identical.
     assert dim % 2 == 0
     freqs = torch.outer(
         torch.arange(max_seq_len),
         1.0 / torch.pow(theta,
                         torch.arange(0, dim, 2).to(torch.float64).div(dim)))
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs
+    return torch.stack([torch.cos(freqs).float(), torch.sin(freqs).float()], dim=-1)
+
+
+def _rope_cos_sin(freqs_parts, coords, seq_len, c):
+    """Build (cos, sin) each [seq_len, 1, c] from the 3 split freq parts (packed
+    [_, pc, 2]) and per-axis coordinate index tensors (temporal, height, width).
+    Real-valued torch.cat only (the complex cat was the Neuron-unsupported op)."""
+    (tf, th, tw) = coords  # index tensors for T, H, W
+    def _assemble(sel):  # sel = 0 -> cos, 1 -> sin
+        f, h, w = tf.numel(), th.numel(), tw.numel()
+        return torch.cat([
+            torch.index_select(freqs_parts[0][..., sel], 0, tf).view(f, 1, 1, -1).expand(f, h, w, -1),
+            torch.index_select(freqs_parts[1][..., sel], 0, th).view(1, h, 1, -1).expand(f, h, w, -1),
+            torch.index_select(freqs_parts[2][..., sel], 0, tw).view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(seq_len, 1, c)
+    return _assemble(0), _assemble(1)
+
+
+def _apply_rope_real(x_i, cos, sin, n, c):
+    """Rotate x_i[:seq_len] with real cos/sin (SD neuron_layers.causal_rope_apply
+    math). x_i: [seq_len, n, 2c] (interleaved re/im pairs). Returns [seq_len, n, 2c]."""
+    seq_len = cos.size(0)
+    x0 = x_i.to(torch.float32).reshape(seq_len, n, c, 2)
+    x_re = x0[..., 0]
+    x_im = x0[..., 1]
+    out_re = x_re * cos - x_im * sin
+    out_im = x_re * sin + x_im * cos
+    return torch.stack([out_re, out_im], dim=-1).reshape(seq_len, n, 2 * c)
 
 
 # @amp.autocast(enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
 
-    # split freqs
+    # split freqs (packed real [1024, C, 2]) along the freq dim
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
     # loop over samples
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
-
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        dev = x.device
+        coords = (torch.arange(f, device=dev),
+                  torch.arange(h, device=dev),
+                  torch.arange(w, device=dev))
+        cos, sin = _rope_cos_sin(freqs, coords, seq_len, c)
+        x_i = _apply_rope_real(x[i, :seq_len], cos, sin, n, c)
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         # append to collection

@@ -6,7 +6,9 @@ from wan.modules.model import (
     WAN_CROSSATTENTION_CLASSES,
     rope_params,
     MLPProj,
-    sinusoidal_embedding_1d
+    sinusoidal_embedding_1d,
+    _rope_cos_sin,
+    _apply_rope_real,
 )
 # Neuron: torch flex_attention has NO Neuron backend, so the upstream
 # flex_attention import is intentionally left disabled. We instead materialize
@@ -67,9 +69,12 @@ def _neuron_flex_attention(query, key, value, block_mask):
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
+    # REAL-VALUED cos/sin RoPE (no complex; see model.rope_params). Identical to
+    # rope_apply but the temporal axis is offset by start_frame (rolling-forcing
+    # windows advance the frame position). freqs is packed real [1024, C, 2].
     n, c = x.size(2), x.size(3) // 2
 
-    # split freqs
+    # split freqs along the freq dim
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
     # loop over samples
@@ -77,19 +82,12 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
 
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
-
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        dev = x.device
+        coords = (start_frame + torch.arange(f, device=dev),
+                  torch.arange(h, device=dev),
+                  torch.arange(w, device=dev))
+        cos, sin = _rope_cos_sin(freqs, coords, seq_len, c)
+        x_i = _apply_rope_real(x[i, :seq_len], cos, sin, n, c)
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         # append to collection
