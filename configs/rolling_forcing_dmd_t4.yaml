@@ -33,7 +33,12 @@ guidance_scale: 3.0                               # real-score CFG
 denoising_loss_type: flow
 mixed_precision: true
 seed: 0
-sharding_strategy: hybrid_full
+sharding_strategy: full   # FULL_SHARD across all 16 cores (÷16). hybrid_full only
+                          # shards WITHIN each chip and REPLICATES across the 2 chips
+                          # (÷8) -> ~5.8GB/core of trainable params+fp32 master+Adam per
+                          # net; full halves that to ~2.9GB/core. This is the dominant
+                          # HBM cost that OOM'd (NRT dump: Tensors=22GB/pool), not a
+                          # retained graph (RF already grad-limits the rollout via exit_flag).
 lr: 1.5e-06                                        # generator lr
 lr_critic: 4.0e-07                                 # critic lr (lower)
 beta1: 0.0

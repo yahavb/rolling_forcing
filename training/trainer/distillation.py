@@ -107,18 +107,14 @@ class Trainer:
             fp32_master=True
         )
 
-        # CPU-offload the frozen 14B teacher by default. It is forward-only (no
-        # grads, no optimizer state), so streaming its params from host RAM per
-        # FSDP unit avoids putting the full unsharded module on a NeuronCore at
-        # init — which OOM'd HBM (NRT alloc size=5.68GB failed in
-        # _move_states_to_device). Trainable nets (generator/critic) stay on device.
-        # Override with real_score_cpu_offload: false in the config if HBM allows.
+        # ALL models stay on Neuron — NO CPU offload. The frozen 14B teacher is
+        # FULL_SHARD across all 16 cores like the others (~1/16 of 14B bf16 ≈
+        # 1.75GB/core). The HBM fix is sharding (full, ÷16), not offload.
         self.model.real_score = fsdp_wrap(
             self.model.real_score,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.real_score_fsdp_wrap_strategy,
-            cpu_offload=getattr(config, "real_score_cpu_offload", True)
+            wrap_strategy=config.real_score_fsdp_wrap_strategy
         )
 
         self.model.fake_score = fsdp_wrap(
