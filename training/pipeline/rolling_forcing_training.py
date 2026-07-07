@@ -38,6 +38,14 @@ class RollingForcingTrainingPipeline:
         self.context_noise = context_noise
         self.i2v = False
 
+        # THREE-GROUP: the rollout runs ONLY on the student group (ranks tp..2tp-1),
+        # but its internal collectives (generate_and_sync_list + the base.py broadcasts)
+        # default to WORLD src=0 (a teacher rank) -> DEADLOCK when only student ranks
+        # enter. Route them through the student process group + its src rank instead.
+        # None -> world (single-group / legacy behaviour, unchanged).
+        self.sync_group = kwargs.get("sync_group", None)
+        self.sync_src = kwargs.get("sync_src", 0)
+
         self.kv_cache_clean = None
         self.kv_cache2 = None
         self.independent_first_frame = independent_first_frame
@@ -77,8 +85,9 @@ class RollingForcingTrainingPipeline:
 
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         rank = dist.get_rank() if dist.is_initialized() else 0
+        src = self.sync_src  # group-local src (student group leader), not world rank 0
 
-        if rank == 0:
+        if rank == src:
             # Generate random indices
             indices = torch.randint(
                 low=0,
@@ -91,7 +100,9 @@ class RollingForcingTrainingPipeline:
         else:
             indices = torch.empty(num_blocks, dtype=torch.long, device=device)
 
-        dist.broadcast(indices, src=0)  # Broadcast the random indices to all ranks
+        # Broadcast within the student group (src=sync_src) — not world (would deadlock
+        # the teacher/fake groups, which never enter the rollout).
+        dist.broadcast(indices, src=src, group=self.sync_group)
         return indices.tolist()
     
     def generate_list(self, num_blocks, num_denoising_steps, device):

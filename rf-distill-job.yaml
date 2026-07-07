@@ -222,6 +222,12 @@ spec:
               value: "1"
             - name: BRANCH
               value: "rf-distill-t4"
+            # THREE-GROUP placement (SD's proven co-residency fix): teacher on ranks 0-3,
+            # student 4-7, critic 8-11 (tp_degree=4), ranks 12-15 idle-but-lockstep. Each
+            # core holds ONE model instead of all three (11.2GB) -> the rollout's ~1.5GB
+            # NEFF fits. Selects trainer/distillation_3group.py. Needs tp_degree in config.
+            - name: DISTILL_THREE_GROUP
+              value: "1"
             # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
             - name: NPROC
               value: "16"            # all 16 NeuronCores (2 chips x 8, LNC=1)

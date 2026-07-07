@@ -20,7 +20,39 @@ def fsdp_state_dict(model):
     return checkpoint
 
 
-def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False, fp32_master=False):
+def make_distill_groups(tp_degree):
+    """SD three-group placement (distill_sdv2.py three_group=True): give EACH net its
+    own tp_degree-rank group so each core holds ONE model (teacher | student | fake),
+    not all three co-resident. Cross-group transfer is via GLOBAL broadcast (Neuron
+    supports broadcast, not P2P): student bcasts x_t/t/x0; teacher & fake each score
+    and bcast their pred back. Ranks >= 3*tp are IDLE but MUST still join every WORLD
+    collective in lockstep (they are members of the world group only).
+
+    Returns a dict with per-group ProcessGroup handles + this rank's membership +
+    the GLOBAL src rank of each group (for world-broadcasts)."""
+    ws = dist.get_world_size()
+    my_rank = dist.get_rank()
+    teacher_ranks = list(range(0, tp_degree))
+    student_ranks = list(range(tp_degree, 2 * tp_degree))
+    fake_ranks = list(range(2 * tp_degree, 3 * tp_degree))
+    assert ws >= 3 * tp_degree, (
+        f"three-group placement needs world>=3*tp ({3*tp_degree}); got world={ws}")
+    # new_group is COLLECTIVE: every rank must call for all groups in the same order.
+    teacher_pg = dist.new_group(ranks=teacher_ranks)
+    student_pg = dist.new_group(ranks=student_ranks)
+    fake_pg = dist.new_group(ranks=fake_ranks)
+    return {
+        "teacher_ranks": teacher_ranks, "student_ranks": student_ranks, "fake_ranks": fake_ranks,
+        "teacher_pg": teacher_pg, "student_pg": student_pg, "fake_pg": fake_pg,
+        "tsrc": teacher_ranks[0], "ssrc": student_ranks[0], "fsrc": fake_ranks[0],
+        "in_teacher": my_rank in teacher_ranks,
+        "in_student": my_rank in student_ranks,
+        "in_fake": my_rank in fake_ranks,
+        "my_rank": my_rank, "world_size": ws, "tp_degree": tp_degree,
+    }
+
+
+def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False, fp32_master=False, process_group=None):
     # ── Neuron fp32-master-weight fix ─────────────────────────────────────────
     # THE critical distillation fix. For TRAINABLE networks (generator +
     # fake_score/critic) we MUST keep fp32 master parameters. A bf16-only param
@@ -78,6 +110,7 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
 
     module = FSDP(
         module,
+        process_group=process_group,   # None -> WORLD; a group -> shard within that group only
         auto_wrap_policy=auto_wrap_policy,
         sharding_strategy=sharding_strategy,
         mixed_precision=mixed_precision_policy,

@@ -137,7 +137,12 @@ class RollingForcingModel(BaseModel):
         max_num_blocks = max_num_frames // self.num_frame_per_block
         min_num_blocks = min_num_frames // self.num_frame_per_block
         num_generated_blocks = torch.randint(min_num_blocks, max_num_blocks + 1, (1,), device=self.device)
-        dist.broadcast(num_generated_blocks, src=0)
+        # THREE-GROUP: rollout runs only on the student group; broadcast within it
+        # (src=sync_src, group=sync_group) instead of world src=0 (would deadlock the
+        # teacher/fake groups). Defaults (None/0) reproduce the original world-broadcast.
+        dist.broadcast(num_generated_blocks,
+                       src=getattr(self, "sync_src", 0),
+                       group=getattr(self, "sync_group", None))
         num_generated_blocks = num_generated_blocks.item()
         num_generated_frames = num_generated_blocks * self.num_frame_per_block
         if self.args.independent_first_frame and initial_latent is None:
@@ -210,7 +215,10 @@ class RollingForcingModel(BaseModel):
             self._initialize_inference_pipeline()
 
         infer_w_rolling = torch.rand(1, device=self.device) > 0.5
-        dist.broadcast(infer_w_rolling, src=0)
+        # THREE-GROUP: student-group-local broadcast (see _run_generator note above).
+        dist.broadcast(infer_w_rolling,
+                       src=getattr(self, "sync_src", 0),
+                       group=getattr(self, "sync_group", None))
 
         if infer_w_rolling:
             return self.inference_pipeline.inference_with_rolling_forcing(
@@ -236,5 +244,8 @@ class RollingForcingModel(BaseModel):
             same_step_across_blocks=self.args.same_step_across_blocks,
             last_step_only=self.args.last_step_only,
             num_max_frames=self.num_training_frames,
-            context_noise=self.args.context_noise
+            context_noise=self.args.context_noise,
+            # THREE-GROUP: rollout collectives stay within the student group.
+            sync_group=getattr(self, "sync_group", None),
+            sync_src=getattr(self, "sync_src", 0),
         )
