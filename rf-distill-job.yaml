@@ -41,11 +41,13 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        # 16 NeuronCores (2 chips x 8, LNC=1). Frozen 14B teacher + trainable 1.3B student +
-        # 1.3B critic sharded across all 16 via FSDP HYBRID_SHARD. HBM is the gating risk —
-        # see training/README.md RISKS. (Same claim this repo's rf-job.yaml benchmarks on.)
-        - name: m-lnc1-trn2
-          resourceClaimTemplateName: m-lnc1-trn2
+        # l-trn2 claim: full 2-chip Trn2 allocation (more HBM/host headroom than
+        # m-lnc1-trn2). The 14B teacher wrap OOM'd HBM at init on the smaller claim;
+        # this plus CPU-offloading the frozen teacher (trainer real_score_cpu_offload)
+        # is the fix. Frozen 14B teacher + trainable 1.3B student + 1.3B critic via
+        # FSDP HYBRID_SHARD. NOTE: does NOT set NEURON_LOGICAL_NC_CONFIG (forbidden).
+        - name: l-trn2
+          resourceClaimTemplateName: l-trn2
       containers:
         - name: rf-distill
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -197,7 +199,7 @@ spec:
               ls -lhR "$FINAL" | head -60
           resources:
             claims:
-              - name: m-lnc1-trn2
+              - name: l-trn2
             # Training is far more host-heavy than the inference benchmark this manifest
             # was cloned from (70/640Gi): the CPU fp32 EMA shadow, fsdp_state_dict's
             # gather+offload-to-CPU at every save, the 14B teacher loading on CPU before
@@ -205,10 +207,10 @@ spec:
             # 192 vCPU / ~2Ti and sits at ~37% CPU / ~26% mem, so take a bigger slice.
             requests:
               cpu: 80
-              memory: 512Gi
+              memory: 728Gi
             limits:
               cpu: 80
-              memory: 512Gi
+              memory: 728Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
