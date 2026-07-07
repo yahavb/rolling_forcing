@@ -376,6 +376,10 @@ class Trainer:
         # Neuron: use self.device (torch.device("neuron")) instead of the
         # hard-coded "cuda" device strings from upstream.
         batch_size = len(prompts)
+        # Latent H,W from the config (image_or_video_shape=[B,F,C,H,W]) instead of a
+        # hardcoded 60x104 — otherwise visualization samples at the wrong resolution
+        # (and re-inflates the KV cache we just cut). Matches training res.
+        _lat_h, _lat_w = self.config.image_or_video_shape[3], self.config.image_or_video_shape[4]
         if image is not None:
             image = image.squeeze(0).unsqueeze(0).unsqueeze(2).to(device=self.device, dtype=torch.bfloat16)
 
@@ -383,14 +387,14 @@ class Trainer:
             initial_latent = pipeline.vae.encode_to_latent(image).to(device=self.device, dtype=torch.bfloat16)
             initial_latent = initial_latent.repeat(batch_size, 1, 1, 1, 1)
             sampled_noise = torch.randn(
-                [batch_size, self.model.num_training_frames - 1, 16, 60, 104],
+                [batch_size, self.model.num_training_frames - 1, 16, _lat_h, _lat_w],
                 device=self.device,
                 dtype=self.dtype
             )
         else:
             initial_latent = None
             sampled_noise = torch.randn(
-                [batch_size, self.model.num_training_frames, 16, 60, 104],
+                [batch_size, self.model.num_training_frames, 16, _lat_h, _lat_w],
                 device=self.device,
                 dtype=self.dtype
             )

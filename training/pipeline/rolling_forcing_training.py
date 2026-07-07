@@ -26,7 +26,14 @@ class RollingForcingTrainingPipeline:
 
         # Wan specific hyperparameters
         self.num_transformer_blocks = 30
-        self.frame_seq_length = 1560
+        # frame_seq_length is DERIVED from the actual latent resolution at rollout
+        # time (see _sync_frame_seq_length), NOT hardcoded. Hardcoding 1560 (480x832)
+        # while training at 480x640 (1200) over-allocated the KV cache
+        # (num_max_frames * 1560 * 12 * 128 * 2B * 30 layers = 6.0GB vs 4.6GB at 1200)
+        # AND distilled for the wrong resolution vs what we deploy. This mirrors SD
+        # commit 3a3504a ("_update_frame_length ... default 1560 -> shape err").
+        self.frame_seq_length = 1560  # provisional; overwritten per-rollout from noise H,W
+        self.num_max_frames = num_max_frames
         self.num_frame_per_block = num_frame_per_block
         self.context_noise = context_noise
         self.i2v = False
@@ -37,6 +44,21 @@ class RollingForcingTrainingPipeline:
         self.same_step_across_blocks = same_step_across_blocks
         self.last_step_only = last_step_only
         self.kv_cache_size = num_max_frames * self.frame_seq_length
+
+    def _sync_frame_seq_length(self, height, width):
+        """Set frame_seq_length + kv_cache_size + the model's attention window from
+        the ACTUAL latent resolution (patch_size (1,2,2) -> (H//2)*(W//2)), matching
+        the authoritative inference convention in models/dit_pipeline.py. Keeps the
+        causal generator's frame_length/block_length/max_attention_size consistent so
+        KV-cache slicing and the block-causal mask use the right token count."""
+        pT, pH, pW = self.generator.model.patch_size
+        fseq = (height // pH) * (width // pW)
+        self.frame_seq_length = fseq
+        self.kv_cache_size = self.num_max_frames * fseq
+        m = self.generator.model
+        m.frame_length = fseq
+        m.block_length = self.num_frame_per_block * fseq
+        m.max_attention_size = self.num_max_frames * fseq
 
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -80,6 +102,7 @@ class RollingForcingTrainingPipeline:
             **conditional_dict
     ) -> torch.Tensor:
         batch_size, num_frames, num_channels, height, width = noise.shape
+        self._sync_frame_seq_length(height, width)  # SD 3a3504a: KV cache/attn from real res
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             # If the first frame is independent and the first frame is provided, then the number of frames in the
             # noise should still be a multiple of num_frame_per_block
@@ -261,6 +284,7 @@ class RollingForcingTrainingPipeline:
             **conditional_dict
     ) -> torch.Tensor:
         batch_size, num_frames, num_channels, height, width = noise.shape
+        self._sync_frame_seq_length(height, width)  # SD 3a3504a: KV cache/attn from real res
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             # If the first frame is independent and the first frame is provided, then the number of frames in the
             # noise should still be a multiple of num_frame_per_block
