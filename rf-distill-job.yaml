@@ -229,16 +229,8 @@ spec:
             # Everything else (lr 1.5e-6 / lr_critic 4e-7 / dfake_gen_update_ratio 5 /
             # guidance_scale 3.0 / ema 0.99 from step 200 / batch 1-per-rank) is in that config.
             # ── Neuron runtime (mirrors this repo's inference jobs). NO NEURON_LOGICAL_NC_CONFIG. ──
-            # CPU FALLBACK ENABLED for training (matches SD's distill job, which sets no
-            # fallback env -> default enabled). TRAINING uses the upstream complex-number
-            # RoPE (causal_model.py causal_rope_apply: torch.view_as_complex + torch.cat on
-            # complex freqs), and complex dtypes have no native Neuron op — they MUST fall
-            # back to CPU. INFERENCE sets this to 0 because it uses the NKI RoPE kernel (no
-            # complex ops) and wants zero silent CPU fallbacks; that value was wrongly copied
-            # here and made the complex cat hard-error (TORCH_NEURONX_FALLBACK_ONLY_FOR_
-            # UNIMPLEMENTED_OPS=1). SD proves fallback-enabled trains fine for 1000s of iters.
             - name: NEURON_FALLBACK_ENABLED
-              value: "1"
+              value: "0"
             - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
               value: "0"
             - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
