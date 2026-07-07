@@ -151,8 +151,18 @@ class RollingForcingModel(BaseModel):
                               device=self.device, dtype=self.dtype),
             **conditional_dict,
         )
-        # Slice last 21 frames
+        # Slice last 21 frames.
+        # DMD is pure latent-space; the VAE is only touched by THIS branch (re-encode
+        # frame 0 to an image latent), which fires only when the rollout produces >21
+        # frames. With num_training_frames=21 the rollout is always exactly 21 frames,
+        # so this never runs and the VAE stays off-device (freeing HBM, --no_visualize).
+        # Assert loudly if a config regresses num_training_frames >21 without restoring
+        # the on-device VAE, rather than silently faulting on a device-less VAE.
         if pred_image_or_video.shape[1] > 21:
+            assert not getattr(self.args, "no_visualize", False), (
+                "rollout produced >21 frames (num_training_frames>21) but --no_visualize "
+                "left the VAE off-device. DMD needs no VAE: set num_training_frames=21, "
+                "or drop --no_visualize to restore on-device VAE placement.")
             with torch.no_grad():
                 # Reencode to get image latent
                 latent_to_decode = pred_image_or_video[:, :-20, ...]

@@ -190,6 +190,7 @@ spec:
                 --config_path ../configs/rolling_forcing_dmd_t4.yaml \
                 --logdir "$RUN" \
                 --disable-wandb \
+                --no_visualize \
                 || { echo "TRAIN FAILED"; exit 1; }
               cd ..
 

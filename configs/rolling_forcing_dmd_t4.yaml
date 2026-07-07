@@ -74,6 +74,14 @@ distribution_loss: dmd
 trainer: score_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3                             # independent of T; keep at 3
+# DMD is pure latent-space (teacher/critic score latents, loss on latents) — the VAE is
+# NOT needed. It was only pulled onto the device by base.py:156, the rollout branch that
+# fires when >21 frames are generated (re-encode frame 0 to an image latent). Pinning
+# num_training_frames 27->21 makes the rollout ALWAYS produce exactly 21 frames, so that
+# branch never runs, gradient_mask is None, and the VAE is dead code. Also shrinks
+# num_max_frames 27->21: KV cache 5.97->4.64GB/model + rollout/scoring activations ~22%.
+# This is the SD lever (02fa0bf: fewer frames = less activation) that clears the iter-0 OOM.
+num_training_frames: 21
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
