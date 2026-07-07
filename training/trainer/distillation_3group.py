@@ -100,6 +100,14 @@ class Trainer:
         self.max_step = int(0.98 * self.num_train_timestep)
         _b, _f, _c, _h, _w = config.image_or_video_shape
         self.lat_shape = (1, self.num_training_frames, _c, _h, _w)
+        # frame_seq = patchified tokens/frame (patch (1,2,2) -> (H//2)*(W//2)). The
+        # non-causal scorers (WanModel) PAD the input up to self.seq_len and run one
+        # full-sequence SDPA at that size. The wrapper hardcodes seq_len=32760 (=21*1560,
+        # the 480x832 default) -> our 15*1200=18000-token x_t gets padded to 32760 and
+        # the SDPA compile fails at bf16[1,32760,40,128]. Set seq_len to the ACTUAL
+        # num_training_frames * frame_seq so there is no oversized pad.
+        self.frame_seq = (_h // 2) * (_w // 2)
+        self.score_seq_len = self.num_training_frames * self.frame_seq
 
         # ── build ONLY this rank's model, sharded within its own group ──
         self.generator = self.real_score = self.fake_score = None
@@ -152,6 +160,7 @@ class Trainer:
         if self.in_fake:
             self._log("building fake_score critic (1.3B, trainable)...")
             self.fake_score = WanDiffusionWrapper(model_name=getattr(config, "fake_name", "Wan2.1-T2V-1.3B"), is_causal=False)
+            self.fake_score.seq_len = self.score_seq_len  # actual res, not the 32760 default (avoids pad-to-32760 SDPA)
             self.fake_score.model.requires_grad_(True)
             if getattr(config, "gradient_checkpointing", False):
                 self.fake_score.enable_gradient_checkpointing()
@@ -170,6 +179,7 @@ class Trainer:
         if self.in_teacher:
             self._log(f"building real_score teacher ({real_name}, FROZEN)...")
             self.real_score = WanDiffusionWrapper(model_name=real_name, is_causal=False)
+            self.real_score.seq_len = self.score_seq_len  # actual res, not the 32760 default (avoids pad-to-32760 SDPA)
             self.real_score.model.requires_grad_(False)
             # The 14B teacher loads fp32 (Wan weights are fp32 on disk). Sharded across
             # only its 4-rank group that is 14B*4B/4 = 14GB/core of PARAMS + scoring
