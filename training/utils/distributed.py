@@ -25,25 +25,30 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
     # THE critical distillation fix. For TRAINABLE networks (generator +
     # fake_score/critic) we MUST keep fp32 master parameters. A bf16-only param
     # with lr=1.5e-6 rounds every update to zero (bf16 resolution ~3.9e-3 >>
-    # Δp/p ~1.5e-4), so the model silently never trains. Passing fp32_master=True
-    # keeps FSDP's sharded params in float32 (bf16 compute is expected to come
-    # from autocast, if enabled). Frozen modules (14B teacher real_score, text
-    # encoder) keep bf16 params (fp32_master=False) to save HBM.
+    # Δp/p ~1.5e-4), so the model silently never trains.
+    #
+    # BUT the fp32 master must NOT mean fp32 COMPUTE. FSDP MixedPrecision keeps the
+    # sharded flat parameter in its LOADED dtype (fp32 here — ode_init loads fp32,
+    # confirmed by the [fp32-master check]) as the optimizer master, and casts to
+    # `param_dtype` only for forward/backward. Setting param_dtype=float32 forced
+    # fp32 COMPUTE while activations stay bf16 (self.dtype), so the DiT's nn.Linear
+    # matmuls hit "aten.mm: input datatypes mismatched" and failed to compile on
+    # Neuron. The fp32-master-ness comes from the fp32 flat param, NOT from the
+    # compute dtype. So compute in bf16 (param_dtype=bfloat16) to match activations,
+    # while FSDP retains the fp32 master for the optimizer step — exactly SD's
+    # MixedPrecisionPolicy(param_dtype=bfloat16, reduce_dtype=float32), which trains
+    # the same lr=1.5e-6 for 1000s of iters. reduce_dtype=float32 keeps grad reduction
+    # full-precision so the tiny updates survive. RF's [fp32-master check] at step 50
+    # still fires loudly if the master somehow isn't retained. The fp32_master arg is
+    # now inert (kept for call-site compatibility): every net computes in bf16, and the
+    # fp32-master-ness is provided by FSDP retaining the fp32-loaded flat param.
     if mixed_precision:
-        if fp32_master:
-            mixed_precision_policy = MixedPrecision(
-                param_dtype=torch.float32,
-                reduce_dtype=torch.float32,
-                buffer_dtype=torch.float32,
-                cast_forward_inputs=False
-            )
-        else:
-            mixed_precision_policy = MixedPrecision(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32,
-                buffer_dtype=torch.float32,
-                cast_forward_inputs=False
-            )
+        mixed_precision_policy = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.float32,
+            cast_forward_inputs=False
+        )
     else:
         mixed_precision_policy = None
 
