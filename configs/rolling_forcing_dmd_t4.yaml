@@ -88,7 +88,7 @@ dfake_gen_update_ratio: 5                          # generator updated once per 
 # "55% less activation"). latent_w 80 matches rf-deploy.yaml LATENT_W=80.
 image_or_video_shape:
 - 1
-- 21
+- 15
 - 16
 - 60
 - 80
@@ -96,25 +96,18 @@ distribution_loss: dmd
 trainer: score_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3                             # independent of T; keep at 3
-# DMD is pure latent-space (teacher/critic score latents, loss on latents) — the VAE is
-# NOT needed. It was only pulled onto the device by base.py:156, the rollout branch that
-# fires when >21 frames are generated (re-encode frame 0 to an image latent). Pinning
-# num_training_frames 27->21 makes the rollout ALWAYS produce exactly 21 frames, so that
-# branch never runs, gradient_mask is None, and the VAE is dead code. Also shrinks
-# num_max_frames 27->21: KV cache 5.97->4.64GB/model + rollout/scoring activations ~22%.
-# This is the SD lever (02fa0bf: fewer frames = less activation) that clears the iter-0 OOM.
-num_training_frames: 21
+# num_training_frames drives BOTH: (1) the VAE-avoidance — DMD is latent-space and the
+# VAE is only pulled on-device by base.py:156, the >21-frame re-encode branch, so any
+# value <=21 keeps it dead; and (2) max_attention_size = num_training_frames * frame_seq,
+# which SIZES the rollout self-attn working cache (causal_model.py:298,316 — NOT
+# local_attn_size, which only masks WITHIN it). With three-group placement the co-residency
+# OOM is gone (Tensors 11.2->6.6GB/core), but the rollout's last-block attention over the
+# full window still overflowed: 3600 x (N*1200) x 12 heads x 2B. N=21 -> 2.18GB, N=18 ->
+# 1.87GB (still ~1.7GB over). N=15 (5 blocks x 3) -> ~1.24GB, clears it with headroom. 15
+# is a multiple of num_frame_per_block(3); the flat 3group trainer rolls out exactly N
+# frames (no [21,N] sampling), so N just needs %3==0. SD lever 02fa0bf (fewer frames = less
+# activation). Tradeoff: 15-frame rollout vs deploy's up-to-24; fine for the T=4 PoC.
+num_training_frames: 15
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
-  # BOUND the causal self-attention window (frames) to cap the rollout attention
-  # scratchpad. Three-group placement freed co-residency (Tensors 11.2->6.6GB/core),
-  # but the student rollout's LAST block attends the FULL 21-frame window: scores =
-  # 3 frames(3600 tok) x 21 frames(25200 tok) x 12 heads x 2B = 2.18GB, overflowing
-  # the ~24GB budget on top of ~15GB rollout scratchpad. local_attn_size=-1 (unbounded)
-  # -> 12 frames caps KV span at 12*1200=14400 -> scores ~1.24GB (~0.9GB saved), clears
-  # it with headroom. Tradeoff: deploy caps context at 24 frames (dit_attention.py
-  # kv_cache_logical_size=24*frame_length) and we train at 21, so this trims the
-  # attention span from 21->12 frames vs deploy's effective 21. Acceptable for the T=4
-  # PoC (single prompt, does-it-converge); revisit for the shippable multi-prompt ckpt.
-  local_attn_size: 12
