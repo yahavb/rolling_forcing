@@ -189,13 +189,7 @@ class Trainer:
             self.name_to_trainable_params[renamed_n] = p
         ema_weight = config.ema_weight
         self.generator_ema = None
-        # Build EMA ONLY if we're already at/after ema_start_step. Below it, EMA is unused
-        # and the training loop lazily creates it once step reaches ema_start_step (see the
-        # "Create EMA params" block below). Building it here at step 0 forced an FSDP
-        # summon_full_params on the generator — a 5.287GB fp32 all-gather onto EVERY rank —
-        # which OOM'd HBM at init on top of the resident 17.8GB, before a single step ran,
-        # and was discarded ~20 lines later by the `step < ema_start_step` guard anyway.
-        if (ema_weight is not None) and (ema_weight > 0.0) and (self.step >= config.ema_start_step):
+        if (ema_weight is not None) and (ema_weight > 0.0):
             print(f"Setting up EMA with weight {ema_weight}")
             self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
 

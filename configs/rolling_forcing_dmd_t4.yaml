@@ -53,7 +53,17 @@ data_path: prompts/distill_poc_single.txt         # PROOF-OF-CONCEPT: single pro
                                                   # Swap to prompts/example_prompts.txt (15) or
                                                   # vidprom_filtered_extended.txt for a broader model.
 batch_size: 1
-ema_weight: 0.99
+# EMA DISABLED to match StreamDiffusionV2's proven-stable Neuron distill (branch
+# exp/fps-1.3b, 1000s of iters, no OOM): SD's trainer has NO EMA at all. Reason,
+# straight from SD's code: EMA_FSDP updates via FSDP.summon_full_params, which
+# all-gathers the FULL fp32 params onto EVERY rank's HBM (a 5.287GB on-device spike
+# for the 1.3B student) — every generator step once ema_start_step is reached, plus
+# once at build. SD's rule is that the full unsharded fp32 model NEVER co-resides
+# on-device; its ONLY full-param gather (checkpoint save) uses cpu_offload=True so it
+# lands on CPU, not HBM. EMA's summon violates that rule, so SD removed EMA entirely.
+# ema_weight=0 disables both summon sites (build + per-step update) here. EMA is a
+# quality nicety, not required for the DMD loop.
+ema_weight: 0.0
 ema_start_step: 200
 total_batch_size: 64
 log_iters: 100
