@@ -158,8 +158,8 @@ spec:
               echo "RUN=$RUN  (final -> $FINAL)"
 
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
-              # PVC dir for the neuronx-cc --dump-to diagnostic (survives the pod)
-              mkdir -p /var/mdl/rolling_forcing/cc_dump && rm -rf /var/mdl/rolling_forcing/cc_dump/* 2>/dev/null || true
+              # pod-local dir for the neuronx-cc --dump-to diagnostic (NOT the shared PVC)
+              mkdir -p /tmp/cc_dump
 
               # ─── PRECOMPUTE T5 prompt embeds ONCE (CPU, 1 proc) — no T5 in training ───
               # Frees ~9.6GB HBM by removing the T5 encoder (and its FSDP wrap/collective)
@@ -195,7 +195,7 @@ spec:
                 --no_visualize \
                 || { echo "TRAIN FAILED"; \
                      echo "=== neuronx-cc compiler dump (real COMPILATION FAILED reason; pod stderr only shows a truncated shape) ==="; \
-                     CCD=/var/mdl/rolling_forcing/cc_dump; \
+                     CCD=/tmp/cc_dump; \
                      find "$CCD" -type f 2>/dev/null | head -60; \
                      echo "=== grep the whole dump tree for the failure reason ==="; \
                      grep -rniE "error|failed|not supported|exceed|too large|sbuf|psum|unsupported|cannot|maximum|invalid" "$CCD" 2>/dev/null | grep -viE "0 error|no error|error_" | head -80; \
@@ -264,13 +264,11 @@ spec:
               value: "INFO"
             - name: TORCH_NEURONX_LOG_LEVEL
               value: "INFO"
-            # NEURONX_DUMP_TO alone produced NOTHING (wrong mechanism for the eager
-            # torch_neuron_eager path + /tmp dies with the pod). Use the CC_FLAGS --dump-to
-            # form pointed at the PERSISTENT PVC (/var/mdl) so the neuronx-cc diagnostic
-            # (the real reason behind the truncated "COMPILATION FAILED: ...shape... ")
-            # survives the pod and we can read it directly off the PVC.
+            # CC_FLAGS --dump-to (pod-local /tmp, NOT the shared PVC) to capture the real
+            # neuronx-cc reason behind the truncated "COMPILATION FAILED: ...shape... ".
+            # The TRAIN-FAILED hook cats/greps it to stdout before the pod exits.
             - name: NEURON_CC_FLAGS
-              value: "--model-type=transformer --dump-to=/var/mdl/rolling_forcing/cc_dump --verbose=INFO"
+              value: "--model-type=transformer --dump-to=/tmp/cc_dump --verbose=INFO"
             - name: MASTER_ADDR
               value: "127.0.0.1"
             - name: MASTER_PORT
