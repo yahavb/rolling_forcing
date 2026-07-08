@@ -248,9 +248,13 @@ class Trainer:
             def zeros_lat():
                 return torch.zeros(self.lat_shape, dtype=self.dtype, device=self.device)
 
+            if it == 0:
+                self._rlog(f"it0 (a): {'STUDENT rollout START' if self.in_student else 'non-student -> straight to bcast wait'}")
             # (a) student rollout under no_grad -> detached x0 + its x_t/timestep
             if self.in_student:
                 x0_det, x_t, tt, num_frame = self._student_rollout(it, cond)
+                if it == 0:
+                    self._rlog("it0 (a): STUDENT rollout DONE")
             else:
                 x0_det = x_t = tt = num_frame = None
 
@@ -261,10 +265,14 @@ class Trainer:
             else:
                 x_t = zeros_lat(); tt = torch.zeros((1, self.num_training_frames), dtype=torch.int64, device=self.device)
                 embeds = torch.zeros(emb_shape, dtype=self.dtype, device=self.device); x0_send = zeros_lat()
+            if it == 0:
+                self._rlog("it0 (b): ENTER world bcast x_t (all 16 ranks must arrive)")
             x_t = self._bcast(x_t, self.ssrc)
             tt = self._bcast(tt.to(torch.int64), self.ssrc)
             embeds = self._bcast(embeds, self.ssrc)
             x0_send = self._bcast(x0_send, self.ssrc)
+            if it == 0:
+                self._rlog("it0 (b): bcasts DONE")
             condb = {"prompt_embeds": embeds}
             neg = self.neg_embed.to(device=self.device, dtype=self.dtype).repeat(x_t.shape[0], 1, 1)
             uncondb = {"prompt_embeds": neg}
@@ -368,8 +376,13 @@ class Trainer:
         no_grad by default; with_grad=True rebuilds the graph for the single backward."""
         noise = torch.randn(self.lat_shape, dtype=self.dtype, device=self.device)
         ctx = torch.enable_grad() if with_grad else torch.no_grad()
+        if it == 0:
+            self._rlog(f"  rollout it0: inference_with_self_forcing START (with_grad={with_grad}) "
+                       f"[first call -> DiT+NKI COMPILE, minutes]")
         with ctx:
             out, _, _ = self.pipeline.inference_with_self_forcing(noise=noise, **cond)
+        if it == 0:
+            self._rlog("  rollout it0: inference_with_self_forcing DONE")
         # out: [B, F, C, H, W] x0 prediction (last-21 handled inside for >21; here ==21)
         x0 = out
         num_frame = x0.shape[1]
