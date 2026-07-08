@@ -220,8 +220,8 @@ class WanT2VCrossAttention(WanSelfAttention):
             k = self.norm_k(self.k(context)).view(b, -1, n, d)
             v = self.v(context).view(b, -1, n, d)
 
-        # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        # compute attention (CROSS-attn over text context: small seq_k -> NKI cross kernel)
+        x = flash_attention(q, k, v, k_lens=context_lens, is_cross_attn=True)
 
         # output
         x = x.flatten(2)
@@ -247,8 +247,8 @@ class WanGanCrossAttention(WanSelfAttention):
         kk = self.norm_k(self.k(x)).view(b, -1, n, d)
         vv = self.v(x).view(b, -1, n, d)
 
-        # compute attention
-        x = flash_attention(qq, kk, vv)
+        # compute attention (GAN cross-attn over context: small seq_k -> NKI cross kernel)
+        x = flash_attention(qq, kk, vv, is_cross_attn=True)
 
         # output
         x = x.flatten(2)
@@ -289,9 +289,9 @@ class WanI2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = flash_attention(q, k_img, v_img, k_lens=None)
-        # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        img_x = flash_attention(q, k_img, v_img, k_lens=None, is_cross_attn=True)
+        # compute attention (CROSS-attn over text context: small seq_k -> NKI cross kernel)
+        x = flash_attention(q, k, v, k_lens=context_lens, is_cross_attn=True)
 
         # output
         x = x.flatten(2)
