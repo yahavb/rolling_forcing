@@ -40,17 +40,24 @@ def _causal_rope_rotation_nki(x, cos_sin, num_heads=12, head_dim=128):
         sin_tile = cs_sb[:, nl.ds(D, D)]
         x_sb = nl.load(x[nl.ds(ts, P), :, :])
 
-        out_sb = nl.ndarray((P, N, D), dtype=x.dtype, buffer=nl.sbuf)
-        for n in nl.affine_range(N):
-            xh = x_sb[:, n, :]
-            x_cos = nl.multiply(xh, cos_tile)
+        # RoPE is per-position, not per-head: cos/sin are identical across all N
+        # heads. So do the even/odd swap ONCE over the whole (P, N, D) tile and
+        # broadcast cos/sin across the head axis, instead of looping N times. The
+        # per-head loop drove the strided swap onto GPSIMD N times per tile; hoisting
+        # it out + a stride-0 (zero-copy) free-axis broadcast keeps the math
+        # byte-identical while collapsing 2N strided ops -> 2 per tile.
+        # cos/sin: (P, D) -> (P, 1, D) view -> stride-0 broadcast to (P, N, D).
+        cos_b = cos_tile.expand_dim(1).broadcast(1, N)
+        sin_b = sin_tile.expand_dim(1).broadcast(1, N)
 
-            x_swap = nl.ndarray((P, D), dtype=xh.dtype, buffer=nl.sbuf)
-            x_swap[:, 0::2] = xh[:, 1::2]
-            x_swap[:, 1::2] = xh[:, 0::2]
+        x_cos = nl.multiply(x_sb, cos_b)
 
-            x_sin = nl.multiply(x_swap, sin_tile)
-            out_sb[:, n, :] = nl.add(x_cos, x_sin)
+        x_swap = nl.ndarray((P, N, D), dtype=x.dtype, buffer=nl.sbuf)
+        x_swap[:, :, 0::2] = x_sb[:, :, 1::2]
+        x_swap[:, :, 1::2] = x_sb[:, :, 0::2]
+
+        x_sin = nl.multiply(x_swap, sin_b)
+        out_sb = nl.add(x_cos, x_sin)
 
         nl.store(out[nl.ds(ts, P), :, :], out_sb)
 
