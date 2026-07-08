@@ -187,11 +187,15 @@ class Trainer:
                 weight_decay=config.weight_decay)
 
         if self.in_teacher:
-            self._rlog(f"teacher: START from_pretrained({real_name}) bf16 low_cpu_mem...")
-            # Load the frozen 14B DIRECTLY in bf16 with diffusers' low_cpu_mem_usage path.
+            self._rlog(f"teacher: START from_pretrained({real_name}) bf16...")
+            # Load the frozen 14B in bf16 (torch_dtype) via the PLAIN from_pretrained path
+            # that worked in earlier runs. NOT low_cpu_mem_usage=True: that (accelerate
+            # meta-device init) HUNG for 25min+ with 8 teacher ranks on the Neuron eager
+            # backend. Host RAM is now 1900Gi, so the bf16 load (no fp32->330GB spike since
+            # torch_dtype loads bf16 directly) fits comfortably without the meta-device path.
             self.real_score = WanDiffusionWrapper(
                 model_name=real_name, is_causal=False,
-                low_cpu_mem_usage=True, load_dtype=torch.bfloat16)
+                load_dtype=torch.bfloat16)
             self._rlog("teacher: from_pretrained DONE; requires_grad_(False)...")
             self.real_score.seq_len = self.score_seq_len
             self.real_score.model.requires_grad_(False)
