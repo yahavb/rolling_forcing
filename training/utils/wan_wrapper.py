@@ -120,15 +120,29 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            low_cpu_mem_usage=False,
+            load_dtype=None,
     ):
         super().__init__()
 
+        # low_cpu_mem_usage + load_dtype: for the FROZEN 14B teacher, load DIRECTLY in
+        # bf16 with diffusers' memory-efficient path instead of materializing the full
+        # fp32 (28GB) per rank then casting. Without this, all 8 teacher ranks load 28GB
+        # fp32 + a 14GB bf16 copy simultaneously (~330GB host RAM) -> OOMKill / 24h hang
+        # in from_pretrained (before FSDP even runs). Defaults off -> student/critic
+        # unchanged (they need fp32 masters anyway).
+        _kw = {}
+        if low_cpu_mem_usage:
+            _kw["low_cpu_mem_usage"] = True
+        if load_dtype is not None:
+            _kw["torch_dtype"] = load_dtype
+
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size, **_kw)
         else:
-            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
+            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/", **_kw)
         self.model.eval()
 
         # For non-causal diffusion, all frames share the same timestep

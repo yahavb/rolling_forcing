@@ -178,17 +178,15 @@ class Trainer:
 
         if self.in_teacher:
             self._log(f"building real_score teacher ({real_name}, FROZEN)...")
-            self.real_score = WanDiffusionWrapper(model_name=real_name, is_causal=False)
+            # Load the frozen 14B DIRECTLY in bf16 with diffusers' low_cpu_mem_usage path.
+            # Loading full fp32 (28GB) per rank then casting made all 8 teacher ranks spike
+            # ~330GB host RAM at once in from_pretrained -> OOMKill / 24h hang BEFORE FSDP.
+            # Frozen -> needs no fp32 master, so bf16 (14B*2B/8 = 3.5GB/core after shard).
+            self.real_score = WanDiffusionWrapper(
+                model_name=real_name, is_causal=False,
+                low_cpu_mem_usage=True, load_dtype=torch.bfloat16)
             self.real_score.seq_len = self.score_seq_len  # actual res, not the 32760 default (avoids pad-to-32760 SDPA)
             self.real_score.model.requires_grad_(False)
-            # The 14B teacher loads fp32 (Wan weights are fp32 on disk). Sharded across
-            # only its 4-rank group that is 14B*4B/4 = 14GB/core of PARAMS + scoring
-            # activation -> 21GB Tensors -> OOM on the teacher scoring x_t. It is FROZEN,
-            # so it needs NO fp32 master (that only matters for trainable nets whose tiny
-            # updates would round away in bf16). Cast to bf16 BEFORE wrapping -> 14B*2B/4 =
-            # 7GB/core. SD builds its 14B teacher bf16 for exactly this reason. The
-            # student/critic keep fp32 masters (they train).
-            self.real_score.model.to(torch.bfloat16)
             self.real_score = fsdp_wrap(
                 self.real_score, sharding_strategy=config.sharding_strategy,
                 mixed_precision=config.mixed_precision, wrap_strategy="transformer",
