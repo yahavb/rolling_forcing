@@ -66,6 +66,7 @@ spec:
               # ── PROVENANCE ──
               GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
               echo "┌── PROVENANCE ──"
+              echo "│ JOB    : rf-distill (T=4 DMD distillation)  pod=$(hostname)"
               echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
               echo "│ commit : $GIT_SHA"
               echo "│ subject: $(git log -1 --pretty=%s)"
@@ -207,11 +208,11 @@ spec:
             # sharding, and num_workers=8 all live in host RAM. The trn2.48xlarge has
             # 192 vCPU / ~2Ti and sits at ~37% CPU / ~26% mem, so take a bigger slice.
             requests:
-              cpu: 80
-              memory: 728Gi
+              cpu: 180
+              memory: 1900Gi
             limits:
-              cpu: 80
-              memory: 728Gi
+              cpu: 180
+              memory: 1900Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
