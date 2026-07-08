@@ -243,10 +243,21 @@ spec:
               value: "134217728"
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
+            # DIAGNOSE the teacher SDPA compile fail: the pod log only showed a TRUNCATED
+            # "COMPILATION FAILED: input1 of shape bf16[1,18000,40,128] " with NO reason
+            # (async report + CC_LOG_LEVEL=ERROR hid the neuronx-cc diagnostic). Shape alone
+            # isn't the blocker (14B MoE compiles). Surface the real error:
+            #  - LAUNCH_BLOCKING=1: synchronous errors -> traceback + reason at the true op
+            #  - CC_LOG_LEVEL=INFO: neuronx-cc prints the actual failure cause
+            #  - keep the compiler workdir so its logs survive the pod
+            - name: NEURON_LAUNCH_BLOCKING
+              value: "1"
             - name: NEURON_CC_LOG_LEVEL
-              value: "ERROR"
+              value: "INFO"
             - name: TORCH_NEURONX_LOG_LEVEL
-              value: "ERROR"
+              value: "INFO"
+            - name: NEURONX_DUMP_TO
+              value: "/tmp/neuron_cc_dump"
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
             - name: MASTER_ADDR
