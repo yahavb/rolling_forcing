@@ -124,11 +124,18 @@ class Trainer:
         if self.is_main_process:
             print(msg, flush=True)
 
+    def _rlog(self, msg):
+        # ALL-ranks timestamped log — student/critic build on ranks 8-15 are invisible to
+        # _log (rank0-only, a teacher rank). Prefix rank so we see WHICH rank hangs WHERE.
+        import time as _t
+        print(f"[r{self.my_rank} {_t.strftime('%H:%M:%S')}] {msg}", flush=True)
+
     def _build_group_model(self, config):
         real_name = getattr(config, "real_name", "Wan2.1-T2V-1.3B")
         if self.in_student:
-            self._log("building student generator (1.3B causal, trainable)...")
+            self._rlog("student: START from_pretrained(1.3B causal)...")
             self.generator = WanDiffusionWrapper(**getattr(config, "model_kwargs", {}), is_causal=True)
+            self._rlog("student: from_pretrained DONE")
             self.generator.model.requires_grad_(True)
             if getattr(config, "gradient_checkpointing", False):
                 self.generator.enable_gradient_checkpointing()
@@ -148,18 +155,21 @@ class Trainer:
                 elif "model" in sd:
                     sd = sd["model"]
                 self.generator.load_state_dict(sd, strict=True)
+            self._rlog("student: START fsdp_wrap...")
             self.generator = fsdp_wrap(
                 self.generator, sharding_strategy=config.sharding_strategy,
                 mixed_precision=config.mixed_precision, wrap_strategy="transformer",
                 transformer_module=_WAN_BLOCKS, process_group=self.groups["student_pg"])
+            self._rlog("student: fsdp_wrap DONE")
             self.opt_g = torch.optim.AdamW(
                 [p for p in self.generator.parameters() if p.requires_grad],
                 lr=config.lr, betas=(config.beta1, config.beta2),
                 weight_decay=config.weight_decay)
 
         if self.in_fake:
-            self._log("building fake_score critic (1.3B, trainable)...")
+            self._rlog("critic: START from_pretrained(1.3B)...")
             self.fake_score = WanDiffusionWrapper(model_name=getattr(config, "fake_name", "Wan2.1-T2V-1.3B"), is_causal=False)
+            self._rlog("critic: from_pretrained DONE")
             self.fake_score.seq_len = self.score_seq_len  # actual res, not the 32760 default (avoids pad-to-32760 SDPA)
             self.fake_score.model.requires_grad_(True)
             if getattr(config, "gradient_checkpointing", False):
@@ -177,20 +187,20 @@ class Trainer:
                 weight_decay=config.weight_decay)
 
         if self.in_teacher:
-            self._log(f"building real_score teacher ({real_name}, FROZEN)...")
+            self._rlog(f"teacher: START from_pretrained({real_name}) bf16 low_cpu_mem...")
             # Load the frozen 14B DIRECTLY in bf16 with diffusers' low_cpu_mem_usage path.
-            # Loading full fp32 (28GB) per rank then casting made all 8 teacher ranks spike
-            # ~330GB host RAM at once in from_pretrained -> OOMKill / 24h hang BEFORE FSDP.
-            # Frozen -> needs no fp32 master, so bf16 (14B*2B/8 = 3.5GB/core after shard).
             self.real_score = WanDiffusionWrapper(
                 model_name=real_name, is_causal=False,
                 low_cpu_mem_usage=True, load_dtype=torch.bfloat16)
-            self.real_score.seq_len = self.score_seq_len  # actual res, not the 32760 default (avoids pad-to-32760 SDPA)
+            self._rlog("teacher: from_pretrained DONE; requires_grad_(False)...")
+            self.real_score.seq_len = self.score_seq_len
             self.real_score.model.requires_grad_(False)
+            self._rlog("teacher: START fsdp_wrap (shard over teacher_pg)...")
             self.real_score = fsdp_wrap(
                 self.real_score, sharding_strategy=config.sharding_strategy,
                 mixed_precision=config.mixed_precision, wrap_strategy="transformer",
                 transformer_module=_WAN_BLOCKS, process_group=self.groups["teacher_pg"])
+            self._rlog("teacher: fsdp_wrap DONE.")
 
         # student needs the rollout pipeline; wire its collectives to the student group
         self.pipeline = None
