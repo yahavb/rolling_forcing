@@ -278,20 +278,30 @@ class Trainer:
             uncondb = {"prompt_embeds": neg}
 
             # (c) teacher scores x_t -> real_pred (CFG)
+            if it == 0 and self.in_teacher:
+                self._rlog("it0 (c): TEACHER score START [first call -> 14B NKI-attn COMPILE, SLOW]")
             real_pred = zeros_lat()
             if self.in_teacher:
                 with torch.no_grad():
                     _, real_cond = self.real_score(noisy_image_or_video=x_t, conditional_dict=condb, timestep=tt)
                     _, real_unc = self.real_score(noisy_image_or_video=x_t, conditional_dict=uncondb, timestep=tt)
                     real_pred = real_cond + (real_cond - real_unc) * self.guidance_scale
+                if it == 0:
+                    self._rlog("it0 (c): TEACHER score DONE")
             real_pred = self._bcast(real_pred, self.tsrc)
 
             # (d) critic scores x_t -> fake_pred
+            if it == 0 and self.in_fake:
+                self._rlog("it0 (d): CRITIC score START [first call -> 1.3B compile]")
             fake_pred = zeros_lat()
             if self.in_fake:
                 with torch.no_grad():
                     _, fake_pred = self.fake_score(noisy_image_or_video=x_t, conditional_dict=condb, timestep=tt)
+                if it == 0:
+                    self._rlog("it0 (d): CRITIC score DONE")
             fake_pred = self._bcast(fake_pred, self.fsrc)
+            if it == 0:
+                self._rlog("it0 (c/d): scores broadcast DONE -> entering (e) student DMD update")
 
             # (e) student DMD update — recompute forward WITH grad
             dmdnorm = float("nan")
