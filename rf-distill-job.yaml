@@ -191,7 +191,13 @@ spec:
                 --logdir "$RUN" \
                 --disable-wandb \
                 --no_visualize \
-                || { echo "TRAIN FAILED"; exit 1; }
+                || { echo "TRAIN FAILED"; \
+                     echo "=== neuronx-cc compiler logs (the REAL COMPILATION FAILED reason; the pod stderr only shows a truncated shape) ==="; \
+                     find /tmp/neuron_cc_dump -name '*.txt' -o -name '*.log' -o -name '*.json' 2>/dev/null | head -40; \
+                     for f in $(find /tmp/neuron_cc_dump -name '*.txt' -o -name 'log*' 2>/dev/null | head -20); do echo "----- $f -----"; tail -n 60 "$f"; done; \
+                     echo "=== grep for FAILED/error across the whole dump tree ==="; \
+                     grep -rniE "error|failed|not supported|exceed|too large|sbuf|psum|unsupported|cannot" /tmp/neuron_cc_dump 2>/dev/null | grep -viE "0 error|no error" | head -60; \
+                     exit 1; }
               cd ..
 
               # ─── final copy of run dir (log + any remaining ckpts) to S3 ───
