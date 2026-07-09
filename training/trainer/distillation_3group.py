@@ -401,6 +401,17 @@ class Trainer:
 
             # free per-iter graph/tensors before the next iter allocates
             x0_det = x_t = real_pred = fake_pred = x0_send = None
+            # THE per-G-step leak (memprobe: +8GB/945 tensors each G-step, NOT freed by
+            # grad_accum=1). The pipeline's _initialize_kv_cache allocates a FRESH KV cache
+            # every rollout and stores it on self.pipeline.kv_cache_clean/crossattn_cache.
+            # During the with-grad G-step, that cache is written INSIDE the autograd graph,
+            # so the persistent pipeline refs PIN the whole grad graph -> del x0_grad/loss_g
+            # can't free it. SD nulls student.kv_cache1/crossattn_cache/shared_buffers each
+            # iter for exactly this. Null RF's pipeline caches too.
+            if self.in_student and self.pipeline is not None:
+                self.pipeline.kv_cache_clean = None
+                self.pipeline.crossattn_cache = None
+                self.pipeline.kv_cache2 = None
             gc.collect()
             if hasattr(torch, "neuron") and hasattr(torch.neuron, "synchronize"):
                 try:
