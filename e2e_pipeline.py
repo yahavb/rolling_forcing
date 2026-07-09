@@ -271,4 +271,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # TEMP (nfpb debug): torchrun's @record swallows the user stack and prints a
+    # bare "AssertionError". Print the full traceback with file:line before dying.
+    import traceback as _tb
+    try:
+        main()
+    except BaseException:
+        import os as _os
+        _r = _os.environ.get("RANK", "?")
+        print(f"===== FULL TRACEBACK (rank {_r}) =====", flush=True)
+        _tb.print_exc()
+        print(f"===== END TRACEBACK (rank {_r}) =====", flush=True)
+        raise
