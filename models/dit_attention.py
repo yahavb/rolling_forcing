@@ -121,8 +121,27 @@ class CausalWanSelfAttention(nn.Module):
         heads_per_shard = num_heads // tp_degree
         shard_dim = heads_per_shard * head_dim
 
+        # rotate_half RoPE: the kernel now rotates contiguous head halves (i, i+c)
+        # instead of interleaved pairs (2i, 2i+1). The model was trained interleaved,
+        # so we permute q/k output dims (and their pre-RoPE RMSNorm weights) from the
+        # interleaved basis into the half-split basis at load. Applying the SAME
+        # per-head permutation to q and k leaves q.k (attention scores) bit-identical;
+        # v/o are untouched. (Proven in verify_rotate_half.py.) NOTE: only reached for
+        # tp_degree>1 (the sharded DMD load path); tp=1 is not handled here.
+        c = head_dim // 2
+        perm = torch.empty(head_dim, dtype=torch.long)
+        perm[:c] = torch.arange(0, head_dim, 2)   # evens -> first half
+        perm[c:] = torch.arange(1, head_dim, 2)   # odds  -> second half
+
+        def permute_rows(val):  # val rows are [num_heads*head_dim, ...]; permute per head
+            v = val.view(num_heads, head_dim, *val.shape[1:])
+            return v[:, perm].reshape(val.shape).clone()
+
         for key, val in full_sd.items():
-            if key == "o.weight":
+            if key in ("q.weight", "q.bias", "k.weight", "k.bias",
+                       "norm_q.weight", "norm_k.weight"):
+                sd[key] = permute_rows(val)
+            elif key == "o.weight":
                 sd[key] = val[:, tp_rank * shard_dim:(tp_rank + 1) * shard_dim].clone()
             elif key == "o.bias":
                 sd[key] = val.clone() if tp_rank == 0 else torch.zeros_like(val)

@@ -40,20 +40,23 @@ def _causal_rope_rotation_nki(x, cos_sin, num_heads=12, head_dim=128):
         sin_tile = cs_sb[:, nl.ds(D, D)]
         x_sb = nl.load(x[nl.ds(ts, P), :, :])
 
-        # The strided even/odd swap was the GPSIMD-bound cost (89.5% on this class):
-        # the per-head loop ran it N times per tile. Hoist it ONCE over the whole
-        # (P, N, D) tile — strided free-axis slices are legal on a 3D SBUF tile — so
-        # the swap goes from 2N strided ops to 2 per tile. The per-head multiply/add
-        # stay in the loop unchanged (that math already compiled in the baseline);
-        # each head reuses the same cos_tile/sin_tile, so output is byte-identical.
-        x_swap = nl.ndarray((P, N, D), dtype=x.dtype, buffer=nl.sbuf)
-        x_swap[:, :, 0::2] = x_sb[:, :, 1::2]
-        x_swap[:, :, 1::2] = x_sb[:, :, 0::2]
-
+        # rotate_half layout: the "swap" is two CONTIGUOUS half-slices
+        # (x[:, c:], x[:, :c]) instead of the strided even/odd interleave, so it
+        # lowers to a cheap contiguous copy instead of a GPSIMD step-2 gather.
+        # Requires cos_sin built in half-split layout AND q/k weights permuted
+        # interleave->half-split at load (see build_rope_grids + shard_state_dict);
+        # attention q.k is then bit-identical (proven in verify_rotate_half.py).
+        C = D // 2
         out_sb = nl.ndarray((P, N, D), dtype=x.dtype, buffer=nl.sbuf)
         for n in nl.affine_range(N):
-            x_cos = nl.multiply(x_sb[:, n, :], cos_tile)
-            x_sin = nl.multiply(x_swap[:, n, :], sin_tile)
+            xh = x_sb[:, n, :]
+            x_cos = nl.multiply(xh, cos_tile)
+
+            x_swap = nl.ndarray((P, D), dtype=xh.dtype, buffer=nl.sbuf)
+            x_swap[:, 0:C] = xh[:, C:D]
+            x_swap[:, C:D] = xh[:, 0:C]
+
+            x_sin = nl.multiply(x_swap, sin_tile)
             out_sb[:, n, :] = nl.add(x_cos, x_sin)
 
         nl.store(out[nl.ds(ts, P), :, :], out_sb)
@@ -88,10 +91,14 @@ def build_rope_grids(freqs_cos, freqs_sin, sign_pattern, start_frame,
         freqs_sin[:W, s0 + s1:].view(1, 1, W, -1).expand(F, H, W, -1),
     ], dim=-1).reshape(seq_len, c)
 
-    cos_expanded = cos_half.repeat_interleave(2, dim=-1)
-    sin_expanded = sin_half.repeat_interleave(2, dim=-1)
+    # rotate_half layout (matches the contiguous half-swap in the NKI kernel):
+    #   cos = [cos_half, cos_half];  sin = [sin_half, sin_half] with sign[:c] = -1.
+    # (was interleaved: repeat_interleave(2) + sign[0::2]=-1.) The q/k weights are
+    # permuted interleave->half-split at load so q.k stays bit-identical.
+    cos_expanded = torch.cat([cos_half, cos_half], dim=-1)
+    sin_expanded = torch.cat([sin_half, sin_half], dim=-1)
     sign = torch.ones(d, device=device, dtype=sin_expanded.dtype)
-    sign[0::2] = -1.0
+    sign[:c] = -1.0
     sin_signed = sin_expanded * sign.unsqueeze(0)
     cos_sin = torch.cat([cos_expanded, sin_signed], dim=-1).contiguous()
 
