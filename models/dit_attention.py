@@ -130,10 +130,36 @@ class CausalWanSelfAttention(nn.Module):
                 sd[key] = val.clone()
         return sd
 
+    def _build_fused_qkv(self):
+        # Fuse the 3 separate q/k/v Linears into ONE [dim, 3*dim] matmul. Profiling
+        # showed the per-rank matmuls are DMA-bound (small, low arithmetic intensity)
+        # -> 4% MFU. Concatenating q/k/v into one GEMM triples the matmul width at
+        # the SAME resolution and topology, raising arithmetic intensity + cutting
+        # 3 NEFF launches to 1. Built lazily from the loaded q/k/v weights so the
+        # checkpoint still loads by name (strict=True) unchanged; numerically identical.
+        dim = self.dim
+        qm = self.q._orig_mod if hasattr(self.q, "_orig_mod") else self.q
+        km = self.k._orig_mod if hasattr(self.k, "_orig_mod") else self.k
+        vm = self.v._orig_mod if hasattr(self.v, "_orig_mod") else self.v
+        fused = nn.Linear(dim, 3 * dim, bias=qm.bias is not None)
+        with torch.no_grad():
+            fused.weight.copy_(torch.cat([qm.weight, km.weight, vm.weight], dim=0))
+            if qm.bias is not None:
+                fused.bias.copy_(torch.cat([qm.bias, km.bias, vm.bias], dim=0))
+        fused = fused.to(qm.weight.device, qm.weight.dtype)
+        self._qkv_fused = _compile(fused)
+
     def _local_qkv_norm(self, x):
-        q = self.norm_q(self.q(x))[0]
-        k = self.norm_k(self.k(x))[0]
-        v = self.v(x)[0]
+        if not hasattr(self, "_qkv_fused"):
+            self._build_fused_qkv()
+        # fused(x) is [1, S, 3*dim]; [0] strips batch -> [S, 3*dim] (matches the
+        # original q(x)[0] batch-strip). split -> q,k,v each [S, dim]. norm_q/k
+        # preserve shape (NO [0] here — batch already stripped, unlike the original
+        # which applied [0] AFTER norm on the still-batched [1,S,dim]).
+        qkv = self._qkv_fused(x)[0]
+        q, k, v = qkv.split(self.dim, dim=-1)
+        q = self.norm_q(q)
+        k = self.norm_k(k)
         return q, k, v
 
     def _gather_qkv(self, q_local, k_local, v_local, L):
