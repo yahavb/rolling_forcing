@@ -146,16 +146,20 @@ class CausalWanSelfAttention(nn.Module):
         # rank as [q0;k0;v0; q1;k1;v1; ...], then de-interleave via view(W,3,S,dim).
         # Bit-identical to 3 separate gathers (verified). Removes 2 of every 3
         # barriers (96 -> 32 per launch).
+        # gather is rank-major -> [q0;k0;v0; q1;k1;v1; ...]; de-interleaving to
+        # contiguous [L,dim] per tensor requires ONE copy (fundamental — no view
+        # fixes rank-interleaved data). Do it as a single permute+reshape (one
+        # kernel/alloc) then return q/k/v as free views, instead of 3 strided
+        # reshape-copies. Bit-identical to 3 separate gathers (verified).
+        W = self.world_size
         S = q_local.shape[0]                       # per-rank sequence shard
-        stacked = torch.cat([q_local, k_local, v_local], dim=0)   # [3S, dim]
-        gathered = torch.empty(self.world_size * 3 * S, self.dim,
+        stacked = torch.stack((q_local, k_local, v_local), dim=0)  # [3, S, dim]
+        gathered = torch.empty(W * 3 * S, self.dim,
                                dtype=q_local.dtype, device=q_local.device)
-        ps.all_gather_into_tensor(gathered, stacked, "world")     # [W*3S, dim]
-        g = gathered.view(self.world_size, 3, S, self.dim)
-        q = g[:, 0].reshape(L, self.dim)
-        k = g[:, 1].reshape(L, self.dim)
-        v = g[:, 2].reshape(L, self.dim)
-        return q, k, v
+        ps.all_gather_into_tensor(gathered, stacked.reshape(3 * S, self.dim), "world")
+        # [W*3S, dim] -> [W,3,S,dim] -> [3,W,S,dim] -> one contiguous copy [3,L,dim]
+        qkv = gathered.view(W, 3, S, self.dim).permute(1, 0, 2, 3).reshape(3, L, self.dim)
+        return qkv[0], qkv[1], qkv[2]
 
     def _slice_heads(self, t):
         return self._slice_heads_2d(t).unsqueeze(0)
