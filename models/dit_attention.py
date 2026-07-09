@@ -137,14 +137,25 @@ class CausalWanSelfAttention(nn.Module):
         return q, k, v
 
     def _gather_qkv(self, q_local, k_local, v_local, L):
-        def _gather(t):
-            if self.world_size == 1:
-                return t
-            out = torch.empty(L, self.dim, dtype=t.dtype, device=t.device)
-            ps.all_gather_into_tensor(out, t, "world")
-            return out
-
-        return _gather(q_local), _gather(k_local), _gather(v_local)
+        if self.world_size == 1:
+            return q_local, k_local, v_local
+        # FUSE the 3 QKV all-gathers into ONE collective. Profiling showed these
+        # 3 per-layer "world" all-gathers (x32 layers = 96 barriers/launch) are the
+        # dominant collective-barrier cost. q/k/v are identical shape [L/W, dim];
+        # stack them into [3*L/W, dim], gather once -> [W*3*L/W, dim] grouped by
+        # rank as [q0;k0;v0; q1;k1;v1; ...], then de-interleave via view(W,3,S,dim).
+        # Bit-identical to 3 separate gathers (verified). Removes 2 of every 3
+        # barriers (96 -> 32 per launch).
+        S = q_local.shape[0]                       # per-rank sequence shard
+        stacked = torch.cat([q_local, k_local, v_local], dim=0)   # [3S, dim]
+        gathered = torch.empty(self.world_size * 3 * S, self.dim,
+                               dtype=q_local.dtype, device=q_local.device)
+        ps.all_gather_into_tensor(gathered, stacked, "world")     # [W*3S, dim]
+        g = gathered.view(self.world_size, 3, S, self.dim)
+        q = g[:, 0].reshape(L, self.dim)
+        k = g[:, 1].reshape(L, self.dim)
+        v = g[:, 2].reshape(L, self.dim)
+        return q, k, v
 
     def _slice_heads(self, t):
         return self._slice_heads_2d(t).unsqueeze(0)
