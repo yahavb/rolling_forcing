@@ -56,7 +56,16 @@ tp_degree: 4                                       # ranks per group: teacher 0-
 iters: 10000                                       # SD long-run recipe (gentle lr + grad-accum)
 save_every: 200
 warmup: 10                                         # critic-only iters before G updates (critic leads)
-grad_accum: 4                                      # effective batch 4 (RF lr assumes a batch)
+grad_accum: 1                                      # step+zero_grad EVERY G-step (was 4).
+                                                   # PROVEN by the memprobe: dev_MB jumps 19GB->34GB
+                                                   # at the first G-step (it10) and STAYS at 39GB
+                                                   # through it11-14 — the G-step grad buffers are
+                                                   # NOT freed because with accum=4, zero_grad/step
+                                                   # only fire every 4th G-step (first at it25). The
+                                                   # 2nd G-step (it15) stacks another ~20GB -> OOM.
+                                                   # accum=1 frees the grads each G-step so they can't
+                                                   # stack. (Effective batch drops 4->1; revisit for
+                                                   # final quality, but PoC needs it to survive first.)
 data_path: prompts/distill_poc_single.txt         # PROOF-OF-CONCEPT: single prompt (example 000,
                                                   # the western/horse shot). Data-free DMD; a student
                                                   # specialized to ONE prompt tolerates fewer steps
