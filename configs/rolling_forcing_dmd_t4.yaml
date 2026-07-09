@@ -88,7 +88,7 @@ dfake_gen_update_ratio: 5                          # generator updated once per 
 # "55% less activation"). latent_w 80 matches rf-deploy.yaml LATENT_W=80.
 image_or_video_shape:
 - 1
-- 15
+- 12
 - 16
 - 60
 - 80
@@ -107,7 +107,7 @@ num_frame_per_block: 3                             # independent of T; keep at 3
 # is a multiple of num_frame_per_block(3); the flat 3group trainer rolls out exactly N
 # frames (no [21,N] sampling), so N just needs %3==0. SD lever 02fa0bf (fewer frames = less
 # activation). Tradeoff: 15-frame rollout vs deploy's up-to-24; fine for the T=4 PoC.
-num_training_frames: 15
+num_training_frames: 12
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
