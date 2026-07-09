@@ -399,14 +399,33 @@ class CausalInferencePipeline(torch.nn.Module):
         dn_buffers = (self.shared_buffer_k, self.shared_buffer_v)
         cu_buffers = (self.cu_shared_buffer_k, self.cu_shared_buffer_v)
 
-        noise_producer = NoiseProducer(dtype=noise.dtype)
+        # max_inflight=2 lets the CPU noise thread run one phase ahead of the
+        # device, so renoise_future.result() below never blocks on torch.randn.
+        noise_producer = NoiseProducer(dtype=noise.dtype, max_inflight=2)
+
+        # Prefetch renoise ONE PHASE AHEAD to hide the host->device bubble the
+        # profiler showed between every graph launch (dit_pipeline.py:475): the
+        # ~150us gap where the device idled waiting on result()+.to(device).
+        # build_renoise_plan is pure host arithmetic and does NOT touch the RNG,
+        # and requests are still enqueued in phase order (0,1,..,window_num-1),
+        # so the FIFO producer draws identical noise -> frames byte-identical.
+        renoise_plans = [build_renoise_plan(p) for p in range(window_num)]
+        next_future = (noise_producer.request(renoise_plans[0])
+                       if renoise_plans and renoise_plans[0] else None)
 
         for phase in range(window_num):
             if profile:
                 window_start = time.perf_counter()
 
-            plan = build_renoise_plan(phase)
-            renoise_future = noise_producer.request(plan) if plan else None
+            # this phase consumes the future prefetched last iteration (or primed
+            # before the loop); immediately request the NEXT phase so its CPU gen
+            # + H2D copy overlap THIS phase's graph execution.
+            renoise_future = next_future
+            if phase + 1 < window_num:
+                nxt_plan = renoise_plans[phase + 1]
+                next_future = noise_producer.request(nxt_plan) if nxt_plan else None
+            else:
+                next_future = None
 
             start_block = window_start_blocks[phase]
             end_block = window_end_blocks[phase]
