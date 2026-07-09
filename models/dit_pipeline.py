@@ -207,6 +207,9 @@ class CausalInferencePipeline(torch.nn.Module):
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
+            # Propagate nfpb to attention blocks' block_length (default assumes 3).
+            for block in self.generator.model.blocks:
+                block.self_attn.block_length = self.num_frame_per_block * block.self_attn.frame_length
 
         self._num_heads = self.generator.model.num_heads
         self._head_dim = self.generator.model.dim // self.generator.model.num_heads
