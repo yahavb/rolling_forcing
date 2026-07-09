@@ -131,10 +131,26 @@ class Trainer:
             print(msg, flush=True)
 
     def _rlog(self, msg):
-        # ALL-ranks timestamped log — student/critic build on ranks 8-15 are invisible to
-        # _log (rank0-only, a teacher rank). Prefix rank so we see WHICH rank hangs WHERE.
+        # ALL debug prints are prefixed IMAFUCKINGASSHOLE so every temporary diagnostic
+        # line can be grep-deleted in one shot once the leak is found.
         import time as _t
-        print(f"[r{self.my_rank} {_t.strftime('%H:%M:%S')}] {msg}", flush=True)
+        print(f"IMAFUCKINGASSHOLE [r{self.my_rank} {_t.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    def _gstep_probe(self, it, tag):
+        # IMAFUCKINGASSHOLE debug: device-tensor count+MB at a point INSIDE the G-step, so
+        # we see WHICH sub-step (rollout / backward / opt.step / del) adds the leaked
+        # tensors. Student src rank, only iters 9-17 (spans the first two G-steps).
+        if not (self.my_rank == self.ssrc and 9 <= it <= 17):
+            return
+        import gc as _gc
+        n = mb = 0
+        for o in _gc.get_objects():
+            try:
+                if torch.is_tensor(o) and o.device.type == "neuron":
+                    n += 1; mb += o.numel() * o.element_size() / 1e6
+            except Exception:
+                pass
+        print(f"IMAFUCKINGASSHOLE [gstep it{it}] {tag}: dev_tensors={n} dev_MB={mb:.0f}", flush=True)
 
     def _build_group_model(self, config):
         real_name = getattr(config, "real_name", "Wan2.1-T2V-1.3B")
@@ -320,7 +336,9 @@ class Trainer:
             dmdnorm = float("nan")
             do_g = (it >= self.warmup) and (it % self.dfake_gen_update_ratio == 0)
             if self.in_student and do_g:
+                self._gstep_probe(it, "e0: before with_grad rollout")
                 x0_grad, _, _, _ = self._student_rollout(it, cond, with_grad=True)
+                self._gstep_probe(it, "e1: after with_grad rollout")
                 grad = (fake_pred - real_pred)
                 normalizer = torch.abs(x0_grad - real_pred).mean(
                     dim=list(range(1, x0_grad.dim())), keepdim=True)
@@ -330,7 +348,9 @@ class Trainer:
                 if self._g_since_step == 0:
                     self.opt_g.zero_grad(set_to_none=True)
                 loss_g = 0.5 * F.mse_loss(x0_grad.double(), target.double()) / self.grad_accum
+                self._gstep_probe(it, "e2: before backward")
                 loss_g.backward()
+                self._gstep_probe(it, "e3: after backward")
                 self._g_since_step += 1
                 if self._g_since_step >= self.grad_accum:
                     gn = float(self.generator.clip_grad_norm_(10.0))
@@ -340,7 +360,9 @@ class Trainer:
                     else:
                         self.opt_g.step()
                     self._g_since_step = 0
+                self._gstep_probe(it, "e4: after opt.step")
                 del grad, target, x0_grad, loss_g
+                self._gstep_probe(it, "e5: after del")
 
             # (f) critic diffusion (flow) update on x0_send
             lf = float("nan")
@@ -374,9 +396,9 @@ class Trainer:
             if self.my_rank == self.ssrc:
                 avg = sum(self._dmdnorm_hist) / len(self._dmdnorm_hist) if self._dmdnorm_hist else float("nan")
                 phase = "warmup" if it < self.warmup else ("G-step" if do_g else "critic-only")
-                print(f"it {it}/{self.iters} [{phase}] dmdnorm={dmdnorm:.4f} dmdnorm_avg50={avg:.4f}", flush=True)
+                print(f"IMAFUCKINGASSHOLE it {it}/{self.iters} [{phase}] dmdnorm={dmdnorm:.4f} dmdnorm_avg50={avg:.4f}", flush=True)
             if self.my_rank == self.fsrc:
-                print(f"it {it}/{self.iters}  loss_fake={lf:.4f}", flush=True)
+                print(f"IMAFUCKINGASSHOLE it {it}/{self.iters}  loss_fake={lf:.4f}", flush=True)
 
             self.step = it
 
@@ -385,16 +407,30 @@ class Trainer:
             # 22.4GB resident at the iter-15 OOM. If dev_MB GROWS each G-step (10,15,20,25)
             # -> creep (structural). If FLAT-high -> the resident grad-rollout graph peak
             # (SD 5d90c6b two-forward territory).
-            if self.my_rank == self.ssrc and it <= 30:
+            if self.my_rank == self.ssrc and it <= 18:
                 import gc as _gc
+                from collections import Counter as _Counter
                 n = mb = 0
+                shape_mb = _Counter(); shape_ct = _Counter(); grad_ct = 0
                 for o in _gc.get_objects():
                     try:
                         if torch.is_tensor(o) and o.device.type == "neuron":
-                            n += 1; mb += o.numel() * o.element_size() / 1e6
+                            n += 1
+                            _mb = o.numel() * o.element_size() / 1e6
+                            mb += _mb
+                            key = f"{tuple(o.shape)}:{o.dtype}"
+                            shape_mb[key] += _mb; shape_ct[key] += 1
+                            if o.requires_grad or o.grad_fn is not None:
+                                grad_ct += 1
                     except Exception:
                         pass
-                print(f"[memprobe it{it}] dev_tensors={n} dev_MB={mb:.0f} do_g={do_g}", flush=True)
+                print(f"IMAFUCKINGASSHOLE [memprobe it{it}] dev_tensors={n} dev_MB={mb:.0f} do_g={do_g} grad_tensors={grad_ct}", flush=True)
+                # On the iters right after a G-step (11,16), dump the top retained tensor
+                # shapes by total MB — this NAMES what is leaking instead of guessing.
+                if it in (9, 11, 16):
+                    top = shape_mb.most_common(12)
+                    for k, v in top:
+                        print(f"IMAFUCKINGASSHOLE   [memtop it{it}] {v:8.0f} MB  x{shape_ct[k]:4d}  {k}", flush=True)
 
             if it > 0 and it % self.save_every == 0:
                 self._save_ckpt(it)
