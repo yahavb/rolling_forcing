@@ -98,6 +98,12 @@ class Trainer:
         self.num_train_timestep = getattr(config, "num_train_timestep", 1000)
         self.min_step = int(0.02 * self.num_train_timestep)
         self.max_step = int(0.98 * self.num_train_timestep)
+        # Fixed DMD timestep buckets (SD 86cb4d3): sample the critic/DMD noise level from
+        # this SMALL set instead of a continuous randint, so torch.compile reuses a BOUNDED
+        # set of NEFFs (~8) instead of loading a new module.neff per distinct timestep ->
+        # the iter-~12 scratchpad creep-OOM. 8 evenly-spaced levels within [min,max].
+        self._DMD_TIMESTEPS = torch.tensor([100, 250, 400, 500, 600, 700, 800, 900],
+                                           dtype=torch.long, device=self.device)
         _b, _f, _c, _h, _w = config.image_or_video_shape
         self.lat_shape = (1, self.num_training_frames, _c, _h, _w)
         # frame_seq = patchified tokens/frame (patch (1,2,2) -> (H//2)*(W//2)). The
@@ -234,7 +240,14 @@ class Trainer:
         return {"prompt_embeds": e}
 
     def _sample_timestep(self, b, num_frame):
-        t = torch.randint(self.min_step, self.max_step, (b, 1), device=self.device, dtype=torch.long).repeat(1, num_frame)
+        # DISCRETE timestep buckets (SD 86cb4d3 — THE iter-~10/12 OOM fix). A random
+        # CONTINUOUS value every iter (the old torch.randint(min,max)) makes torch.compile
+        # trace a NEW graph each time -> a new module.neff loads and NEVER unloads ->
+        # scratchpad creeps monotonically -> OOM ~iter 12. This is a NEFF-accumulation
+        # CREEP, not a memory peak (frames/res cuts move the peak but not this leak).
+        # Sample from a FIXED 8-bucket set so NEFFs repeat and the loaded set stays bounded.
+        idx = torch.randint(0, self._DMD_TIMESTEPS.shape[0], (b, 1), device=self.device).repeat(1, num_frame)
+        t = self._DMD_TIMESTEPS[idx]
         if self.timestep_shift > 1:
             t = self.timestep_shift * (t / 1000) / (1 + (self.timestep_shift - 1) * (t / 1000)) * 1000
         return t.clamp(self.min_step, self.max_step)
