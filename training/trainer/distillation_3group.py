@@ -367,7 +367,23 @@ class Trainer:
                     self.opt_g.zero_grad(set_to_none=True)
                 self._gstep_probe(it, "e4: after opt.step+zero_grad")
                 del grad, target, x0_grad, loss_g
-                self._gstep_probe(it, "e5: after del")
+                # STRUCTURAL free of the G-step rollout graph, RIGHT HERE (SD 5d90c6b free
+                # sequence), not deferred to end-of-iter. memtop proved the with_grad
+                # rollout's 30-block activations + KV cache (1,3600,1536)/(1,7200,12,128)
+                # stay pinned per G-step. The pipeline holds the KV cache it built during
+                # the grad rollout; null it + its cross/kv2 + force gc + neuron.synchronize
+                # BEFORE the next allocation so the graph actually releases.
+                if self.pipeline is not None:
+                    self.pipeline.kv_cache_clean = None
+                    self.pipeline.crossattn_cache = None
+                    self.pipeline.kv_cache2 = None
+                gc.collect()
+                if hasattr(torch, "neuron") and hasattr(torch.neuron, "synchronize"):
+                    try:
+                        torch.neuron.synchronize()
+                    except Exception:
+                        pass
+                self._gstep_probe(it, "e6: after pipeline-cache null + gc + sync")
 
             # (f) critic diffusion (flow) update on x0_send
             lf = float("nan")
