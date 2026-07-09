@@ -356,11 +356,16 @@ class Trainer:
                     gn = float(self.generator.clip_grad_norm_(10.0))
                     if gn != gn or gn == float("inf"):
                         self._log(f"  [grad] it {it}: NON-FINITE grad_norm={gn} -> SKIP step")
-                        self.opt_g.zero_grad(set_to_none=True)
                     else:
                         self.opt_g.step()
                     self._g_since_step = 0
-                self._gstep_probe(it, "e4: after opt.step")
+                    # FREE THE GRADS NOW, not at the next G-step. The probe showed .grad
+                    # (full fp32 grads on every student param) + FSDP backward buffers
+                    # persist from this G-step through the following critic-only iters and
+                    # only cleared at the NEXT G-step's zero_grad -> +10GB retained across
+                    # G-steps -> OOM. set_to_none=True actually releases the tensors.
+                    self.opt_g.zero_grad(set_to_none=True)
+                self._gstep_probe(it, "e4: after opt.step+zero_grad")
                 del grad, target, x0_grad, loss_g
                 self._gstep_probe(it, "e5: after del")
 
