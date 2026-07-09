@@ -379,6 +379,23 @@ class Trainer:
                 print(f"it {it}/{self.iters}  loss_fake={lf:.4f}", flush=True)
 
             self.step = it
+
+            # PER-ITER DEVICE-MEM PROBE (SD e9fc1d2 discipline: MEASURE creep vs peak, don't
+            # guess). Only student src rank, only early iters, to avoid spam. Tensors was
+            # 22.4GB resident at the iter-15 OOM. If dev_MB GROWS each G-step (10,15,20,25)
+            # -> creep (structural). If FLAT-high -> the resident grad-rollout graph peak
+            # (SD 5d90c6b two-forward territory).
+            if self.my_rank == self.ssrc and it <= 30:
+                import gc as _gc
+                n = mb = 0
+                for o in _gc.get_objects():
+                    try:
+                        if torch.is_tensor(o) and o.device.type == "neuron":
+                            n += 1; mb += o.numel() * o.element_size() / 1e6
+                    except Exception:
+                        pass
+                print(f"[memprobe it{it}] dev_tensors={n} dev_MB={mb:.0f} do_g={do_g}", flush=True)
+
             if it > 0 and it % self.save_every == 0:
                 self._save_ckpt(it)
 
