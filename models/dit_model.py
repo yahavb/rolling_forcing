@@ -218,15 +218,30 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             num_frames = e0.shape[1]
             frame_seqlen = grid_sizes[1] * grid_sizes[2]
             L_full = num_frames * frame_seqlen
-            shard_len_e = L_full // self.world_size
             rank = ps.get_rank("world")
-            sp_start = rank * shard_len_e
-            sp_end = sp_start + shard_len_e
-            start_frame = sp_start // frame_seqlen
-            end_frame = (sp_end - 1) // frame_seqlen + 1
-            start_off = sp_start - start_frame * frame_seqlen
-            kwargs["e"] = self._expand_e_shard_neuron(
-                e0, start_frame, end_frame, start_off, shard_len_e, frame_seqlen)
+
+            def _e_slice(tok_start, tok_len):
+                # expand e for a contiguous token run [tok_start:tok_start+tok_len]
+                s_frame = tok_start // frame_seqlen
+                e_frame = (tok_start + tok_len - 1) // frame_seqlen + 1
+                s_off = tok_start - s_frame * frame_seqlen
+                return self._expand_e_shard_neuron(
+                    e0, s_frame, e_frame, s_off, tok_len, frame_seqlen)
+
+            if _cp_merged:
+                # e must match the [cu_N ; dn_N] input shard: expand the cu run and the
+                # dn run for THIS rank separately, then concat (proven == old contiguous
+                # slice for these tokens; verify_merged_cp.py max|Δ|=0).
+                L_cu_e = nfpb_cu * frame_seqlen
+                L_dn_e = L_full - L_cu_e
+                L_cu_Ne = L_cu_e // self.world_size
+                L_dn_Ne = L_dn_e // self.world_size
+                e_cu = _e_slice(rank * L_cu_Ne, L_cu_Ne)
+                e_dn = _e_slice(L_cu_e + rank * L_dn_Ne, L_dn_Ne)
+                kwargs["e"] = torch.cat([e_cu, e_dn], dim=2)
+            else:
+                shard_len_e = L_full // self.world_size
+                kwargs["e"] = _e_slice(rank * shard_len_e, shard_len_e)
 
         for block_index, block in enumerate(self.blocks):
             kwargs.update(

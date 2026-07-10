@@ -468,9 +468,10 @@ class CausalWanSelfAttention(nn.Module):
         L_dn_N = L_dn // N
         L_full_N = L_full // N
 
+        import os as _os
+        _cp_merged = _os.environ.get("RF_CP_MERGED", "0") == "1" and self.world_size > 1
+
         q_local, k_local, v_local = self._local_qkv_norm(x)
-        q_full, k_full, v_full = self._gather_qkv(
-            q_local, k_local, v_local, L_full)
 
         n = self.num_heads
         d = self.head_dim
@@ -478,37 +479,87 @@ class CausalWanSelfAttention(nn.Module):
         h_start = self.tp_rank * n_local
         h_end = h_start + n_local
 
-        v_full_h = self._slice_heads_2d(v_full).contiguous()
-
-        q_full_4d = q_full.view(L_full, n, d)
-        k_full_4d = k_full.view(L_full, n, d)
-        q_cu = q_full_4d[:L_cu].unsqueeze(0)
-        q_dn = q_full_4d[L_cu:].unsqueeze(0)
-        k_cu_full = k_full_4d[:L_cu].unsqueeze(0)
-        k_dn_full = k_full_4d[L_cu:].unsqueeze(0)
-        v_cu = v_full_h[:L_cu].unsqueeze(0)
-        v_dn = v_full_h[L_cu:].unsqueeze(0)
+        if _cp_merged:
+            # Merged-path CP (input sharded [cu_N;dn_N] per rank; verify_merged_cp.py max|Δ|=0):
+            # - q: gather over attn-tp -> interleaved [cu_N;dn_N]xtp -> deinterleave to cu_sp,dn_sp.
+            #   Only L_full/sp gathered per rank instead of full L_full over world.
+            # - k/v: still need full window -> world-gather, but now INTERLEAVED
+            #   [r0cu,r0dn,r1cu,r1dn,...] -> deinterleave via view(N,-1) to recover [cu|dn].
+            L_cu_N = L_cu // N
+            L_dn_N = L_dn // N
+            # q over attn-tp
+            q_tp = torch.empty((L_cu_N + L_dn_N) * tp, self.dim, dtype=q_local.dtype, device=q_local.device)
+            ps.all_gather_into_tensor(q_tp, q_local, "attn-tp")
+            q_tp = q_tp.view(tp, L_cu_N + L_dn_N, self.dim)
+            q_cu_2d = q_tp[:, :L_cu_N].reshape(L_cu_sp, self.dim)
+            q_dn_2d = q_tp[:, L_cu_N:].reshape(L_dn_sp, self.dim)
+            # k/v over world, deinterleave
+            _, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L_full, gather_q=False)
+            k_di = k_full.view(N, L_cu_N + L_dn_N, self.dim)
+            v_di = v_full.view(N, L_cu_N + L_dn_N, self.dim)
+            k_cu = k_di[:, :L_cu_N].reshape(L_cu, self.dim)
+            k_dn = k_di[:, L_cu_N:].reshape(L_dn, self.dim)
+            v_cu_full = v_di[:, :L_cu_N].reshape(L_cu, self.dim)
+            v_dn_full = v_di[:, L_cu_N:].reshape(L_dn, self.dim)
+            v_cu_h = self._slice_heads_2d(v_cu_full).contiguous()
+            v_dn_h = self._slice_heads_2d(v_dn_full).contiguous()
+            q_cu = q_cu_2d.view(L_cu_sp, n, d).unsqueeze(0)
+            q_dn = q_dn_2d.view(L_dn_sp, n, d).unsqueeze(0)
+            k_cu_full = k_cu.view(L_cu, n, d).unsqueeze(0)
+            k_dn_full = k_dn.view(L_dn, n, d).unsqueeze(0)
+            v_cu = v_cu_h.unsqueeze(0)
+            v_dn = v_dn_h.unsqueeze(0)
+            # reconstructed contiguous k_full for the k_full[:L_cu]/[L_cu:] anchor-write slices below
+            k_full = torch.cat([k_cu, k_dn], dim=0)
+        else:
+            q_full, k_full, v_full = self._gather_qkv(
+                q_local, k_local, v_local, L_full)
+            v_full_h = self._slice_heads_2d(v_full).contiguous()
+            q_full_4d = q_full.view(L_full, n, d)
+            k_full_4d = k_full.view(L_full, n, d)
+            q_cu = q_full_4d[:L_cu].unsqueeze(0)
+            q_dn = q_full_4d[L_cu:].unsqueeze(0)
+            k_cu_full = k_full_4d[:L_cu].unsqueeze(0)
+            k_dn_full = k_full_4d[L_cu:].unsqueeze(0)
+            v_cu = v_full_h[:L_cu].unsqueeze(0)
+            v_dn = v_full_h[L_cu:].unsqueeze(0)
 
         cu_sf_int = cache_update_start // frame_seqlen
         dn_sf_int = current_start // frame_seqlen
         cu_sf_t = torch.tensor(cu_sf_int, device=q_cu.device)
         dn_sf_t = torch.tensor(dn_sf_int, device=q_dn.device)
 
-        rq_cu_full = self._nki_rope_apply(
-            q_cu, grid_cu, freqs_cos, freqs_sin,
-            start_frame=cu_sf_t, rope_grid_cache=rope_grid_cache,
-            start_frame_int=cu_sf_int,
-            head_start=h_start, head_end=h_end)
+        # In CP-merged, q_cu/q_dn are ALREADY this rank's sp-shard, so RoPE only that
+        # shard at its token offset (sp_rank*L_*_sp). Otherwise q_cu/q_dn are full.
+        if _cp_merged:
+            rq_cu_full = self._nki_rope_apply(
+                q_cu, grid_cu, freqs_cos, freqs_sin,
+                start_frame=cu_sf_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=cu_sf_int, head_start=h_start, head_end=h_end,
+                tok_offset=self.sp_rank * L_cu_sp, tok_len=L_cu_sp)
+        else:
+            rq_cu_full = self._nki_rope_apply(
+                q_cu, grid_cu, freqs_cos, freqs_sin,
+                start_frame=cu_sf_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=cu_sf_int,
+                head_start=h_start, head_end=h_end)
         rk_cu = self._nki_rope_apply(
             k_cu_full, grid_cu, freqs_cos, freqs_sin,
             start_frame=cu_sf_t, rope_grid_cache=rope_grid_cache,
             start_frame_int=cu_sf_int,
             head_start=h_start, head_end=h_end)
-        rq_dn_full = self._nki_rope_apply(
-            q_dn, grid_dn, freqs_cos, freqs_sin,
-            start_frame=dn_sf_t, rope_grid_cache=rope_grid_cache,
-            start_frame_int=dn_sf_int,
-            head_start=h_start, head_end=h_end)
+        if _cp_merged:
+            rq_dn_full = self._nki_rope_apply(
+                q_dn, grid_dn, freqs_cos, freqs_sin,
+                start_frame=dn_sf_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=dn_sf_int, head_start=h_start, head_end=h_end,
+                tok_offset=self.sp_rank * L_dn_sp, tok_len=L_dn_sp)
+        else:
+            rq_dn_full = self._nki_rope_apply(
+                q_dn, grid_dn, freqs_cos, freqs_sin,
+                start_frame=dn_sf_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=dn_sf_int,
+                head_start=h_start, head_end=h_end)
         rk_dn = self._nki_rope_apply(
             k_dn_full, grid_dn, freqs_cos, freqs_sin,
             start_frame=dn_sf_t, rope_grid_cache=rope_grid_cache,
@@ -540,8 +591,13 @@ class CausalWanSelfAttention(nn.Module):
             current_start_frame_dn, le_dn, ls_dn,
             rope_grid_cache=rope_grid_cache)
 
-        q_cu_sp = rq_cu_full[:, self.sp_rank * L_cu_sp:(self.sp_rank + 1) * L_cu_sp]
-        q_dn_sp = rq_dn_full[:, self.sp_rank * L_dn_sp:(self.sp_rank + 1) * L_dn_sp]
+        if _cp_merged:
+            # already the sp-shard (RoPE'd on the attn-tp-gathered shard) — no slice
+            q_cu_sp = rq_cu_full
+            q_dn_sp = rq_dn_full
+        else:
+            q_cu_sp = rq_cu_full[:, self.sp_rank * L_cu_sp:(self.sp_rank + 1) * L_cu_sp]
+            q_dn_sp = rq_dn_full[:, self.sp_rank * L_dn_sp:(self.sp_rank + 1) * L_dn_sp]
         y_cu = self._attend(q_cu_sp, cu_shared_buffers, klen_cu)
         y_dn = self._attend(q_dn_sp, dn_shared_buffers, klen_dn)
 
