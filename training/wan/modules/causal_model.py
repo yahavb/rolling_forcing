@@ -240,6 +240,24 @@ class CausalWanSelfAttention(nn.Module):
                     value=padded_v.transpose(2, 1),
                     block_mask=block_mask
                 )[:, :, :-padded_length].transpose(2, 1)
+        elif self.training:
+            # FUNCTIONAL TRAINING ATTENTION (SD 42cd403). The streaming KV-cache path below
+            # does IN-PLACE slice writes (kv_cache["k"][:, a:b] = ...) which are autograd-
+            # fatal under the NO_REENTRANT checkpoint recompute FSDP2 applies ("SliceBackward0
+            # is a view and is being modified inplace"). For the 1-step single-block DMD
+            # distill rollout, the exit block attends only its OWN roped_key/v (no cache
+            # assembly, no eviction) — so build K/V functionally, out-of-place, no cache
+            # mutation. Inference (eval/no_grad) keeps the streaming cache path untouched.
+            frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+            current_start_frame = current_start // frame_seqlen
+            roped_query = causal_rope_apply(
+                q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+            roped_key = causal_rope_apply(
+                k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+            x = attention(roped_query, roped_key, v)
+            x = x.flatten(2)
+            x = self.o(x)
+            return x
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
@@ -247,7 +265,7 @@ class CausalWanSelfAttention(nn.Module):
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)   # [B, L, 12, 128]
             roped_key = causal_rope_apply(
                 k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)   # [B, L, 12, 128]
-            
+
             grid_sizes_one_block = grid_sizes.clone()
             grid_sizes_one_block[:,0] = 3
 

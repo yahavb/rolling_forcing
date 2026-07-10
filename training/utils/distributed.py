@@ -47,6 +47,10 @@ def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls):
 
     # per-block NO_REENTRANT activation checkpointing (SD: mandatory — OOMs without it)
     m = model.model  # WanDiffusionWrapper.model = the CausalWanModel (has .blocks)
+    # WanDiffusionWrapper.__init__ set model.eval() -> self.training=False. The functional
+    # training attention path (causal_model self-attn `elif self.training`) needs train mode.
+    # SD calls m.train().requires_grad_(True) here for exactly this.
+    m.train().requires_grad_(True)
     apply_activation_checkpointing(
         m,
         checkpoint_wrapper_fn=lambda mod: checkpoint_wrapper(mod, checkpoint_impl=CheckpointImpl.NO_REENTRANT),
