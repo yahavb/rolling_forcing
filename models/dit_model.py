@@ -160,13 +160,31 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         grid_sizes = _get_grid_sizes(x)
         x = self.patch_embedding(x)
 
+        # RF_CP_MERGED=1 enables separate cu/dn world-sharding for merged mode so the
+        # per-layer attn-tp query gather can reconstruct cu_sp+dn_sp (merged-path CP).
+        # Bit-identical to the contiguous shard when the block reassembles to match.
+        import os as _os
+        _cp_merged = _os.environ.get("RF_CP_MERGED", "0") == "1" and mode == "merged"
         if self.world_size > 1:
             L = x.shape[1]
             assert L % self.world_size == 0, (
                 f"sequence length {L} not divisible by world_size {self.world_size}")
-            shard_len = L // self.world_size
             rank = ps.get_rank("world")
-            x = x[:, rank * shard_len:(rank + 1) * shard_len].contiguous()
+            if _cp_merged:
+                # shard cu and dn SEPARATELY: rank holds [cu[r*L_cu_N:], dn[r*L_dn_N:]]
+                frame_seqlen0 = grid_sizes[1] * grid_sizes[2]
+                L_cu = nfpb_cu * frame_seqlen0
+                L_dn = L - L_cu
+                assert L_cu % self.world_size == 0 and L_dn % self.world_size == 0
+                L_cu_N = L_cu // self.world_size
+                L_dn_N = L_dn // self.world_size
+                x = torch.cat([
+                    x[:, rank * L_cu_N:(rank + 1) * L_cu_N],
+                    x[:, L_cu + rank * L_dn_N:L_cu + (rank + 1) * L_dn_N],
+                ], dim=1).contiguous()
+            else:
+                shard_len = L // self.world_size
+                x = x[:, rank * shard_len:(rank + 1) * shard_len].contiguous()
 
         e = self.time_embedding(
             self._sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
