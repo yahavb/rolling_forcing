@@ -103,15 +103,12 @@ image_or_video_shape:
 - 80
 distribution_loss: dmd
 trainer: score_distillation
-# gradient_checkpointing DISABLED — counterintuitive but data-driven. The memprobe proved
-# the with_grad rollout's grad-checkpoint (use_reentrant=False) SAVED block-input tensors
-# (1,3600,1536) accumulate +300/G-step and NEVER free on the Neuron eager backend (del +
-# gc + neuron.synchronize all failed to release them). grad-ckpt is normally a memory SAVE
-# (recompute vs store), but here it's a LEAK: the saved recompute tensors are pinned below
-# Python. Off = they are never saved = nothing to leak. Numerically identical (same grads,
-# same weights) — only the per-step peak is higher, but it FREES each iter. If this OOMs on
-# PEAK instead of leaking, the answer is SD 5d90c6b two-forward.
-gradient_checkpointing: false
+# gradient_checkpointing ON. Tested OFF (3a378f9): the with_grad rollout stored ALL
+# activations up front -> e1 dev_MB 17754->44142 (+26GB) and OOM'd DURING the rollout
+# forward, before backward. So grad-ckpt IS helping the peak; disabling it is strictly
+# worse. The real fix for the per-G-step retention is the STRUCTURAL SD 5d90c6b two-forward,
+# not a checkpointing toggle.
+gradient_checkpointing: true
 num_frame_per_block: 3                             # independent of T; keep at 3
 # num_training_frames drives BOTH: (1) the VAE-avoidance — DMD is latent-space and the
 # VAE is only pulled on-device by base.py:156, the >21-frame re-encode branch, so any
