@@ -257,31 +257,45 @@ class CausalWanSelfAttention(nn.Module):
         sp_shard_len = L // self.sp_degree
         sp_start = self.sp_rank * sp_shard_len
 
-        # CP query path: gather q ONLY over the attn-tp group -> the sp-shard
-        # [sp_start : sp_start+sp_shard_len] directly (proven == world-gather-then-
-        # slice), instead of all-gathering the full L over world and discarding
-        # (sp-1)/sp of it. RoPE only this shard's positions. k/v still need full L
-        # (attention reads the whole KV window), so they gather over world.
-        if self.world_size == 1:
-            q_tp = q_local
-        else:
-            q_tp = torch.empty(sp_shard_len, self.dim, dtype=q_local.dtype, device=q_local.device)
-            ps.all_gather_into_tensor(q_tp, q_local, "attn-tp")
-        _, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L, gather_q=False)
-
-        k_full_4d = k_full.view(L, n, d).unsqueeze(0)
-        v = self._slice_heads(v_full)
-
         start_frame_int = current_start // frame_seqlen
         start_frame_t = torch.tensor(start_frame_int, device=x.device)
 
-        q_tp_4d = q_tp.view(sp_shard_len, n, d).unsqueeze(0)
-        roped_query = self._nki_rope_apply(
-            q_tp_4d, grid_sizes, freqs_cos, freqs_sin,
-            start_frame=start_frame_t, rope_grid_cache=rope_grid_cache,
-            start_frame_int=start_frame_int,
-            head_start=h_start, head_end=h_end,
-            tok_offset=sp_start, tok_len=sp_shard_len)
+        # RF_DISABLE_CP=1 forces the OLD full-gather-then-slice path (reference).
+        # The device-side accuracy gate in rf-job runs the pipeline once with
+        # RF_DISABLE_CP=1 and once without, and diffs the output latents BEFORE the
+        # benchmark — so CP correctness is verified on real hardware, not assumed.
+        import os as _os
+        _cp_on = _os.environ.get("RF_DISABLE_CP", "0") != "1"
+
+        if _cp_on and self.world_size > 1:
+            # CP query path: gather q ONLY over the attn-tp group -> the sp-shard
+            # [sp_start : sp_start+sp_shard_len] directly (proven == world-gather-
+            # then-slice), instead of all-gathering full L over world and discarding
+            # (sp-1)/sp of it. RoPE only this shard's positions.
+            q_tp = torch.empty(sp_shard_len, self.dim, dtype=q_local.dtype, device=q_local.device)
+            ps.all_gather_into_tensor(q_tp, q_local, "attn-tp")
+            _, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L, gather_q=False)
+            k_full_4d = k_full.view(L, n, d).unsqueeze(0)
+            v = self._slice_heads(v_full)
+            q_tp_4d = q_tp.view(sp_shard_len, n, d).unsqueeze(0)
+            roped_query = self._nki_rope_apply(
+                q_tp_4d, grid_sizes, freqs_cos, freqs_sin,
+                start_frame=start_frame_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=start_frame_int,
+                head_start=h_start, head_end=h_end,
+                tok_offset=sp_start, tok_len=sp_shard_len)
+        else:
+            # REFERENCE: original full-gather over world, RoPE full, slice to shard.
+            q_full, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L)
+            k_full_4d = k_full.view(L, n, d).unsqueeze(0)
+            v = self._slice_heads(v_full)
+            q_full_4d = q_full.view(L, n, d).unsqueeze(0)
+            roped_q_full = self._nki_rope_apply(
+                q_full_4d, grid_sizes, freqs_cos, freqs_sin,
+                start_frame=start_frame_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=start_frame_int,
+                head_start=h_start, head_end=h_end)
+            roped_query = roped_q_full[:, sp_start:sp_start + sp_shard_len]
 
         roped_key = self._nki_rope_apply(
             k_full_4d, grid_sizes, freqs_cos, freqs_sin,
