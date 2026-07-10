@@ -1,30 +1,3 @@
-# Rolling Forcing DMD DISTILLATION job — distill the T=5 Wan2.1-T2V-1.3B causal student
-# down to a T=4 (fewer-step) student for faster inference, ON TRAINIUM.
-# Produces checkpoints/<TS>/model.pt drop-in for this repo's inference (use_ema).
-#
-# WHY: inference DiT cost per rolling window scales ~(T+1) merged frames
-# (dit_pipeline.py: full_frames=(T+1)*num_frame_per_block). T 5->4 cuts ~18->15 frames/block
-# (~0.83x) -> projects ~14 fps -> ~16-17 fps. The shipped T=5 checkpoint CANNOT be truncated
-# at inference (the DMD student only predicts accurate x0 at the noise levels it was distilled
-# on) — so we RE-DISTILL with a 4-entry denoising_step_list.
-#
-# RECIPE = upstream RollingForcing DMD, unchanged except denoising_step_list (T=5->T=4):
-#   - generator (student)  : Wan2.1-T2V-1.3B causal, TRAINABLE, init from ode_init.pt
-#   - real_score (teacher) : Wan2.1-T2V-14B  BASE MULTI-STEP BIDIRECTIONAL, FROZEN
-#                            (NOT a distilled few-step ckpt — that mistake produced a garbage
-#                             teacher signal in the StreamDiffusionV2 attempt and never converged)
-#   - fake_score (critic)  : Wan2.1-T2V-1.3B, TRAINABLE
-#   - data-free: prompts only (student backward-simulates its own samples)
-#   - fp32 MASTER WEIGHTS on the trainable nets (the other fatal SD bug: bf16-only params
-#     + lr=1.5e-6 round every update to zero). The vendored trainer enforces this.
-#
-# NOTE: training code lives in training/ (vendored + Neuron-adapted from ~/RollingForcing).
-# See training/README.md for the adaptations and the on-device RISK list.
-#
-# Launch:
-#   kubectl delete job rf-distill --ignore-not-found
-#   kubectl apply -f rf-distill-job.yaml
-#   kubectl logs -f job/rf-distill
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -41,11 +14,6 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        # l-trn2 claim: full 2-chip Trn2 allocation (more HBM/host headroom than
-        # m-lnc1-trn2). The 14B teacher wrap OOM'd HBM at init on the smaller claim;
-        # this plus CPU-offloading the frozen teacher (trainer real_score_cpu_offload)
-        # is the fix. Frozen 14B teacher + trainable 1.3B student + 1.3B critic via
-        # FSDP HYBRID_SHARD. NOTE: does NOT set NEURON_LOGICAL_NC_CONFIG (forbidden).
         - name: l-trn2
           resourceClaimTemplateName: l-trn2
       containers:
@@ -202,17 +170,12 @@ spec:
           resources:
             claims:
               - name: l-trn2
-            # Training is far more host-heavy than the inference benchmark this manifest
-            # was cloned from (70/640Gi): the CPU fp32 EMA shadow, fsdp_state_dict's
-            # gather+offload-to-CPU at every save, the 14B teacher loading on CPU before
-            # sharding, and num_workers=8 all live in host RAM. The trn2.48xlarge has
-            # 192 vCPU / ~2Ti and sits at ~37% CPU / ~26% mem, so take a bigger slice.
             requests:
-              cpu: 180
-              memory: 1900Gi
+              cpu: 80
+              memory: 800Gi
             limits:
-              cpu: 180
-              memory: 1900Gi
+              cpu: 80
+              memory: 800Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -228,6 +191,12 @@ spec:
             # core holds ONE model instead of all three (11.2GB) -> the rollout's ~1.5GB
             # NEFF fits. Selects trainer/distillation_3group.py. Needs tp_degree in config.
             - name: DISTILL_THREE_GROUP
+              value: "1"
+            # Functional (out-of-place, single-block) self-attn on the STUDENT grad rollout
+            # (SD 42cd403+1d5f752). Required with FSDP2's NO_REENTRANT checkpoint: the
+            # streaming in-place KV-cache writes are autograd-fatal under recompute. Gated
+            # on this env (constant all run) so ckpt fwd/recompute always take the same path.
+            - name: DISTILL_FUNCTIONAL_ATTN
               value: "1"
             # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
             - name: NPROC

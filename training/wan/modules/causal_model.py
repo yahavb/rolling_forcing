@@ -1,3 +1,4 @@
+import os
 from wan.modules.attention import attention
 from wan.modules.model import (
     WanRMSNorm,
@@ -240,14 +241,19 @@ class CausalWanSelfAttention(nn.Module):
                     value=padded_v.transpose(2, 1),
                     block_mask=block_mask
                 )[:, :, :-padded_length].transpose(2, 1)
-        elif self.training:
-            # FUNCTIONAL TRAINING ATTENTION (SD 42cd403). The streaming KV-cache path below
-            # does IN-PLACE slice writes (kv_cache["k"][:, a:b] = ...) which are autograd-
-            # fatal under the NO_REENTRANT checkpoint recompute FSDP2 applies ("SliceBackward0
-            # is a view and is being modified inplace"). For the 1-step single-block DMD
-            # distill rollout, the exit block attends only its OWN roped_key/v (no cache
-            # assembly, no eviction) — so build K/V functionally, out-of-place, no cache
-            # mutation. Inference (eval/no_grad) keeps the streaming cache path untouched.
+        elif os.environ.get("DISTILL_FUNCTIONAL_ATTN", "").lower() in ("1", "true"):
+            # FUNCTIONAL TRAINING ATTENTION (SD 42cd403 + 1d5f752). The streaming KV-cache
+            # path below does IN-PLACE slice writes (kv_cache["k"][:, a:b] = ...) which are
+            # autograd-fatal under the NO_REENTRANT checkpoint recompute FSDP2 applies
+            # ("SliceBackward0 is a view and is being modified inplace"). For the 1-step
+            # single-block DMD distill rollout, the exit block attends only its OWN
+            # roped_key/v (no cache assembly, no eviction) — build K/V functionally,
+            # out-of-place, no cache mutation. Inference keeps the streaming cache path.
+            # GATE ON ENV, NOT self.training: NO_REENTRANT recompute / FSDP can FLIP
+            # module.training between the original forward and the recompute, so a
+            # self.training gate makes fwd take the functional branch and recompute take
+            # the cache branch -> different saved-tensor counts -> CheckpointError (72 vs
+            # 62). The env flag is constant all run, so fwd and recompute ALWAYS match.
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
             roped_query = causal_rope_apply(
