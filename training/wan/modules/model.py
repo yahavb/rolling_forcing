@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -206,7 +207,16 @@ class WanT2VCrossAttention(WanSelfAttention):
         # compute query, key, value
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
-        if crossattn_cache is not None:
+        # FUNCTIONAL cross-attn under DISTILL_FUNCTIONAL_ATTN (SD 42cd403/1d5f752): the
+        # crossattn_cache "is_init" pattern is STATEFUL — on the checkpoint forward is_init
+        # is False (compute + store k/v), on recompute it's now True (read cached k/v) ->
+        # different saved-tensor sets -> CheckpointError (72 vs 62). Always compute k/v
+        # fresh, never touch the cache, so fwd and recompute match. Env-gated (constant all
+        # run, unlike a state flag). Context is fixed per prompt, so recompute is free.
+        if os.environ.get("DISTILL_FUNCTIONAL_ATTN", "").lower() in ("1", "true"):
+            k = self.norm_k(self.k(context)).view(b, -1, n, d)
+            v = self.v(context).view(b, -1, n, d)
+        elif crossattn_cache is not None:
             if not crossattn_cache["is_init"]:
                 crossattn_cache["is_init"] = True
                 k = self.norm_k(self.k(context)).view(b, -1, n, d)
