@@ -279,9 +279,14 @@ class Trainer:
 
             if it == 0:
                 self._rlog(f"it0 (a): {'STUDENT rollout START' if self.in_student else 'non-student -> straight to bcast wait'}")
-            # (a) student rollout under no_grad -> detached x0 + its x_t/timestep
+            # (a) student rollout under no_grad -> detached x0 + its x_t/timestep.
+            # Fix the rollout noise ONCE so the (e) with_grad recompute reproduces THIS x0
+            # (SD 5d90c6b): the DMD grad (fake-real) is computed on this x0, so (e) must
+            # recompute the same one.
+            _rollout_noise = None
             if self.in_student:
-                x0_det, x_t, tt, num_frame = self._student_rollout(it, cond)
+                _rollout_noise = torch.randn(self.lat_shape, dtype=self.dtype, device=self.device)
+                x0_det, x_t, tt, num_frame = self._student_rollout(it, cond, noise=_rollout_noise)
                 if it == 0:
                     self._rlog("it0 (a): STUDENT rollout DONE")
             else:
@@ -337,7 +342,8 @@ class Trainer:
             do_g = (it >= self.warmup) and (it % self.dfake_gen_update_ratio == 0)
             if self.in_student and do_g:
                 self._gstep_probe(it, "e0: before with_grad rollout")
-                x0_grad, _, _, _ = self._student_rollout(it, cond, with_grad=True)
+                # SD 5d90c6b: recompute with the SAME fixed noise as (a) so x0_grad == x0_det.
+                x0_grad, _, _, _ = self._student_rollout(it, cond, with_grad=True, noise=_rollout_noise)
                 self._gstep_probe(it, "e1: after with_grad rollout")
                 grad = (fake_pred - real_pred)
                 normalizer = torch.abs(x0_grad - real_pred).mean(
@@ -479,10 +485,14 @@ class Trainer:
         self._save_ckpt(self.iters)
         self._log("done.")
 
-    def _student_rollout(self, it, cond, with_grad=False):
+    def _student_rollout(self, it, cond, with_grad=False, noise=None):
         """Run the RF rollout on the student group. Returns (x0, x_t, tt, num_frame).
-        no_grad by default; with_grad=True rebuilds the graph for the single backward."""
-        noise = torch.randn(self.lat_shape, dtype=self.dtype, device=self.device)
+        no_grad by default; with_grad=True rebuilds the graph for the single backward.
+        SD 5d90c6b: the (a) no_grad and (e) with_grad rollouts MUST reuse the SAME noise
+        so the recompute reproduces the same x0 the teacher/critic scored — else the DMD
+        gradient (fake-real, computed on the (a) x0) is applied to a DIFFERENT (e) x0."""
+        if noise is None:
+            noise = torch.randn(self.lat_shape, dtype=self.dtype, device=self.device)
         ctx = torch.enable_grad() if with_grad else torch.no_grad()
         if it == 0:
             self._rlog(f"  rollout it0: inference_with_self_forcing START (with_grad={with_grad}) "
