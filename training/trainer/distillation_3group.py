@@ -131,15 +131,14 @@ class Trainer:
             print(msg, flush=True)
 
     def _rlog(self, msg):
-        # ALL debug prints are prefixed IMAFUCKINGASSHOLE so every temporary diagnostic
-        # line can be grep-deleted in one shot once the leak is found.
+        # per-rank timestamped diagnostic (build/it0 markers). [dbg] tag = greppable.
         import time as _t
-        print(f"IMAFUCKINGASSHOLE [r{self.my_rank} {_t.strftime('%H:%M:%S')}] {msg}", flush=True)
+        print(f"[dbg r{self.my_rank} {_t.strftime('%H:%M:%S')}] {msg}", flush=True)
 
     def _gstep_probe(self, it, tag):
-        # IMAFUCKINGASSHOLE debug: device-tensor count+MB at a point INSIDE the G-step, so
-        # we see WHICH sub-step (rollout / backward / opt.step / del) adds the leaked
-        # tensors. Student src rank, only iters 9-17 (spans the first two G-steps).
+        # [dbg] device-tensor count+MB at a point INSIDE the G-step, so we see WHICH
+        # sub-step (rollout / backward / opt.step / del) adds the leaked tensors.
+        # Student src rank, only iters 9-17 (spans the first two G-steps).
         if not (self.my_rank == self.ssrc and 9 <= it <= 17):
             return
         import gc as _gc
@@ -150,7 +149,7 @@ class Trainer:
                     n += 1; mb += o.numel() * o.element_size() / 1e6
             except Exception:
                 pass
-        print(f"IMAFUCKINGASSHOLE [gstep it{it}] {tag}: dev_tensors={n} dev_MB={mb:.0f}", flush=True)
+        print(f"[dbg gstep it{it}] {tag}: dev_tensors={n} dev_MB={mb:.0f}", flush=True)
 
     def _build_group_model(self, config):
         real_name = getattr(config, "real_name", "Wan2.1-T2V-1.3B")
@@ -428,9 +427,9 @@ class Trainer:
             if self.my_rank == self.ssrc:
                 avg = sum(self._dmdnorm_hist) / len(self._dmdnorm_hist) if self._dmdnorm_hist else float("nan")
                 phase = "warmup" if it < self.warmup else ("G-step" if do_g else "critic-only")
-                print(f"IMAFUCKINGASSHOLE it {it}/{self.iters} [{phase}] dmdnorm={dmdnorm:.4f} dmdnorm_avg50={avg:.4f}", flush=True)
+                print(f"it {it}/{self.iters} [{phase}] dmdnorm={dmdnorm:.4f} dmdnorm_avg50={avg:.4f}", flush=True)
             if self.my_rank == self.fsrc:
-                print(f"IMAFUCKINGASSHOLE it {it}/{self.iters}  loss_fake={lf:.4f}", flush=True)
+                print(f"it {it}/{self.iters}  loss_fake={lf:.4f}", flush=True)
 
             self.step = it
 
@@ -456,13 +455,13 @@ class Trainer:
                                 grad_ct += 1
                     except Exception:
                         pass
-                print(f"IMAFUCKINGASSHOLE [memprobe it{it}] dev_tensors={n} dev_MB={mb:.0f} do_g={do_g} grad_tensors={grad_ct}", flush=True)
+                print(f"[dbg memprobe it{it}] dev_tensors={n} dev_MB={mb:.0f} do_g={do_g} grad_tensors={grad_ct}", flush=True)
                 # On the iters right after a G-step (11,16), dump the top retained tensor
                 # shapes by total MB — this NAMES what is leaking instead of guessing.
                 if it in (9, 11, 16):
                     top = shape_mb.most_common(12)
                     for k, v in top:
-                        print(f"IMAFUCKINGASSHOLE   [memtop it{it}] {v:8.0f} MB  x{shape_ct[k]:4d}  {k}", flush=True)
+                        print(f"[dbg memtop it{it}] {v:8.0f} MB  x{shape_ct[k]:4d}  {k}", flush=True)
 
             if it > 0 and it % self.save_every == 0:
                 self._save_ckpt(it)
