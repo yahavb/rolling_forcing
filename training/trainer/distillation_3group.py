@@ -368,6 +368,8 @@ class Trainer:
                         self._log(f"  [grad] it {it}: NON-FINITE grad_norm={gn} -> SKIP step")
                     else:
                         self.opt_g.step()
+                        if self.my_rank == self.ssrc:
+                            print(f"[grad] it {it}: grad_norm={gn:.6e}", flush=True)
                     self._g_since_step = 0
                     # FREE THE GRADS NOW, not at the next G-step. The probe showed .grad
                     # (full fp32 grads on every student param) + FSDP backward buffers

@@ -241,8 +241,16 @@ class CausalWanSelfAttention(nn.Module):
                     value=padded_v.transpose(2, 1),
                     block_mask=block_mask
                 )[:, :, :-padded_length].transpose(2, 1)
-        elif os.environ.get("DISTILL_FUNCTIONAL_ATTN", "").lower() in ("1", "true"):
-            # FUNCTIONAL TRAINING ATTENTION (SD 42cd403 + 1d5f752). The streaming KV-cache
+        elif (os.environ.get("DISTILL_FUNCTIONAL_ATTN", "").lower() in ("1", "true")
+              and torch.is_grad_enabled()):
+            # FUNCTIONAL TRAINING ATTENTION — ONLY under grad (the exit block during ckpt
+            # recompute). The no_grad blocks MUST use the full cache path: rolling-forcing
+            # needs cross-block KV context (earlier blocks' cache feeds later blocks). The
+            # old env-only gate broke this by making ALL blocks blind-per-block (no temporal
+            # context) → the student produced degraded x0, teacher scored it worse, dmdnorm
+            # rose monotonically. Now: no_grad blocks → full cache path (safe: no backward,
+            # no recompute, in-place writes are fine). With-grad exit block → functional
+            # (required: ckpt recompute breaks on in-place views). The streaming KV-cache
             # path below does IN-PLACE slice writes (kv_cache["k"][:, a:b] = ...) which are
             # autograd-fatal under the NO_REENTRANT checkpoint recompute FSDP2 applies
             # ("SliceBackward0 is a view and is being modified inplace"). For the 1-step

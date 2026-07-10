@@ -213,7 +213,10 @@ class WanT2VCrossAttention(WanSelfAttention):
         # different saved-tensor sets -> CheckpointError (72 vs 62). Always compute k/v
         # fresh, never touch the cache, so fwd and recompute match. Env-gated (constant all
         # run, unlike a state flag). Context is fixed per prompt, so recompute is free.
-        if os.environ.get("DISTILL_FUNCTIONAL_ATTN", "").lower() in ("1", "true"):
+        if (os.environ.get("DISTILL_FUNCTIONAL_ATTN", "").lower() in ("1", "true")
+                and torch.is_grad_enabled()):
+            # Only bypass the cache under grad (the exit block's checkpoint recompute).
+            # No-grad blocks use the cache normally — cross-attn cache is cheap and correct.
             k = self.norm_k(self.k(context)).view(b, -1, n, d)
             v = self.v(context).view(b, -1, n, d)
         elif crossattn_cache is not None:
