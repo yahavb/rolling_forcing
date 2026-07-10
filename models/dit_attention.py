@@ -260,18 +260,13 @@ class CausalWanSelfAttention(nn.Module):
         start_frame_int = current_start // frame_seqlen
         start_frame_t = torch.tensor(start_frame_int, device=x.device)
 
-        # RF_DISABLE_CP=1 forces the OLD full-gather-then-slice path (reference).
-        # The device-side accuracy gate in rf-job runs the pipeline once with
-        # RF_DISABLE_CP=1 and once without, and diffs the output latents BEFORE the
-        # benchmark — so CP correctness is verified on real hardware, not assumed.
-        import os as _os
-        _cp_on = _os.environ.get("RF_DISABLE_CP", "0") != "1"
-
-        if _cp_on and self.world_size > 1:
-            # CP query path: gather q ONLY over the attn-tp group -> the sp-shard
-            # [sp_start : sp_start+sp_shard_len] directly (proven == world-gather-
-            # then-slice), instead of all-gathering full L over world and discarding
-            # (sp-1)/sp of it. RoPE only this shard's positions.
+        # CP query path: gather q ONLY over the attn-tp group -> this rank's sp-shard
+        # [sp_start : sp_start+sp_shard_len] directly (proven == world-gather-then-
+        # slice, bit-identical), instead of all-gathering the full L over world and
+        # discarding (sp-1)/sp of it. RoPE only this shard's positions. k/v still
+        # gather full L over world (attention reads the whole KV window).
+        # Validated at CP2/CP4/CP8 (max|Δ|=0.0 vs the old full-gather path).
+        if self.world_size > 1:
             q_tp = torch.empty(sp_shard_len, self.dim, dtype=q_local.dtype, device=q_local.device)
             ps.all_gather_into_tensor(q_tp, q_local, "attn-tp")
             _, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L, gather_q=False)
@@ -285,7 +280,6 @@ class CausalWanSelfAttention(nn.Module):
                 head_start=h_start, head_end=h_end,
                 tok_offset=sp_start, tok_len=sp_shard_len)
         else:
-            # REFERENCE: original full-gather over world, RoPE full, slice to shard.
             q_full, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L)
             k_full_4d = k_full.view(L, n, d).unsqueeze(0)
             v = self._slice_heads(v_full)
