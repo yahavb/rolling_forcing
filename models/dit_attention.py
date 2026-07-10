@@ -148,6 +148,26 @@ class CausalWanSelfAttention(nn.Module):
         q_out = _gather(q_local) if gather_q else None
         return q_out, _gather(k_local), _gather(v_local)
 
+    def _gather_cu_dn(self, t_local, L_cu, L_dn):
+        """Merged-CP: gather a [cu_N;dn_N] per-rank tensor into contiguous [cu],[dn].
+
+        t_local is this rank's [cu_N ; dn_N] shard. A single world-gather would land
+        interleaved [r0cu,r0dn,r1cu,r1dn,...], forcing a strided deinterleave copy
+        (the gpsimd 1c20../c326.. kernels). Instead we slice cu/dn locally (contiguous,
+        cheap) and world-gather each part: all_gather concatenates in rank order, so the
+        result is already contiguous [r0cu,r1cu,...] = [L_cu,dim] and [r0dn,r1dn,...] =
+        [L_dn,dim] with NO deinterleave copy. Bit-identical (verify_cp_kv_gather.py
+        max|Δ|=0); trades 1 interleaved gather + strided copy for 2 contiguous gathers.
+        """
+        L_cu_N = L_cu // self.world_size
+        cu_local = t_local[:L_cu_N].contiguous()
+        dn_local = t_local[L_cu_N:].contiguous()
+        cu = torch.empty(L_cu, self.dim, dtype=t_local.dtype, device=t_local.device)
+        dn = torch.empty(L_dn, self.dim, dtype=t_local.dtype, device=t_local.device)
+        ps.all_gather_into_tensor(cu, cu_local, "world")
+        ps.all_gather_into_tensor(dn, dn_local, "world")
+        return cu, dn
+
     def _slice_heads(self, t):
         return self._slice_heads_2d(t).unsqueeze(0)
 
@@ -493,14 +513,14 @@ class CausalWanSelfAttention(nn.Module):
             q_tp = q_tp.view(tp, L_cu_N + L_dn_N, self.dim)
             q_cu_2d = q_tp[:, :L_cu_N].reshape(L_cu_sp, self.dim)
             q_dn_2d = q_tp[:, L_cu_N:].reshape(L_dn_sp, self.dim)
-            # k/v over world, deinterleave
-            _, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L_full, gather_q=False)
-            k_di = k_full.view(N, L_cu_N + L_dn_N, self.dim)
-            v_di = v_full.view(N, L_cu_N + L_dn_N, self.dim)
-            k_cu_di = k_di[:, :L_cu_N].reshape(L_cu, self.dim)
-            k_dn_di = k_di[:, L_cu_N:].reshape(L_dn, self.dim)
-            v_cu_full = v_di[:, :L_cu_N].reshape(L_cu, self.dim)
-            v_dn_full = v_di[:, L_cu_N:].reshape(L_dn, self.dim)
+            # k/v over world, SPLIT-BEFORE-GATHER: gather cu and dn parts separately so
+            # each lands contiguous in rank order — NO strided deinterleave copy. This
+            # removes the gpsimd-94% kernels 1c20../c326.. (~15.8k us/step, profile run
+            # 100726225029). Bit-identical to the view(N,-1).split (verify_cp_kv_gather.py
+            # max|Δ|=0). Trades 1 interleaved gather + full-window copy -> 2 contiguous
+            # gathers per k/v.
+            k_cu_di, k_dn_di = self._gather_cu_dn(k_local, L_cu, L_dn)
+            v_cu_full, v_dn_full = self._gather_cu_dn(v_local, L_cu, L_dn)
             v_cu_h = self._slice_heads_2d(v_cu_full).contiguous()
             v_dn_h = self._slice_heads_2d(v_dn_full).contiguous()
             q_cu = q_cu_2d.view(L_cu_sp, n, d).unsqueeze(0)
