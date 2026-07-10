@@ -497,20 +497,20 @@ class CausalWanSelfAttention(nn.Module):
             _, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L_full, gather_q=False)
             k_di = k_full.view(N, L_cu_N + L_dn_N, self.dim)
             v_di = v_full.view(N, L_cu_N + L_dn_N, self.dim)
-            k_cu = k_di[:, :L_cu_N].reshape(L_cu, self.dim)
-            k_dn = k_di[:, L_cu_N:].reshape(L_dn, self.dim)
+            k_cu_di = k_di[:, :L_cu_N].reshape(L_cu, self.dim)
+            k_dn_di = k_di[:, L_cu_N:].reshape(L_dn, self.dim)
             v_cu_full = v_di[:, :L_cu_N].reshape(L_cu, self.dim)
             v_dn_full = v_di[:, L_cu_N:].reshape(L_dn, self.dim)
             v_cu_h = self._slice_heads_2d(v_cu_full).contiguous()
             v_dn_h = self._slice_heads_2d(v_dn_full).contiguous()
             q_cu = q_cu_2d.view(L_cu_sp, n, d).unsqueeze(0)
             q_dn = q_dn_2d.view(L_dn_sp, n, d).unsqueeze(0)
-            k_cu_full = k_cu.view(L_cu, n, d).unsqueeze(0)
-            k_dn_full = k_dn.view(L_dn, n, d).unsqueeze(0)
+            k_cu_full = k_cu_di.view(L_cu, n, d).unsqueeze(0)
+            k_dn_full = k_dn_di.view(L_dn, n, d).unsqueeze(0)
             v_cu = v_cu_h.unsqueeze(0)
             v_dn = v_dn_h.unsqueeze(0)
-            # reconstructed contiguous k_full for the k_full[:L_cu]/[L_cu:] anchor-write slices below
-            k_full = torch.cat([k_cu, k_dn], dim=0)
+            # NOTE: no k_full = cat([k_cu,k_dn]) — that full-K copy per layer was pure waste.
+            # The anchor-write slices below use k_cu_di/k_dn_di directly (== k_full[:L_cu]/[L_cu:]).
         else:
             q_full, k_full, v_full = self._gather_qkv(
                 q_local, k_local, v_local, L_full)
@@ -567,14 +567,17 @@ class CausalWanSelfAttention(nn.Module):
             head_start=h_start, head_end=h_end)
 
         if self._will_anchor_write(kv_cache, cache_update_start):
-            k_cu = self._slice_heads_2d(k_full[:L_cu]).contiguous().unsqueeze(0)
+            # CP: k_cu_di is already [L_cu, dim] (== k_full[:L_cu]); else slice contiguous k_full.
+            _k_cu_src = k_cu_di if _cp_merged else k_full[:L_cu]
+            k_cu = self._slice_heads_2d(_k_cu_src).contiguous().unsqueeze(0)
         else:
             k_cu = None
         le_cu, ls_cu = self._cache_write(
             k_cu, v_cu, rk_cu, kv_cache, cache_update_start, cu_shared_buffers)
 
         if self._will_anchor_write(kv_cache, current_start):
-            k_dn = self._slice_heads_2d(k_full[L_cu:]).contiguous().unsqueeze(0)
+            _k_dn_src = k_dn_di if _cp_merged else k_full[L_cu:]
+            k_dn = self._slice_heads_2d(_k_dn_src).contiguous().unsqueeze(0)
         else:
             k_dn = None
         le_dn, ls_dn = self._cache_write(
