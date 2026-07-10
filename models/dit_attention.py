@@ -136,7 +136,7 @@ class CausalWanSelfAttention(nn.Module):
         v = self.v(x)[0]
         return q, k, v
 
-    def _gather_qkv(self, q_local, k_local, v_local, L):
+    def _gather_qkv(self, q_local, k_local, v_local, L, gather_q=True):
         def _gather(t):
             if self.world_size == 1:
                 return t
@@ -144,7 +144,9 @@ class CausalWanSelfAttention(nn.Module):
             ps.all_gather_into_tensor(out, t, "world")
             return out
 
-        return _gather(q_local), _gather(k_local), _gather(v_local)
+        # CP: q may be gathered separately over attn-tp (caller does it); skip here.
+        q_out = _gather(q_local) if gather_q else None
+        return q_out, _gather(k_local), _gather(v_local)
 
     def _slice_heads(self, t):
         return self._slice_heads_2d(t).unsqueeze(0)
@@ -182,14 +184,23 @@ class CausalWanSelfAttention(nn.Module):
 
     def _nki_rope_apply(self, x, grid_sizes, freqs_cos, freqs_sin, start_frame,
                         rope_grid_cache=None, start_frame_int=None,
-                        head_start=None, head_end=None):
+                        head_start=None, head_end=None,
+                        tok_offset=0, tok_len=None):
+        # CP: tok_offset/tok_len RoPE only a contiguous token sub-range using the
+        # position-matched grid slice combined[tok_offset:tok_offset+tok_len].
+        # RoPE is per-position, so RoPE(q)[slice] == RoPE(grid[slice], q[slice]) —
+        # bit-identical to rope-full-then-slice, but on 1/sp the tokens.
         assert (head_start is None) == (head_end is None), (
             "head_start and head_end must be provided together")
 
         b, s, n, d = x.shape
         f, h, w = grid_sizes
         seq_len = f * h * w
-        assert seq_len == s
+        if tok_len is None:
+            tok_len = seq_len
+            assert seq_len == s
+        else:
+            assert s == tok_len, f"x len {s} != tok_len {tok_len}"
         if head_start is None:
             head_start = 0
             head_end = n
@@ -210,10 +221,13 @@ class CausalWanSelfAttention(nn.Module):
             if cache_key is not None:
                 rope_grid_cache[cache_key] = combined
 
+        # slice the grid to the requested token sub-range (CP query shard)
+        combined = combined[tok_offset:tok_offset + tok_len]
+
         n_local = head_end - head_start
         P = 128
-        pad = (P - seq_len % P) % P
-        x_local = x[0, :seq_len, head_start:head_end, :]
+        pad = (P - tok_len % P) % P
+        x_local = x[0, :tok_len, head_start:head_end, :]
         x_padded = torch.nn.functional.pad(x_local, (0, 0, 0, 0, 0, pad))
         combined_padded = torch.nn.functional.pad(combined, (0, 0, 0, pad))
 
@@ -221,7 +235,7 @@ class CausalWanSelfAttention(nn.Module):
             x_padded, combined_padded,
             num_heads=n_local, head_dim=d)
 
-        return out[:seq_len].unsqueeze(0)
+        return out[:tok_len].unsqueeze(0)
 
     def _qkv_rope(self, x, grid_sizes, freqs_cos, freqs_sin, current_start,
                   rope_grid_cache=None, kv_cache=None):
@@ -233,28 +247,41 @@ class CausalWanSelfAttention(nn.Module):
             f"L ({L}) must be divisible by world_size ({self.world_size})")
 
         q_local, k_local, v_local = self._local_qkv_norm(x)
-        q_full, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L)
 
         n = self.num_heads
         d = self.head_dim
         n_local = self.heads_per_shard
         h_start = self.tp_rank * n_local
         h_end = h_start + n_local
-        q_full_4d = q_full.view(L, n, d).unsqueeze(0)
+
+        sp_shard_len = L // self.sp_degree
+        sp_start = self.sp_rank * sp_shard_len
+
+        # CP query path: gather q ONLY over the attn-tp group -> the sp-shard
+        # [sp_start : sp_start+sp_shard_len] directly (proven == world-gather-then-
+        # slice), instead of all-gathering the full L over world and discarding
+        # (sp-1)/sp of it. RoPE only this shard's positions. k/v still need full L
+        # (attention reads the whole KV window), so they gather over world.
+        if self.world_size == 1:
+            q_tp = q_local
+        else:
+            q_tp = torch.empty(sp_shard_len, self.dim, dtype=q_local.dtype, device=q_local.device)
+            ps.all_gather_into_tensor(q_tp, q_local, "attn-tp")
+        _, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L, gather_q=False)
+
         k_full_4d = k_full.view(L, n, d).unsqueeze(0)
         v = self._slice_heads(v_full)
 
         start_frame_int = current_start // frame_seqlen
         start_frame_t = torch.tensor(start_frame_int, device=x.device)
 
-        roped_q_full = self._nki_rope_apply(
-            q_full_4d, grid_sizes, freqs_cos, freqs_sin,
+        q_tp_4d = q_tp.view(sp_shard_len, n, d).unsqueeze(0)
+        roped_query = self._nki_rope_apply(
+            q_tp_4d, grid_sizes, freqs_cos, freqs_sin,
             start_frame=start_frame_t, rope_grid_cache=rope_grid_cache,
             start_frame_int=start_frame_int,
-            head_start=h_start, head_end=h_end)
-        sp_shard_len = L // self.sp_degree
-        sp_start = self.sp_rank * sp_shard_len
-        roped_query = roped_q_full[:, sp_start:sp_start + sp_shard_len]
+            head_start=h_start, head_end=h_end,
+            tok_offset=sp_start, tok_len=sp_shard_len)
 
         roped_key = self._nki_rope_apply(
             k_full_4d, grid_sizes, freqs_cos, freqs_sin,
