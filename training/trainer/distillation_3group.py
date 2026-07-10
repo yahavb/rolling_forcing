@@ -28,7 +28,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 
-from utils.distributed import fsdp_wrap, make_distill_groups, launch_distributed_job
+from utils.distributed import fsdp_wrap, fsdp2_wrap_student, make_distill_groups, launch_distributed_job
 from utils.misc import set_seed
 from utils.wan_wrapper import WanDiffusionWrapper
 from pipeline import RollingForcingTrainingPipeline
@@ -159,8 +159,10 @@ class Trainer:
             self.generator = WanDiffusionWrapper(**getattr(config, "model_kwargs", {}), is_causal=True)
             self._rlog("student: from_pretrained DONE")
             self.generator.model.requires_grad_(True)
-            if getattr(config, "gradient_checkpointing", False):
-                self.generator.enable_gradient_checkpointing()
+            # NOTE: do NOT call enable_gradient_checkpointing() here — fsdp2_wrap_student
+            # applies per-block NO_REENTRANT checkpoint_wrapper itself (SD path). The
+            # diffusers-native grad-ckpt (self.gradient_checkpointing flag) would double-
+            # wrap. FSDP2 fully_shard + its checkpoint is the ONLY checkpointing now.
             self.scheduler = self.generator.get_scheduler()
             self.scheduler.timesteps = self.scheduler.timesteps.to(self.device)
             if getattr(config, "alphas_cumprod", None) is None and getattr(self.scheduler, "alphas_cumprod", None) is not None:
@@ -177,12 +179,12 @@ class Trainer:
                 elif "model" in sd:
                     sd = sd["model"]
                 self.generator.load_state_dict(sd, strict=True)
-            self._rlog("student: START fsdp_wrap...")
-            self.generator = fsdp_wrap(
-                self.generator, sharding_strategy=config.sharding_strategy,
-                mixed_precision=config.mixed_precision, wrap_strategy="transformer",
-                transformer_module=_WAN_BLOCKS, process_group=self.groups["student_pg"])
-            self._rlog("student: fsdp_wrap DONE")
+            self._rlog("student: START FSDP2 fully_shard...")
+            # FSDP2 fully_shard (SD 5d90c6b) — reshard_after_forward=True frees the DMD
+            # G-step backward graph that FSDP1 retained (+10GB/G-step -> OOM). Student only.
+            self.generator = fsdp2_wrap_student(
+                self.generator, self.groups["student_ranks"], _WAN_BLOCKS)
+            self._rlog("student: FSDP2 fully_shard DONE")
             self.opt_g = torch.optim.AdamW(
                 [p for p in self.generator.parameters() if p.requires_grad],
                 lr=config.lr, betas=(config.beta1, config.beta2),
@@ -359,7 +361,10 @@ class Trainer:
                 self._gstep_probe(it, "e3: after backward")
                 self._g_since_step += 1
                 if self._g_since_step >= self.grad_accum:
-                    gn = float(self.generator.clip_grad_norm_(10.0))
+                    # FSDP2 fully_shard modules have NO .clip_grad_norm_ method (that is
+                    # FSDP1). Clip the params directly (SD path); DTensor grads clip correctly.
+                    gn = float(torch.nn.utils.clip_grad_norm_(
+                        [p for p in self.generator.parameters() if p.requires_grad], 10.0))
                     if gn != gn or gn == float("inf"):
                         self._log(f"  [grad] it {it}: NON-FINITE grad_norm={gn} -> SKIP step")
                     else:
@@ -517,19 +522,31 @@ class Trainer:
         return x0d, x_t, tt, num_frame
 
     def _save_ckpt(self, it):
-        from utils.distributed import fsdp_state_dict
+        # FSDP2 (fully_shard) student: gather the full state_dict via
+        # get_model_state_dict(full_state_dict=True, cpu_offload=True) (SD save_ckpt path),
+        # NOT FSDP1 fsdp_state_dict. Fallback materializes DTensor shards to full tensors.
         if not self.in_student:
             if dist.is_initialized():
                 dist.barrier()
             return
-        sd = fsdp_state_dict(self.generator)
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+        full = get_model_state_dict(
+            self.generator, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+        if len(full) == 0:
+            from torch.distributed.tensor import DTensor
+            raw = self.generator.state_dict()
+            full = {}
+            for k, v in raw.items():
+                if isinstance(v, DTensor):
+                    v = v.full_tensor()
+                full[k] = v.detach().to("cpu")
         if dist.is_initialized():
             dist.barrier()
         if self.my_rank == self.ssrc:
             def _clean(k):
                 return (k.replace("_fsdp_wrapped_module.", "").replace("_checkpoint_wrapped_module.", "")
-                        .replace("_orig_mod.", ""))
-            payload = {"generator": {_clean(k): v for k, v in sd.items()}, "distill_iter": it}
+                        .replace("_orig_mod.", "").replace("_checkpoint_wrapped_module", ""))
+            payload = {"generator": {_clean(k): v for k, v in full.items()}, "distill_iter": it}
             out = os.path.join(self.output_path, f"model.iter{it}.pt")
             torch.save(payload, out)
             print(f"[ckpt] wrote {out} ({len(payload['generator'])} tensors)", flush=True)

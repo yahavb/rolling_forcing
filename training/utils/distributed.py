@@ -20,6 +20,45 @@ def fsdp_state_dict(model):
     return checkpoint
 
 
+def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls):
+    """FSDP2 fully_shard for the STUDENT generator (SD 5d90c6b path). FSDP1's backward
+    unshard buffers were NOT resharded/freed after the DMD G-step backward -> the rollout
+    activation graph accumulated +~10GB per G-step (proven by memprobe across del+gc+sync).
+    FSDP2 fully_shard(reshard_after_forward=True) reshards params after BOTH forward and
+    backward, so the graph frees. Per-block + root, matching SD build_student_pipeline.
+
+    Only the student needs this — teacher is frozen (no backward) and critic does a single
+    forward+backward (no multi-block rollout), neither OOM'd. Both stay FSDP1.
+
+    student_ranks: the global ranks in the student group (e.g. [8,9,10,11]).
+    transformer_layer_cls: set of block classes to shard per-block.
+    Returns the model (fully_shard mutates in place)."""
+    from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper, CheckpointImpl, apply_activation_checkpointing)
+    from torch.distributed.device_mesh import DeviceMesh
+
+    # Build the mesh from the EXPLICIT student rank list — NOT init_device_mesh over the
+    # world. init_device_mesh(world//n, n) is collective across ALL ranks, but only the
+    # student ranks call this function (teacher/critic never enter) -> a world-collective
+    # here would DEADLOCK. DeviceMesh(mesh=<student ranks>) constructs over exactly those
+    # ranks (reuses the already-created student process group), no world collective.
+    local_mesh = DeviceMesh("neuron", torch.tensor(student_ranks, dtype=torch.int))
+
+    # per-block NO_REENTRANT activation checkpointing (SD: mandatory — OOMs without it)
+    m = model.model  # WanDiffusionWrapper.model = the CausalWanModel (has .blocks)
+    apply_activation_checkpointing(
+        m,
+        checkpoint_wrapper_fn=lambda mod: checkpoint_wrapper(mod, checkpoint_impl=CheckpointImpl.NO_REENTRANT),
+        check_fn=lambda mod: any(isinstance(mod, c) for c in transformer_layer_cls),
+    )
+    mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    for blk in m.blocks:
+        fully_shard(blk, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
+    fully_shard(m, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
+    return model
+
+
 def make_distill_groups(tp_degree, teacher_tp=None, student_tp=None, fake_tp=None):
     """SD three-group placement (distill_sdv2.py three_group=True): give EACH net its
     own rank group so each core holds ONE model (teacher | student | fake), not all
