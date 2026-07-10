@@ -617,6 +617,15 @@ class CausalWanSelfAttention(nn.Module):
         if N == 1:
             return cu_dn_sep.unsqueeze(0)
 
+        if _cp_merged:
+            # cu_dn_sep is ALREADY this world-rank's [cu-block r ; dn-block r] shard —
+            # exactly the CP input layout the NEXT block expects (proven). So return it
+            # directly: no world all-gather + restore_layout + reslice needed. This keeps
+            # block-to-block layout consistent (the bug the isolated CPU proof missed:
+            # output layout must EQUAL input layout for chained blocks) AND saves the
+            # world all-gather (extra CP win).
+            return cu_dn_sep.unsqueeze(0)
+
         gathered = torch.empty(N * L_full_N, self.dim, dtype=cu_dn_sep.dtype, device=cu_dn_sep.device)
         ps.all_gather_into_tensor(gathered, cu_dn_sep, "world")
         full = restore_layout(gathered, N=N, nfpb=3, max_frames=15,

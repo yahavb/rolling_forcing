@@ -259,8 +259,24 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             full = torch.empty(B * self.world_size * shard_len, C,
                                dtype=x.dtype, device=x.device)
             ps.all_gather_into_tensor(full, x.reshape(-1, C), "world")
-            x = full.reshape(B, self.world_size * shard_len, C)
+            if _cp_merged:
+                # block output is [cu_N;dn_N] per rank -> gathered is interleaved
+                # [r0cu,r0dn,r1cu,r1dn,...]; deinterleave to contiguous [cu|dn] for head.
+                frame_seqlen0 = grid_sizes[1] * grid_sizes[2]
+                L_cu_o = nfpb_cu * frame_seqlen0
+                L_dn_o = self.world_size * shard_len - L_cu_o
+                L_cu_No = L_cu_o // self.world_size
+                L_dn_No = L_dn_o // self.world_size
+                di = full.view(self.world_size, shard_len, C)
+                x = torch.cat([
+                    di[:, :L_cu_No].reshape(1, L_cu_o, C),
+                    di[:, L_cu_No:].reshape(1, L_dn_o, C),
+                ], dim=1)
+            else:
+                x = full.reshape(B, self.world_size * shard_len, C)
 
+        # head uses e; for _cp_merged the head runs on the full contiguous sequence, so
+        # rebuild the full expanded e (not the cu/dn-sharded kwargs["e"]).
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         x = x.flatten(1, 2)
         result = self._unpatchify(x, self.out_dim, self.patch_size, grid_sizes).unsqueeze(0)
