@@ -483,7 +483,11 @@ class CausalWanSelfAttention(nn.Module):
                 l = l * cp + sum_s * cc
                 acc = acc * cp + O_s * cc
                 m = m_new
-        out = acc / l                              # [Sq, bs, d]
+        out = acc / l                              # [Sq, bs, d] fp32
+        # combine runs in fp32 (kernel partials are fp32 for cross-rank precision), but the
+        # default kernel returns q.dtype (bf16) and the downstream Linear (self.o) expects
+        # that — cast back or the o-proj matmul hits 'input datatypes mismatched'.
+        out = out.to(q_kern.dtype)
         # match default _attend contract exactly: out.unsqueeze(0).flatten(2)
         # -> [1, Sq, bs*d]  (same as wan_flash_self_attn result path).
         return out.unsqueeze(0).flatten(2)
