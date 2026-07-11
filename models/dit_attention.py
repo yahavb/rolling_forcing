@@ -448,22 +448,23 @@ class CausalWanSelfAttention(nn.Module):
         # on the padded BUFFER width, not the valid length (the default path passes a
         # 8192-padded buffer with actual_seqlen_k=k_len_int). Each segment gets its own
         # 8192-padded buffer with actual_seqlen_k=seg; the kernel masks past seg.
+        # kernel layout: q_kern [bs,d,Sq], k_kern [bs,d,Sk], v_kern [bs,Sk,d]  (bs=heads/shard).
         assert k_len_int % sp == 0, (
             f"ring: valid window k_len_int={k_len_int} must be divisible by sp={sp}")
+        bs, d_dim, Sk = k_kern.shape
         seg = k_len_int // sp
-        d_dim = k_kern.shape[0]
         buf_w = ((seg + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
 
-        m = None  # running max [seqlen_q, 1]
-        l = None  # running sum
-        acc = None  # running unnormalized output [seqlen_q, d]
+        m = None  # running max [Sq, bs]
+        l = None  # running sum  [Sq, bs]
+        acc = None  # running unnormalized output [Sq, bs, d]
         for s in range(sp):  # GLOBAL segment order — required for bit-exactness
             # pad each segment's k/v to a multiple of ATTN_SEQLEN_MULTIPLE; kernel ignores
-            # the pad via actual_seqlen_k=seg (same masking the default path uses for 3600).
-            k_seg = k_kern.new_zeros((d_dim, buf_w))
-            v_seg = v_kern.new_zeros((buf_w, d_dim))
-            k_seg[:, :seg] = k_kern[:, s * seg:(s + 1) * seg]
-            v_seg[:seg, :] = v_kern[s * seg:(s + 1) * seg, :]
+            # the pad via actual_seqlen_k=seg (same masking the default path uses).
+            k_seg = k_kern.new_zeros((bs, d_dim, buf_w))
+            v_seg = v_kern.new_zeros((bs, buf_w, d_dim))
+            k_seg[:, :, :seg] = k_kern[:, :, s * seg:(s + 1) * seg]
+            v_seg[:, :seg, :] = v_kern[:, s * seg:(s + 1) * seg, :]
             O_s, max_s, sum_s = wan_flash_self_attn(
                 q_kern, k_seg.contiguous(), v_seg.contiguous(),
                 softmax_scale=self.softmax_scale,
@@ -471,9 +472,9 @@ class CausalWanSelfAttention(nn.Module):
                 use_dynamic_loop=False,
                 return_partials=True,
             )
-            O_s = O_s[:, 0, :]                      # [seqlen_q, d]  (batch_size==1)
-            max_s = max_s[:, 0:1]                   # [seqlen_q, 1]
-            sum_s = sum_s[:, 0:1]                   # [seqlen_q, 1]
+            # kernel partial outputs: O_s [Sq, bs, d], max_s/sum_s [Sq, bs]
+            max_s = max_s.unsqueeze(-1)            # [Sq, bs, 1] for broadcast over d
+            sum_s = sum_s.unsqueeze(-1)            # [Sq, bs, 1]
             if m is None:
                 m, l, acc = max_s, sum_s, O_s
             else:
@@ -483,10 +484,10 @@ class CausalWanSelfAttention(nn.Module):
                 l = l * cp + sum_s * cc
                 acc = acc * cp + O_s * cc
                 m = m_new
-        out = acc / l                              # [seqlen_q, d]
-        # match default _attend contract: wan_flash returns [seqlen_q, bs, d];
-        # .unsqueeze(0).flatten(2) -> [1, seqlen_q, bs*d]. Here bs==1 -> [1, seqlen_q, d].
-        return out.unsqueeze(0)
+        out = acc / l                              # [Sq, bs, d]
+        # match default _attend contract exactly: out.unsqueeze(0).flatten(2)
+        # -> [1, Sq, bs*d]  (same as wan_flash_self_attn result path).
+        return out.unsqueeze(0).flatten(2)
 
     def _output_proj(self, out):
         out = self.o(out)
