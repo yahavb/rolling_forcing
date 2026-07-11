@@ -480,6 +480,23 @@ class CausalWanSelfAttention(nn.Module):
             )
             # kernel partial outputs: O_s [Sq, bs, d], max_s/sum_s [Sq, bs, 1]
             # (trailing 1 kept from the kernel's HBM layout; broadcasts over d).
+            # DIAGNOSTIC RF_RING_SAFECOMBINE=1: recombine WITHOUT row_max. Each segment's
+            # O_s = sum_j exp(S-max_s)V, sum_s = sum_j exp(S-max_s). Multiply both by
+            # exp(max_s) to put every segment on the SAME (unshifted) scale, then just add:
+            #   O_true = sum_s exp(max_s) O_s / sum_s exp(max_s) sum_s.
+            # Safe at seqlen 900 (no overflow). If NSEG=4 PASSES here but FAILS with the
+            # max-merge, row_max from the kernel is the bug. If it still FAILS, O_s/sum_s
+            # are wrong per-segment.
+            if _os2.environ.get("RF_RING_SAFECOMBINE", "0") == "1":
+                w = torch.exp(torch.where(max_s > 1e30, torch.full_like(max_s, float('-inf')), max_s))
+                if m is None:
+                    acc = O_s * w
+                    l = sum_s * w
+                    m = torch.zeros_like(max_s)
+                else:
+                    acc = acc + O_s * w
+                    l = l + sum_s * w
+                continue
             # Guard the sentinel: a fully-masked/padded segment leaves the kernel's
             # (un-negated) row_max at ~+3.4e38 with sum_s=0. Exponentiating that -> inf ->
             # garbage. Clamp such rows to -inf so they contribute nothing (cc factor -> 0),
