@@ -513,22 +513,18 @@ class CausalWanSelfAttention(nn.Module):
                     acc = acc + O_s * w
                     l = l + sum_s * w
                 continue
-            # Guard the sentinel: a fully-masked/padded segment leaves the kernel's
-            # (un-negated) row_max at ~+3.4e38 with sum_s=0. Exponentiating that -> inf ->
-            # garbage. Clamp such rows to -inf so they contribute nothing (cc factor -> 0),
-            # which is correct since sum_s=0 there anyway.
-            SENT = 1e30
-            max_s = torch.where(max_s > SENT, torch.full_like(max_s, float('-inf')), max_s)
+            # Minimal compile-safe online-softmax merge. RING_DEBUG (run rx7dt) proved every
+            # segment's max_s is finite and small (−9..+68) — segments are NEVER fully masked
+            # (each query row has `seg` valid keys), so no sentinel/inf ever occurs. The
+            # earlier isinf/nan_to_num/-inf guards were dead code AND are exactly the
+            # data-dependent ops that miscompile under torch.compile(fullgraph=True) on Neuron
+            # -> the NSEG=4 garbage. Strip them; plain max/exp/add only (matches the CPU proof).
             if m is None:
                 m, l, acc = max_s, sum_s, O_s
             else:
                 m_new = torch.maximum(m, max_s)
-                # exp(-inf - -inf) = nan; guard so all-masked-so-far rows stay 0.
-                safe = torch.where(torch.isinf(m_new), torch.zeros_like(m_new), m_new)
-                cp = torch.exp(torch.where(torch.isinf(m), torch.full_like(m, float('-inf')), m) - safe)
-                cc = torch.exp(torch.where(torch.isinf(max_s), torch.full_like(max_s, float('-inf')), max_s) - safe)
-                cp = torch.nan_to_num(cp, nan=0.0)
-                cc = torch.nan_to_num(cc, nan=0.0)
+                cp = torch.exp(m - m_new)
+                cc = torch.exp(max_s - m_new)
                 l = l * cp + sum_s * cc
                 acc = acc * cp + O_s * cc
                 m = m_new
