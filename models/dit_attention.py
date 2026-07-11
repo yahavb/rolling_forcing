@@ -490,10 +490,17 @@ class CausalWanSelfAttention(nn.Module):
                 )  # [Sq, bs, d] normalized = O_s / sum_s
                 recon = (O_s / sum_s).to(ref_seg.dtype)
                 dO = (recon - ref_seg).abs().max().item()
-                print(f"[RING_DEBUG seg={s}] O_s finite={torch.isfinite(O_s).all().item()} "
-                      f"sum_s[min={sum_s.min().item():.3e},max={sum_s.max().item():.3e}] "
-                      f"max_s[min={max_s.min().item():.3e},max={max_s.max().item():.3e}] "
-                      f"|O_s/sum_s - default|max={dO:.3e}", flush=True)
+                # HYPOTHESIS: exported max_s != the internal max used for O_s/sum_s.
+                # Recompute the TRUE per-row max on-device from the same inputs and compare.
+                # q_kern [bs,d,Sq], k_seg [bs,d,seg] -> scores [bs,Sq,seg]; max over keys.
+                S_true = torch.einsum('bdq,bdk->bqk', q_kern.float(),
+                                      k_seg[:, :, :seg].float()) * self.softmax_scale
+                true_max = S_true.max(dim=-1).values.permute(1, 0).unsqueeze(-1)  # [Sq,bs,1]
+                dmax = (max_s.float() - true_max).abs().max().item()
+                print(f"[RING_DEBUG seg={s}] |O_s/sum_s-default|={dO:.3e} "
+                      f"max_s[{max_s.min().item():.3e},{max_s.max().item():.3e}] "
+                      f"true_max[{true_max.min().item():.3e},{true_max.max().item():.3e}] "
+                      f"|max_s-true_max|={dmax:.3e}", flush=True)
             # kernel partial outputs: O_s [Sq, bs, d], max_s/sum_s [Sq, bs, 1]
             # (trailing 1 kept from the kernel's HBM layout; broadcasts over d).
             # DIAGNOSTIC RF_RING_SAFECOMBINE=1: recombine WITHOUT row_max. Each segment's
