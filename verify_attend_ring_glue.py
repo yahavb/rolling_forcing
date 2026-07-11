@@ -16,14 +16,17 @@ torch.set_default_dtype(torch.float64)
 d = 64
 Sq = 128
 sp = 4
-seg = 150
-Sk = sp * seg
+seg = 900               # realistic: 3600-token window / sp=4
+k_len_int = sp * seg    # 3600 valid tokens
+MULT = 8192             # ATTN_SEQLEN_MULTIPLE
+buf_w = ((k_len_int + MULT - 1) // MULT) * MULT   # padded buffer width (8192)
 scale = 1.0 / (d ** 0.5)
 
-# kernel-layout tensors: q_kern [d, Sq], k_kern [d, Sk], v_kern [Sk, d]
+# kernel-layout tensors: q_kern [d, Sq], padded buffers k_kern [d, buf_w], v_kern [buf_w, d]
+# with only the first k_len_int valid (the rest is pad the kernel masks via actual_seqlen_k).
 q_kern = torch.randn(d, Sq)
-k_kern = torch.randn(d, Sk)
-v_kern = torch.randn(Sk, d)
+k_kern = torch.zeros(d, buf_w); k_kern[:, :k_len_int] = torch.randn(d, k_len_int)
+v_kern = torch.zeros(buf_w, d); v_kern[:k_len_int, :] = torch.randn(k_len_int, d)
 
 
 def wan_flash_stub(q, k, v, softmax_scale, actual_seqlen_k, use_dynamic_loop=False,
@@ -40,14 +43,14 @@ def wan_flash_stub(q, k, v, softmax_scale, actual_seqlen_k, use_dynamic_loop=Fal
     return (O / row_sum).unsqueeze(1)                        # [Sq,bs=1,d]
 
 
-# ----- default path -----
-out_default = wan_flash_stub(q_kern, k_kern, v_kern, scale, Sk).unsqueeze(0).flatten(2)  # [1,Sq,d]
+# ----- default path: full padded buffer, actual_seqlen_k = valid length -----
+out_default = wan_flash_stub(q_kern, k_kern, v_kern, scale, k_len_int).unsqueeze(0).flatten(2)  # [1,Sq,d]
 
-# ----- ring path (mirror of _attend_ring) -----
+# ----- ring path (mirror of _attend_ring, incl. per-segment 8192-pad) -----
 m = l = acc = None
 for s in range(sp):
-    k_seg = k_kern[:, s*seg:(s+1)*seg].contiguous()
-    v_seg = v_kern[s*seg:(s+1)*seg, :].contiguous()
+    k_seg = torch.zeros(d, buf_w); k_seg[:, :seg] = k_kern[:, s*seg:(s+1)*seg]
+    v_seg = torch.zeros(buf_w, d); v_seg[:seg, :] = v_kern[s*seg:(s+1)*seg, :]
     O_s, max_s, sum_s = wan_flash_stub(q_kern, k_seg, v_seg, scale, seg, return_partials=True)
     O_s = O_s[:, 0, :]; max_s = max_s[:, 0:1]; sum_s = sum_s[:, 0:1]
     if m is None:

@@ -443,19 +443,29 @@ class CausalWanSelfAttention(nn.Module):
         world-gather is eliminated). Kept behind RF_RING so the 14.13 path is default.
         """
         sp = self.sp_degree
+        # split the VALID window (k_len_int, e.g. 3600) into sp contiguous global-position
+        # segments. seg need NOT be a multiple of ATTN_SEQLEN_MULTIPLE — that constraint is
+        # on the padded BUFFER width, not the valid length (the default path passes a
+        # 8192-padded buffer with actual_seqlen_k=k_len_int). Each segment gets its own
+        # 8192-padded buffer with actual_seqlen_k=seg; the kernel masks past seg.
+        assert k_len_int % sp == 0, (
+            f"ring: valid window k_len_int={k_len_int} must be divisible by sp={sp}")
         seg = k_len_int // sp
-        assert seg * sp == k_len_int and seg % ATTN_SEQLEN_MULTIPLE == 0, (
-            f"ring: k_len_int {k_len_int} must split into sp={sp} segs of "
-            f"multiple-{ATTN_SEQLEN_MULTIPLE}")
+        d_dim = k_kern.shape[0]
+        buf_w = ((seg + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
 
         m = None  # running max [seqlen_q, 1]
         l = None  # running sum
         acc = None  # running unnormalized output [seqlen_q, d]
         for s in range(sp):  # GLOBAL segment order — required for bit-exactness
-            k_seg = k_kern[:, s * seg:(s + 1) * seg].contiguous()
-            v_seg = v_kern[s * seg:(s + 1) * seg, :].contiguous()
+            # pad each segment's k/v to a multiple of ATTN_SEQLEN_MULTIPLE; kernel ignores
+            # the pad via actual_seqlen_k=seg (same masking the default path uses for 3600).
+            k_seg = k_kern.new_zeros((d_dim, buf_w))
+            v_seg = v_kern.new_zeros((buf_w, d_dim))
+            k_seg[:, :seg] = k_kern[:, s * seg:(s + 1) * seg]
+            v_seg[:seg, :] = v_kern[s * seg:(s + 1) * seg, :]
             O_s, max_s, sum_s = wan_flash_self_attn(
-                q_kern, k_seg, v_seg,
+                q_kern, k_seg.contiguous(), v_seg.contiguous(),
                 softmax_scale=self.softmax_scale,
                 actual_seqlen_k=seg,
                 use_dynamic_loop=False,
