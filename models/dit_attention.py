@@ -414,6 +414,11 @@ class CausalWanSelfAttention(nn.Module):
 
         assert k_kern.shape[2] % ATTN_SEQLEN_MULTIPLE == 0
         assert v_kern.shape[1] % ATTN_SEQLEN_MULTIPLE == 0
+
+        import os as _os
+        if _os.environ.get("RF_RING", "0") == "1" and self.sp_degree > 1:
+            return self._attend_ring(q_kern, k_kern, v_kern, k_len_int)
+
         out = wan_flash_self_attn(
             q_kern, k_kern, v_kern,
             softmax_scale=self.softmax_scale,
@@ -421,6 +426,57 @@ class CausalWanSelfAttention(nn.Module):
             use_dynamic_loop=False,
         )
         return out.unsqueeze(0).flatten(2)
+
+    def _attend_ring(self, q_kern, k_kern, v_kern, k_len_int):
+        """Ring/context-parallel attention over the assembled KV window (STAGE 3a).
+
+        Shards the window's valid k_len_int tokens into sp contiguous global-position
+        segments, runs the flash kernel in partial mode (return_partials=True) on each
+        segment, and combines the per-segment (O_unnorm, row_max, row_sum) in GLOBAL order
+        with the online-softmax merge — bit-exact to full-window attention
+        (verify_ring_kvcache_multiphase.py max|Δ|<1e-12; global-order combine is exact per
+        verify_ring_attention_exact.py). k_kern is [d, seqlen_k]; v_kern is [seqlen_k, d].
+
+        NOTE (stage 3a): this validates the ring kernel+combine on device (ACC GATE
+        max|Δ|=0). It does NOT yet remove the K/V world-gather, so it is a CORRECTNESS
+        step, not an fps win — the fps lever is stage 3b (shard the persistent cache so the
+        world-gather is eliminated). Kept behind RF_RING so the 14.13 path is default.
+        """
+        sp = self.sp_degree
+        seg = k_len_int // sp
+        assert seg * sp == k_len_int and seg % ATTN_SEQLEN_MULTIPLE == 0, (
+            f"ring: k_len_int {k_len_int} must split into sp={sp} segs of "
+            f"multiple-{ATTN_SEQLEN_MULTIPLE}")
+
+        m = None  # running max [seqlen_q, 1]
+        l = None  # running sum
+        acc = None  # running unnormalized output [seqlen_q, d]
+        for s in range(sp):  # GLOBAL segment order — required for bit-exactness
+            k_seg = k_kern[:, s * seg:(s + 1) * seg].contiguous()
+            v_seg = v_kern[s * seg:(s + 1) * seg, :].contiguous()
+            O_s, max_s, sum_s = wan_flash_self_attn(
+                q_kern, k_seg, v_seg,
+                softmax_scale=self.softmax_scale,
+                actual_seqlen_k=seg,
+                use_dynamic_loop=False,
+                return_partials=True,
+            )
+            O_s = O_s[:, 0, :]                      # [seqlen_q, d]  (batch_size==1)
+            max_s = max_s[:, 0:1]                   # [seqlen_q, 1]
+            sum_s = sum_s[:, 0:1]                   # [seqlen_q, 1]
+            if m is None:
+                m, l, acc = max_s, sum_s, O_s
+            else:
+                m_new = torch.maximum(m, max_s)
+                cp = torch.exp(m - m_new)
+                cc = torch.exp(max_s - m_new)
+                l = l * cp + sum_s * cc
+                acc = acc * cp + O_s * cc
+                m = m_new
+        out = acc / l                              # [seqlen_q, d]
+        # match default _attend contract: wan_flash returns [seqlen_q, bs, d];
+        # .unsqueeze(0).flatten(2) -> [1, seqlen_q, bs*d]. Here bs==1 -> [1, seqlen_q, d].
+        return out.unsqueeze(0)
 
     def _output_proj(self, out):
         out = self.o(out)
