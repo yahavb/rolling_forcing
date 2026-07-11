@@ -449,16 +449,22 @@ class CausalWanSelfAttention(nn.Module):
         # 8192-padded buffer with actual_seqlen_k=k_len_int). Each segment gets its own
         # 8192-padded buffer with actual_seqlen_k=seg; the kernel masks past seg.
         # kernel layout: q_kern [bs,d,Sq], k_kern [bs,d,Sk], v_kern [bs,Sk,d]  (bs=heads/shard).
-        assert k_len_int % sp == 0, (
-            f"ring: valid window k_len_int={k_len_int} must be divisible by sp={sp}")
+        # DIAGNOSTIC (RF_RING_NSEG): number of segments to split the window into. Default sp.
+        # RF_RING_NSEG=1 => one segment = whole window in ONE return_partials call + normalize
+        # (no cross-shard combine). Isolates kernel-partial-write correctness from combine:
+        #   1-seg garbage  => kernel partial-write bug; 1-seg OK => combine/segmentation bug.
+        import os as _os2
+        nseg = int(_os2.environ.get("RF_RING_NSEG", str(sp)))
+        assert k_len_int % nseg == 0, (
+            f"ring: valid window k_len_int={k_len_int} must be divisible by nseg={nseg}")
         bs, d_dim, Sk = k_kern.shape
-        seg = k_len_int // sp
+        seg = k_len_int // nseg
         buf_w = ((seg + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
 
         m = None  # running max [Sq, bs]
         l = None  # running sum  [Sq, bs]
         acc = None  # running unnormalized output [Sq, bs, d]
-        for s in range(sp):  # GLOBAL segment order — required for bit-exactness
+        for s in range(nseg):  # GLOBAL segment order — required for bit-exactness
             # pad each segment's k/v to a multiple of ATTN_SEQLEN_MULTIPLE; kernel ignores
             # the pad via actual_seqlen_k=seg (same masking the default path uses).
             k_seg = k_kern.new_zeros((bs, d_dim, buf_w))
@@ -474,12 +480,22 @@ class CausalWanSelfAttention(nn.Module):
             )
             # kernel partial outputs: O_s [Sq, bs, d], max_s/sum_s [Sq, bs, 1]
             # (trailing 1 kept from the kernel's HBM layout; broadcasts over d).
+            # Guard the sentinel: a fully-masked/padded segment leaves the kernel's
+            # (un-negated) row_max at ~+3.4e38 with sum_s=0. Exponentiating that -> inf ->
+            # garbage. Clamp such rows to -inf so they contribute nothing (cc factor -> 0),
+            # which is correct since sum_s=0 there anyway.
+            SENT = 1e30
+            max_s = torch.where(max_s > SENT, torch.full_like(max_s, float('-inf')), max_s)
             if m is None:
                 m, l, acc = max_s, sum_s, O_s
             else:
                 m_new = torch.maximum(m, max_s)
-                cp = torch.exp(m - m_new)
-                cc = torch.exp(max_s - m_new)
+                # exp(-inf - -inf) = nan; guard so all-masked-so-far rows stay 0.
+                safe = torch.where(torch.isinf(m_new), torch.zeros_like(m_new), m_new)
+                cp = torch.exp(torch.where(torch.isinf(m), torch.full_like(m, float('-inf')), m) - safe)
+                cc = torch.exp(torch.where(torch.isinf(max_s), torch.full_like(max_s, float('-inf')), max_s) - safe)
+                cp = torch.nan_to_num(cp, nan=0.0)
+                cc = torch.nan_to_num(cc, nan=0.0)
                 l = l * cp + sum_s * cc
                 acc = acc * cp + O_s * cc
                 m = m_new
