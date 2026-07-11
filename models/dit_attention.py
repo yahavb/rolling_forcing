@@ -478,6 +478,22 @@ class CausalWanSelfAttention(nn.Module):
                 use_dynamic_loop=False,
                 return_partials=True,
             )
+            # DIAGNOSTIC RF_RING_DEBUG: on rank 0, verify this segment's partials against a
+            # normalized single-seg call (return_partials=False) on the SAME seg. The
+            # normalized default is known-correct (NSEG=1 passed). If O_s/sum_s reconstruct
+            # softmax(seg) then the kernel partials are right and the bug is combine-only.
+            if _os2.environ.get("RF_RING_DEBUG", "0") == "1" and ps.get_rank("world") == 0:
+                ref_seg = wan_flash_self_attn(
+                    q_kern, k_seg.contiguous(), v_seg.contiguous(),
+                    softmax_scale=self.softmax_scale, actual_seqlen_k=seg,
+                    use_dynamic_loop=False, return_partials=False,
+                )  # [Sq, bs, d] normalized = O_s / sum_s
+                recon = (O_s / sum_s).to(ref_seg.dtype)
+                dO = (recon - ref_seg).abs().max().item()
+                print(f"[RING_DEBUG seg={s}] O_s finite={torch.isfinite(O_s).all().item()} "
+                      f"sum_s[min={sum_s.min().item():.3e},max={sum_s.max().item():.3e}] "
+                      f"max_s[min={max_s.min().item():.3e},max={max_s.max().item():.3e}] "
+                      f"|O_s/sum_s - default|max={dO:.3e}", flush=True)
             # kernel partial outputs: O_s [Sq, bs, d], max_s/sum_s [Sq, bs, 1]
             # (trailing 1 kept from the kernel's HBM layout; broadcasts over d).
             # DIAGNOSTIC RF_RING_SAFECOMBINE=1: recombine WITHOUT row_max. Each segment's
