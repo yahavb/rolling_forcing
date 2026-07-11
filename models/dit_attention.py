@@ -460,6 +460,7 @@ class CausalWanSelfAttention(nn.Module):
         bs, d_dim, Sk = k_kern.shape
         seg = k_len_int // nseg
         buf_w = ((seg + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
+        buf_full = ((k_len_int + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
 
         m = None  # running max [Sq, bs]
         l = None  # running sum  [Sq, bs]
@@ -536,6 +537,23 @@ class CausalWanSelfAttention(nn.Module):
                 acc = acc * cp + O_s * cc
                 m = m_new
         out = acc / l                              # [Sq, bs, d] fp32
+        # FINAL self-check: inputs (O_s/sum_s/max_s) all proven bit-exact on device, yet
+        # frames=255. The ONE thing not yet measured is the combine OUTPUT. Compare `out`
+        # against a single full-window default call (proven-correct path) over the WHOLE
+        # window. ~0 => combine is correct, bug is downstream (reshape/dtype/o-proj/caller);
+        # large => the combine LOOP miscompiles on device despite bit-exact inputs.
+        if _os2.environ.get("RF_RING_DEBUG", "0") == "1" and ps.get_rank("world") == 0:
+            kfull = k_kern.new_zeros((bs, d_dim, buf_full))
+            vfull = v_kern.new_zeros((bs, buf_full, d_dim))
+            kfull[:, :, :k_len_int] = k_kern[:, :, :k_len_int]
+            vfull[:, :k_len_int, :] = v_kern[:, :k_len_int, :]
+            ref_full = wan_flash_self_attn(
+                q_kern, kfull.contiguous(), vfull.contiguous(),
+                softmax_scale=self.softmax_scale, actual_seqlen_k=k_len_int,
+                use_dynamic_loop=False, return_partials=False)  # [Sq,bs,d] normalized
+            dcomb = (out.to(ref_full.dtype) - ref_full).abs().max().item()
+            print(f"[RING_DEBUG COMBINE] |combined_out - full_default|max={dcomb:.3e} "
+                  f"out[{out.min().item():.3e},{out.max().item():.3e}]", flush=True)
         # combine runs in fp32 (kernel partials are fp32 for cross-rank precision), but the
         # default kernel returns q.dtype (bf16) and the downstream Linear (self.o) expects
         # that — cast back or the o-proj matmul hits 'input datatypes mismatched'.
