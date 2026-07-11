@@ -39,9 +39,11 @@ def wan_flash_stub(q, k, v, softmax_scale, actual_seqlen_k, use_dynamic_loop=Fal
     p = torch.exp(S - row_max)
     O = torch.einsum('bqk,bkd->bqd', p, vv)                    # [bs,Sq,d] unnormalized
     row_sum = p.sum(dim=-1, keepdim=True)                      # [bs,Sq,1]
-    # kernel returns [Sq,bs,d] and [Sq,bs]; transpose bs<->Sq to match
+    # kernel returns O [Sq,bs,d] and row_max/row_sum [Sq,bs,1] (trailing 1 from HBM layout)
     if return_partials:
-        return O.permute(1, 0, 2), row_max.squeeze(-1).permute(1, 0), row_sum.squeeze(-1).permute(1, 0)
+        return (O.permute(1, 0, 2),
+                row_max.permute(1, 0, 2),      # [Sq,bs,1]
+                row_sum.permute(1, 0, 2))      # [Sq,bs,1]
     return (O / row_sum).permute(1, 0, 2)                      # [Sq,bs,d]
 
 
@@ -54,7 +56,7 @@ for s in range(sp):
     k_seg = torch.zeros(bs, d, buf_w); k_seg[:, :, :seg] = k_kern[:, :, s*seg:(s+1)*seg]
     v_seg = torch.zeros(bs, buf_w, d); v_seg[:, :seg, :] = v_kern[:, s*seg:(s+1)*seg, :]
     O_s, max_s, sum_s = wan_flash_stub(q_kern, k_seg, v_seg, scale, seg, return_partials=True)
-    max_s = max_s.unsqueeze(-1); sum_s = sum_s.unsqueeze(-1)   # [Sq,bs,1]
+    # max_s, sum_s already [Sq,bs,1] from kernel — no unsqueeze (matches _attend_ring)
     if m is None:
         m, l, acc = max_s, sum_s, O_s
     else:

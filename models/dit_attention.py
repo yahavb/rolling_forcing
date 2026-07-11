@@ -472,9 +472,8 @@ class CausalWanSelfAttention(nn.Module):
                 use_dynamic_loop=False,
                 return_partials=True,
             )
-            # kernel partial outputs: O_s [Sq, bs, d], max_s/sum_s [Sq, bs]
-            max_s = max_s.unsqueeze(-1)            # [Sq, bs, 1] for broadcast over d
-            sum_s = sum_s.unsqueeze(-1)            # [Sq, bs, 1]
+            # kernel partial outputs: O_s [Sq, bs, d], max_s/sum_s [Sq, bs, 1]
+            # (trailing 1 kept from the kernel's HBM layout; broadcasts over d).
             if m is None:
                 m, l, acc = max_s, sum_s, O_s
             else:

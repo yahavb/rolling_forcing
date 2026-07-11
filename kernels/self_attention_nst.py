@@ -98,8 +98,10 @@ def wan_flash_self_attn(
         buffer=nl.shared_hbm,
     )
     if return_partials:
-        row_max = nl.ndarray(shape=(seqlen_q, batch_size), dtype=nl.float32, buffer=nl.shared_hbm)
-        row_sum = nl.ndarray(shape=(seqlen_q, batch_size), dtype=nl.float32, buffer=nl.shared_hbm)
+        # trailing dim of 1 so the HBM write view has a free dim (NKI patterns need
+        # partition + free). Pipeline squeezes it back / uses it as the broadcast dim.
+        row_max = nl.ndarray(shape=(seqlen_q, batch_size, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+        row_sum = nl.ndarray(shape=(seqlen_q, batch_size, 1), dtype=nl.float32, buffer=nl.shared_hbm)
 
     ac = AttnConfig(
         seqlen_q=seqlen_q,
@@ -709,32 +711,33 @@ def _final_write_back(src_buf, grp_i, ac, atp, bufs, o, num_p, num_f, batch_off)
     # --- ring partial write (DEVICE-ONLY VERIFIABLE: NKI does not run on CPU) ---
     # O_unnorm: src_buf is already unnormalized fp32; write straight to fp32 result o.
     _write_back_o_final_impl(src_buf, grp_i, ac, atp, o, num_p, num_f, batch_off)
-    # row_sum: exp_running_sum (multi-section) already folded all sections; single-section
-    # uses exp_section_sum. _write_back_impl left the correct one in exp_running_sum for
-    # multi and exp_section_sum for single — pick per num_sections.
-    sum_src = (bufs.exp_running_sum[:num_p, grp_i] if atp.num_sections != 1
-               else bufs.exp_section_sum[grp_i][:num_p, 0])
     # row_max: mm1_running_max holds NEGATED max -> un-negate into scratch (prev_mm1_running_max).
     nisa.tensor_scalar(
         bufs.prev_mm1_running_max[grp_i][:num_p, 0],
         bufs.mm1_running_max[:num_p, grp_i],
         nl.multiply, -1.0,
     )
-    _write_back_rowstat(bufs.prev_mm1_running_max[grp_i][:num_p, 0], grp_i, atp, bufs.ring_row_max,
+    # 2-D sbuf src [num_p, 1] (partition + free): NKI views require partition + free dims.
+    _write_back_rowstat(bufs.prev_mm1_running_max[grp_i], grp_i, atp, bufs.ring_row_max,
                         num_p, batch_off)
-    _write_back_rowstat(sum_src, grp_i, atp, bufs.ring_row_sum, num_p, batch_off)
+    # sum_src is a [num_p,1] slice of a 2-D sbuf for multi-section; for single-section it is
+    # exp_section_sum[grp_i] which is [sb_p,1] -> use the full 2-D tensor.
+    sum_2d = (bufs.exp_running_sum[:, grp_i:grp_i + 1] if atp.num_sections != 1
+              else bufs.exp_section_sum[grp_i])
+    _write_back_rowstat(sum_2d, grp_i, atp, bufs.ring_row_sum, num_p, batch_off)
 
 
-def _write_back_rowstat(src_1d, grp_i, atp, dst, num_p, batch_off):
-    """Write a [num_p] fp32 sbuf column to dst[grp_i*sb_p : +num_p, batch_off] (dst is
-    [seqlen_q, bs])."""
+def _write_back_rowstat(src_2d, grp_i, atp, dst, num_p, batch_off):
+    """Write a [num_p, 1] fp32 sbuf tile to dst[grp_i*sb_p : +num_p, batch_off, :].
+    dst is [seqlen_q, bs, 1]; select batch, slice partition -> 2-D [num_p, 1] target
+    (partition + free), mirroring the working _write_back_o_final_impl idiom."""
     dst_view = (
         TensorView(dst)
         .select(dim=1, index=batch_off)
         .slice(dim=0, start=grp_i * atp.sb_p, end=grp_i * atp.sb_p + num_p)
         .get_view()
     )
-    src_pat = src_1d.ap(pattern=[[1, num_p]], offset=0)
+    src_pat = src_2d[:num_p, 0:1].ap(pattern=[[1, num_p], [1, 1]], offset=0)
     nisa.dma_copy(dst=dst_view, src=src_pat)
 
 
