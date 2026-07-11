@@ -100,10 +100,19 @@ class Trainer:
         self.max_step = int(0.98 * self.num_train_timestep)
         # Fixed DMD timestep buckets (SD 86cb4d3): sample the critic/DMD noise level from
         # this SMALL set instead of a continuous randint, so torch.compile reuses a BOUNDED
-        # set of NEFFs (~8) instead of loading a new module.neff per distinct timestep ->
-        # the iter-~12 scratchpad creep-OOM. 8 evenly-spaced levels within [min,max].
-        self._DMD_TIMESTEPS = torch.tensor([100, 250, 400, 500, 600, 700, 800, 900],
-                                           dtype=torch.long, device=self.device)
+        # set of NEFFs instead of loading a new module.neff per distinct timestep ->
+        # the iter-~12 scratchpad creep-OOM.
+        #
+        # CONVERGENCE FIX (blurry iter200 + late dmdnorm_avg50 rise 0.47->0.79 + loss_fake
+        # 0.03->1.0): the original 8 buckets over [100,900] starved the critic — it only
+        # ever learned to denoise at 8 noise levels, and the DMD gradient only queried
+        # those 8, vs upstream dmd.py which samples ~continuously over the full
+        # [min_step, max_step]. Too few levels caps high-freq detail (=blur) and narrows
+        # the critic's learning signal (=staleness -> late divergence). Widen 8->16 levels
+        # spanning the FULL [min_step, max_step]=[20,980] range (upstream bounds), still a
+        # bounded NEFF set (~2x, watch the it<=18 memprobe for creep across G-steps).
+        self._DMD_TIMESTEPS = torch.linspace(
+            self.min_step, self.max_step, 16, device=self.device).round().long()
         _b, _f, _c, _h, _w = config.image_or_video_shape
         self.lat_shape = (1, self.num_training_frames, _c, _h, _w)
         # frame_seq = patchified tokens/frame (patch (1,2,2) -> (H//2)*(W//2)). The
