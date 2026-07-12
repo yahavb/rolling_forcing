@@ -266,6 +266,48 @@ class CausalWanSelfAttention(nn.Module):
         # discarding (sp-1)/sp of it. RoPE only this shard's positions. k/v still
         # gather full L over world (attention reads the whole KV window).
         # Validated at CP2/CP4/CP8 (max|Δ|=0.0 vs the old full-gather path).
+        import os as _os_kr
+        _krope_shard = (_os_kr.environ.get("RF_RING_KROPE", "0") == "1")
+        if self.world_size > 1 and _krope_shard:
+            # SHARDED-K-RoPE (sharding-enabled win): RoPE is per-position, so RoPE only THIS
+            # rank's L/world_size K slice at its global offset, THEN world-gather the roped
+            # shards (all_gather concatenates in rank order == the full roped K). Proven
+            # bit-exact (RoPE-shard-then-gather == RoPE-full). Cuts the gpsimd-heavy K-RoPE
+            # work by world_size (16x): today every rank RoPEs the FULL L redundantly.
+            q_tp = torch.empty(sp_shard_len, self.dim, dtype=q_local.dtype, device=q_local.device)
+            ps.all_gather_into_tensor(q_tp, q_local, "attn-tp")
+            q_tp_4d = q_tp.view(sp_shard_len, n, d).unsqueeze(0)
+            roped_query = self._nki_rope_apply(
+                q_tp_4d, grid_sizes, freqs_cos, freqs_sin,
+                start_frame=start_frame_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=start_frame_int,
+                head_start=h_start, head_end=h_end,
+                tok_offset=sp_start, tok_len=sp_shard_len)
+            # v: gather full (attention reads whole V window), slice heads as before.
+            _, _, v_full = self._gather_qkv(q_local, k_local, v_local, L, gather_q=False)
+            v = self._slice_heads(v_full)
+            # k: RoPE this rank's world-shard at its global offset, gather the ROPED shards.
+            world_rank = ps.get_rank("world")
+            world_shard = L // self.world_size
+            k_shard_4d = k_local.view(world_shard, n, d).unsqueeze(0)
+            rk_shard = self._nki_rope_apply(
+                k_shard_4d, grid_sizes, freqs_cos, freqs_sin,
+                start_frame=start_frame_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=start_frame_int, head_start=h_start, head_end=h_end,
+                tok_offset=world_rank * world_shard, tok_len=world_shard)  # [1, world_shard, n_local, d]
+            # gather the per-rank roped K shards (heads already TP-sliced) over world.
+            n_local = self.heads_per_shard
+            rk_flat = rk_shard[0].reshape(world_shard, n_local * d)
+            rk_gathered = torch.empty(L, n_local * d, dtype=rk_flat.dtype, device=rk_flat.device)
+            ps.all_gather_into_tensor(rk_gathered, rk_flat, "world")
+            roped_key = rk_gathered.view(L, n_local, d).unsqueeze(0)
+            # k (unroped, head-sliced) still needed for anchor write path -> gather k too.
+            if kv_cache is None or self._will_anchor_write(kv_cache, current_start):
+                _, k_full, _ = self._gather_qkv(q_local, k_local, v_local, L, gather_q=False)
+                k = self._slice_heads(k_full)
+            else:
+                k = None
+            return roped_query, k, v, roped_key
         if self.world_size > 1:
             q_tp = torch.empty(sp_shard_len, self.dim, dtype=q_local.dtype, device=q_local.device)
             ps.all_gather_into_tensor(q_tp, q_local, "attn-tp")
