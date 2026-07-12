@@ -55,7 +55,16 @@ def wan_flash_self_attn(
     softmax_scale: Optional[float] = None,
     actual_seqlen_k: Optional[int] = None,
     use_dynamic_loop: bool = False,
+    return_partials: bool = False,
 ):
+    # return_partials (ring/context-parallel attention): instead of the normalized
+    # softmax(QK)V, emit this KV shard's UNNORMALIZED partial so the pipeline can combine
+    # partials across sp ranks in global order (verify_ring_combine_kernelmath.py):
+    #   result   [seqlen_q, bs, d] fp32 = sum_j exp(S_j - row_max) V_j   (no /sum)
+    #   row_max  [seqlen_q, bs]     fp32 = max_j S_j
+    #   row_sum  [seqlen_q, bs]     fp32 = sum_j exp(S_j - row_max)
+    # These are exactly the kernel's own internal accumulators (mm2 pre-normalize,
+    # mm1_running_max, exp_running_sum) — we expose them and skip the final reciprocal.
     batch_size, d, seqlen_q = q.shape
     batch_size_kv, _, seqlen_k = k.shape
     assert_shape(q, (batch_size, d, seqlen_q), "q")
@@ -81,7 +90,18 @@ def wan_flash_self_attn(
     kernel_assert(seqlen_k <= _MAX_SEQLEN, f"seqlen_k={seqlen_k} exceeds {_MAX_SEQLEN}")
     kernel_assert(d > 0 and d <= _MAX_HEAD_DIM, f"d must be in (0,{_MAX_HEAD_DIM}], got {d=}")
 
-    result = nl.ndarray(shape=(seqlen_q, batch_size, d), dtype=q.dtype, buffer=nl.shared_hbm)
+    # partial output is fp32 and UNNORMALIZED (needs full precision for cross-rank combine);
+    # normal output keeps q.dtype.
+    result = nl.ndarray(
+        shape=(seqlen_q, batch_size, d),
+        dtype=(nl.float32 if return_partials else q.dtype),
+        buffer=nl.shared_hbm,
+    )
+    if return_partials:
+        # trailing dim of 1 so the HBM write view has a free dim (NKI patterns need
+        # partition + free). Pipeline squeezes it back / uses it as the broadcast dim.
+        row_max = nl.ndarray(shape=(seqlen_q, batch_size, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+        row_sum = nl.ndarray(shape=(seqlen_q, batch_size, 1), dtype=nl.float32, buffer=nl.shared_hbm)
 
     ac = AttnConfig(
         seqlen_q=seqlen_q,
@@ -91,6 +111,7 @@ def wan_flash_self_attn(
         bs=batch_size,
         scale=softmax_scale,
         dtype=q.dtype,
+        return_partials=return_partials,
     )
 
     use_flash_attn = actual_seqlen_k > _FLASH_ATTENTION_THRESHOLD
@@ -102,18 +123,22 @@ def wan_flash_self_attn(
     else:
         partial_out = result
 
+    rmax = row_max if return_partials else None
+    rsum = row_sum if return_partials else None
     if use_dynamic_loop:
         batch_id_reg = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf, name="batch_id_reg")
         nisa.memset(batch_id_reg, value=0)
         for _ in nl.dynamic_range(0, batch_size):
-            _wan_flash_attn_kernel_impl(q, k, v, result, partial_out, ac, batch_id_reg)
+            _wan_flash_attn_kernel_impl(q, k, v, result, partial_out, ac, batch_id_reg, rmax, rsum)
             nisa.tensor_scalar(
                 dst=batch_id_reg, data=batch_id_reg, op0=nl.add, operand0=1
             )
     else:
         for batch_id in range(batch_size):
-            _wan_flash_attn_kernel_impl(q, k, v, result, partial_out, ac, batch_id)
+            _wan_flash_attn_kernel_impl(q, k, v, result, partial_out, ac, batch_id, rmax, rsum)
 
+    if return_partials:
+        return result, row_max, row_sum
     return result
 
 
@@ -126,6 +151,7 @@ class AttnConfig(nl.NKIObject):
     bs: int = None
     scale: float = None
     dtype: Any = None
+    return_partials: bool = False
 
 
 @dataclass
@@ -183,6 +209,10 @@ class AttnInternalBuffers(nl.NKIObject):
 
     zero_bias_tensor = None
 
+    # ring/context-parallel partial outputs (only used when ac.return_partials)
+    ring_row_max = None
+    ring_row_sum = None
+
 
 def _ap_with_batch(tensor, pattern, offset, batch_off):
     if isinstance(batch_off, int):
@@ -230,11 +260,16 @@ def _compute_tile_parameters(ac: AttnConfig) -> AttnTileParams:
     return atp
 
 
-def _wan_flash_attn_kernel_impl(q, k, v, o, partial_out, ac: AttnConfig, batch_off):
+def _wan_flash_attn_kernel_impl(q, k, v, o, partial_out, ac: AttnConfig, batch_off,
+                                row_max=None, row_sum=None):
     atp = _compute_tile_parameters(ac)
 
     allocator = ModularAllocator(initial_address=0)
     bufs = AttnInternalBuffers()
+    # ring partial outputs (row_max/row_sum) travel on bufs to avoid re-threading every
+    # write-back call site; only read on the last section when ac.return_partials.
+    bufs.ring_row_max = row_max
+    bufs.ring_row_sum = row_sum
 
     bufs.zero_bias_tensor = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, 1), dtype=nl.float32)
     nisa.memset(bufs.zero_bias_tensor, 0.0)
@@ -626,9 +661,7 @@ def _write_back_impl(grp_i, ac, atp, sp, bufs, o, partial_out, batch_off):
     if atp.num_sections != 1:
         if sp.section_idx == 0:
             if is_last_section:
-                _scale_reciprocal_write_back_impl(
-                    bufs.mm2_sb[grp_i], grp_i, ac, atp, bufs, o, num_p, num_f, batch_off
-                )
+                _final_write_back(bufs.mm2_sb[grp_i], grp_i, ac, atp, bufs, o, num_p, num_f, batch_off)
             else:
                 _write_back_o_impl(
                     bufs.mm2_sb[grp_i], grp_i, ac, atp, partial_out, num_p, num_f, batch_off
@@ -653,18 +686,59 @@ def _write_back_impl(grp_i, ac, atp, sp, bufs, o, partial_out, batch_off):
                 operand1=bufs.mm2_sb[grp_i][:num_p, : ac.d],
             )
             if is_last_section:
-                _scale_reciprocal_write_back_impl(
-                    bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, bufs, o, num_p, num_f, batch_off
-                )
+                _final_write_back(bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, bufs, o,
+                                  num_p, num_f, batch_off)
             else:
                 _write_back_o_impl(
                     bufs.mm2_accum_flash_attn[grp_i],
                     grp_i, ac, atp, partial_out, num_p, num_f, batch_off,
                 )
     else:
-        _scale_reciprocal_write_back_impl(
-            bufs.mm2_sb[grp_i], grp_i, ac, atp, bufs, o, num_p, num_f, batch_off
-        )
+        _final_write_back(bufs.mm2_sb[grp_i], grp_i, ac, atp, bufs, o, num_p, num_f, batch_off)
+
+
+def _final_write_back(src_buf, grp_i, ac, atp, bufs, o, num_p, num_f, batch_off):
+    """Last-section write-back: normalize (default) OR emit unnormalized partial (ring).
+
+    src_buf holds the UNNORMALIZED accumulator sum_j exp(S-max) V. Default path multiplies
+    by 1/running_sum and writes softmax(QK)V. Ring path (ac.return_partials) writes src_buf
+    as-is plus row_max (un-negated; kernel stores mm1_running_max negated) and row_sum
+    (exp_running_sum for multi-section, else exp_section_sum) so the pipeline combines
+    partials across sp ranks in global order (verify_ring_combine_kernelmath.py)."""
+    if not ac.return_partials:
+        _scale_reciprocal_write_back_impl(src_buf, grp_i, ac, atp, bufs, o, num_p, num_f, batch_off)
+        return
+    # --- ring partial write (DEVICE-ONLY VERIFIABLE: NKI does not run on CPU) ---
+    # O_unnorm: src_buf is already unnormalized fp32; write straight to fp32 result o.
+    _write_back_o_final_impl(src_buf, grp_i, ac, atp, o, num_p, num_f, batch_off)
+    # row_max: mm1_running_max holds NEGATED max -> un-negate into scratch (prev_mm1_running_max).
+    nisa.tensor_scalar(
+        bufs.prev_mm1_running_max[grp_i][:num_p, 0],
+        bufs.mm1_running_max[:num_p, grp_i],
+        nl.multiply, -1.0,
+    )
+    # 2-D sbuf src [num_p, 1] (partition + free): NKI views require partition + free dims.
+    _write_back_rowstat(bufs.prev_mm1_running_max[grp_i], grp_i, atp, bufs.ring_row_max,
+                        num_p, batch_off)
+    # sum_src is a [num_p,1] slice of a 2-D sbuf for multi-section; for single-section it is
+    # exp_section_sum[grp_i] which is [sb_p,1] -> use the full 2-D tensor.
+    sum_2d = (bufs.exp_running_sum[:, grp_i:grp_i + 1] if atp.num_sections != 1
+              else bufs.exp_section_sum[grp_i])
+    _write_back_rowstat(sum_2d, grp_i, atp, bufs.ring_row_sum, num_p, batch_off)
+
+
+def _write_back_rowstat(src_2d, grp_i, atp, dst, num_p, batch_off):
+    """Write a [num_p, 1] fp32 sbuf tile to dst[grp_i*sb_p : +num_p, batch_off, :].
+    dst is [seqlen_q, bs, 1]; select batch, slice partition -> 2-D [num_p, 1] target
+    (partition + free), mirroring the working _write_back_o_final_impl idiom."""
+    dst_view = (
+        TensorView(dst)
+        .select(dim=1, index=batch_off)
+        .slice(dim=0, start=grp_i * atp.sb_p, end=grp_i * atp.sb_p + num_p)
+        .get_view()
+    )
+    src_pat = src_2d[:num_p, 0:1].ap(pattern=[[1, num_p], [1, 1]], offset=0)
+    nisa.dma_copy(dst=dst_view, src=src_pat)
 
 
 def _scale_reciprocal_write_back_impl(src_buf, grp_i, ac, atp, bufs, o, num_p, num_f, batch_off):

@@ -414,12 +414,165 @@ class CausalWanSelfAttention(nn.Module):
 
         assert k_kern.shape[2] % ATTN_SEQLEN_MULTIPLE == 0
         assert v_kern.shape[1] % ATTN_SEQLEN_MULTIPLE == 0
+
+        import os as _os
+        if _os.environ.get("RF_RING", "0") == "1" and self.sp_degree > 1:
+            return self._attend_ring(q_kern, k_kern, v_kern, k_len_int)
+
         out = wan_flash_self_attn(
             q_kern, k_kern, v_kern,
             softmax_scale=self.softmax_scale,
             actual_seqlen_k=k_len_int,
             use_dynamic_loop=False,
         )
+        return out.unsqueeze(0).flatten(2)
+
+    def _attend_ring(self, q_kern, k_kern, v_kern, k_len_int):
+        """Ring/context-parallel attention over the assembled KV window (STAGE 3a).
+
+        Shards the window's valid k_len_int tokens into sp contiguous global-position
+        segments, runs the flash kernel in partial mode (return_partials=True) on each
+        segment, and combines the per-segment (O_unnorm, row_max, row_sum) in GLOBAL order
+        with the online-softmax merge — bit-exact to full-window attention
+        (verify_ring_kvcache_multiphase.py max|Δ|<1e-12; global-order combine is exact per
+        verify_ring_attention_exact.py). k_kern is [d, seqlen_k]; v_kern is [seqlen_k, d].
+
+        NOTE (stage 3a): this validates the ring kernel+combine on device (ACC GATE
+        max|Δ|=0). It does NOT yet remove the K/V world-gather, so it is a CORRECTNESS
+        step, not an fps win — the fps lever is stage 3b (shard the persistent cache so the
+        world-gather is eliminated). Kept behind RF_RING so the 14.13 path is default.
+        """
+        sp = self.sp_degree
+        # split the VALID window (k_len_int, e.g. 3600) into sp contiguous global-position
+        # segments. seg need NOT be a multiple of ATTN_SEQLEN_MULTIPLE — that constraint is
+        # on the padded BUFFER width, not the valid length (the default path passes a
+        # 8192-padded buffer with actual_seqlen_k=k_len_int). Each segment gets its own
+        # 8192-padded buffer with actual_seqlen_k=seg; the kernel masks past seg.
+        # kernel layout: q_kern [bs,d,Sq], k_kern [bs,d,Sk], v_kern [bs,Sk,d]  (bs=heads/shard).
+        # DIAGNOSTIC (RF_RING_NSEG): number of segments to split the window into. Default sp.
+        # RF_RING_NSEG=1 => one segment = whole window in ONE return_partials call + normalize
+        # (no cross-shard combine). Isolates kernel-partial-write correctness from combine:
+        #   1-seg garbage  => kernel partial-write bug; 1-seg OK => combine/segmentation bug.
+        import os as _os2
+        nseg = int(_os2.environ.get("RF_RING_NSEG", str(sp)))
+        assert k_len_int % nseg == 0, (
+            f"ring: valid window k_len_int={k_len_int} must be divisible by nseg={nseg}")
+        bs, d_dim, Sk = k_kern.shape
+        # FAST PATH (nseg==1): the whole window is on this rank in one piece. combine-of-one
+        # is identity, so skip the return_partials/combine machinery entirely and make a
+        # single plain kernel call — byte-identical to the baseline _attend, baseline speed.
+        # RF_RING=1 RF_RING_NSEG=1 => ring plumbing at 14fps (proves the ring path costs
+        # nothing when K/V is not sharded). Sharded K/V (nseg=sp) is the real win.
+        if nseg == 1:
+            out = wan_flash_self_attn(
+                q_kern, k_kern, v_kern,
+                softmax_scale=self.softmax_scale,
+                actual_seqlen_k=k_len_int,
+                use_dynamic_loop=False,
+            )
+            return out.unsqueeze(0).flatten(2)
+        seg = k_len_int // nseg
+        buf_w = ((seg + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
+        buf_full = ((k_len_int + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
+
+        m = None  # running max [Sq, bs]
+        l = None  # running sum  [Sq, bs]
+        acc = None  # running unnormalized output [Sq, bs, d]
+        for s in range(nseg):  # GLOBAL segment order — required for bit-exactness
+            # pad each segment's k/v to a multiple of ATTN_SEQLEN_MULTIPLE; kernel ignores
+            # the pad via actual_seqlen_k=seg (same masking the default path uses).
+            k_seg = k_kern.new_zeros((bs, d_dim, buf_w))
+            v_seg = v_kern.new_zeros((bs, buf_w, d_dim))
+            k_seg[:, :, :seg] = k_kern[:, :, s * seg:(s + 1) * seg]
+            v_seg[:, :seg, :] = v_kern[:, s * seg:(s + 1) * seg, :]
+            O_s, max_s, sum_s = wan_flash_self_attn(
+                q_kern, k_seg.contiguous(), v_seg.contiguous(),
+                softmax_scale=self.softmax_scale,
+                actual_seqlen_k=seg,
+                use_dynamic_loop=False,
+                return_partials=True,
+            )
+            # DIAGNOSTIC RF_RING_DEBUG: on rank 0, verify this segment's partials against a
+            # normalized single-seg call (return_partials=False) on the SAME seg. The
+            # normalized default is known-correct (NSEG=1 passed). If O_s/sum_s reconstruct
+            # softmax(seg) then the kernel partials are right and the bug is combine-only.
+            if _os2.environ.get("RF_RING_DEBUG", "0") == "1" and ps.get_rank("world") == 0:
+                ref_seg = wan_flash_self_attn(
+                    q_kern, k_seg.contiguous(), v_seg.contiguous(),
+                    softmax_scale=self.softmax_scale, actual_seqlen_k=seg,
+                    use_dynamic_loop=False, return_partials=False,
+                )  # [Sq, bs, d] normalized = O_s / sum_s
+                recon = (O_s / sum_s).to(ref_seg.dtype)
+                dO = (recon - ref_seg).abs().max().item()
+                # HYPOTHESIS: exported max_s != the internal max used for O_s/sum_s.
+                # Recompute the TRUE per-row max on-device from the same inputs and compare.
+                # q_kern [bs,d,Sq], k_seg [bs,d,seg] -> scores [bs,Sq,seg]; max over keys.
+                S_true = torch.einsum('bdq,bdk->bqk', q_kern.float(),
+                                      k_seg[:, :, :seg].float()) * self.softmax_scale
+                true_max = S_true.max(dim=-1).values.permute(1, 0).unsqueeze(-1)  # [Sq,bs,1]
+                dmax = (max_s.float() - true_max).abs().max().item()
+                print(f"[RING_DEBUG seg={s}] |O_s/sum_s-default|={dO:.3e} "
+                      f"max_s[{max_s.min().item():.3e},{max_s.max().item():.3e}] "
+                      f"true_max[{true_max.min().item():.3e},{true_max.max().item():.3e}] "
+                      f"|max_s-true_max|={dmax:.3e}", flush=True)
+            # kernel partial outputs: O_s [Sq, bs, d], max_s/sum_s [Sq, bs, 1]
+            # (trailing 1 kept from the kernel's HBM layout; broadcasts over d).
+            # DIAGNOSTIC RF_RING_SAFECOMBINE=1: recombine WITHOUT row_max. Each segment's
+            # O_s = sum_j exp(S-max_s)V, sum_s = sum_j exp(S-max_s). Multiply both by
+            # exp(max_s) to put every segment on the SAME (unshifted) scale, then just add:
+            #   O_true = sum_s exp(max_s) O_s / sum_s exp(max_s) sum_s.
+            # Safe at seqlen 900 (no overflow). If NSEG=4 PASSES here but FAILS with the
+            # max-merge, row_max from the kernel is the bug. If it still FAILS, O_s/sum_s
+            # are wrong per-segment.
+            if _os2.environ.get("RF_RING_SAFECOMBINE", "0") == "1":
+                w = torch.exp(torch.where(max_s > 1e30, torch.full_like(max_s, float('-inf')), max_s))
+                if m is None:
+                    acc = O_s * w
+                    l = sum_s * w
+                    m = torch.zeros_like(max_s)
+                else:
+                    acc = acc + O_s * w
+                    l = l + sum_s * w
+                continue
+            # Minimal compile-safe online-softmax merge. RING_DEBUG (run rx7dt) proved every
+            # segment's max_s is finite and small (−9..+68) — segments are NEVER fully masked
+            # (each query row has `seg` valid keys), so no sentinel/inf ever occurs. The
+            # earlier isinf/nan_to_num/-inf guards were dead code AND are exactly the
+            # data-dependent ops that miscompile under torch.compile(fullgraph=True) on Neuron
+            # -> the NSEG=4 garbage. Strip them; plain max/exp/add only (matches the CPU proof).
+            if m is None:
+                m, l, acc = max_s, sum_s, O_s
+            else:
+                m_new = torch.maximum(m, max_s)
+                cp = torch.exp(m - m_new)
+                cc = torch.exp(max_s - m_new)
+                l = l * cp + sum_s * cc
+                acc = acc * cp + O_s * cc
+                m = m_new
+        out = acc / l                              # [Sq, bs, d] fp32
+        # FINAL self-check: inputs (O_s/sum_s/max_s) all proven bit-exact on device, yet
+        # frames=255. The ONE thing not yet measured is the combine OUTPUT. Compare `out`
+        # against a single full-window default call (proven-correct path) over the WHOLE
+        # window. ~0 => combine is correct, bug is downstream (reshape/dtype/o-proj/caller);
+        # large => the combine LOOP miscompiles on device despite bit-exact inputs.
+        if _os2.environ.get("RF_RING_DEBUG", "0") == "1" and ps.get_rank("world") == 0:
+            kfull = k_kern.new_zeros((bs, d_dim, buf_full))
+            vfull = v_kern.new_zeros((bs, buf_full, d_dim))
+            kfull[:, :, :k_len_int] = k_kern[:, :, :k_len_int]
+            vfull[:, :k_len_int, :] = v_kern[:, :k_len_int, :]
+            ref_full = wan_flash_self_attn(
+                q_kern, kfull.contiguous(), vfull.contiguous(),
+                softmax_scale=self.softmax_scale, actual_seqlen_k=k_len_int,
+                use_dynamic_loop=False, return_partials=False)  # [Sq,bs,d] normalized
+            dcomb = (out.to(ref_full.dtype) - ref_full).abs().max().item()
+            print(f"[RING_DEBUG COMBINE] |combined_out - full_default|max={dcomb:.3e} "
+                  f"out[{out.min().item():.3e},{out.max().item():.3e}]", flush=True)
+        # combine runs in fp32 (kernel partials are fp32 for cross-rank precision), but the
+        # default kernel returns q.dtype (bf16) and the downstream Linear (self.o) expects
+        # that — cast back or the o-proj matmul hits 'input datatypes mismatched'.
+        out = out.to(q_kern.dtype)
+        # match default _attend contract exactly: out.unsqueeze(0).flatten(2)
+        # -> [1, Sq, bs*d]  (same as wan_flash_self_attn result path).
         return out.unsqueeze(0).flatten(2)
 
     def _output_proj(self, out):
