@@ -23,6 +23,7 @@ import torch.nn as nn
 from kernels.kv_cache_copy import cache_copy, kv_cache_copy
 from kernels.restore_layout import restore_layout
 from kernels.rope import causal_rope_rotation, build_rope_grids
+from kernels.sb2sb_gather import gather_kv_world
 from kernels.self_attention_nst import wan_flash_self_attn
 from utils import _compile
 from utils import parallel_state as ps
@@ -751,12 +752,12 @@ class CausalWanSelfAttention(nn.Module):
         # this rank's RAW valid window shard (no padding) — the leading k_len_int columns.
         k_own = k_kern[:, :, :k_len_int].contiguous()          # [bs, d, k_len_int]
         v_own = v_kern[:, :k_len_int, :].contiguous()          # [bs, k_len_int, d]
-        # all_gather over world: dim-0 concat into a [N, bs, ...] view (k on last/seqlen axis,
-        # v on middle/seqlen axis).
-        k_g = torch.empty((N, bs, d_dim, k_len_int), dtype=k_own.dtype, device=k_own.device)
-        v_g = torch.empty((N, bs, k_len_int, d_dim), dtype=v_own.dtype, device=v_own.device)
-        ps.all_gather_into_tensor(k_g.view(N * bs, d_dim, k_len_int), k_own, "world")
-        ps.all_gather_into_tensor(v_g.view(N * bs, k_len_int, d_dim), v_own, "world")
+        # IN-SBUF all-gather over world (replaces the two torch.distributed
+        # all_gather_into_tensor barrier collectives): gather each rank's window-shard
+        # on-chip in SBUF via the sb2sb kernel. Returns the SAME [N, bs, ...] layout the
+        # torch path produced — k_g[r] == rank r's k_own [bs,d,k_len_int], v_g[r] == rank
+        # r's v_own [bs,k_len_int,d] — so the per-block-interleave reshape below is unchanged.
+        k_g, v_g = gather_kv_world(k_own, v_own, N)
         # PER-BLOCK INTERLEAVE: each rank's window-shard holds nblocks blocks of ws_block
         # tokens each; the full window = for each block, concat rank0..N-1 (verify_cache_shard).
         ws_block = self._cs_block_length
