@@ -578,63 +578,44 @@ class CausalWanSelfAttention(nn.Module):
         return out.unsqueeze(0).flatten(2)
 
     def _attend_ring_shard(self, q_kern, k_kern, v_kern, k_len_int):
-        """STAGE 3b: ring-rotation attention. Each rank owns ONLY window-slice sp_rank; it
-        rotates slices around the sp ring (send-next/recv-prev via ps.ring_exchange), flash-
-        partials each slice it holds, and combines all sp partials in GLOBAL slice order with
-        online-softmax. Removes the redundant full-window materialization: point-to-point
-        rotation instead of every rank holding the whole window.
-        Proven CPU-equivalent: verify_ring_rotation.py + verify_sharded_cache_ring.py
-        (max|Δ|<1e-12). q_kern [bs,d,Sq]; k_kern [bs,d,Sk]; v_kern [bs,Sk,d].
-        NOTE: this variant takes its slice from the already-assembled (replicated) window, so
-        it does not yet cut the gather volume — it measures whether ring send/recv OVERLAPS
-        NKI compute on device (the win condition). True cache-shard (no assembly) is the
-        follow-on once overlap is confirmed."""
+        """STAGE 3b: sharded-window attention. Each rank contributes ONLY its RAW L/sp slice;
+        all_gather over attn-sp reassembles the contiguous window; ONE flash call (like the
+        baseline). Fixes the 3 wastes of the first attempt (run w4rmj, ~5.9fps): (1) gather
+        RAW seg-length slices, NOT 8192-padded (was 9.1x byte waste); (2) reassemble into ONE
+        contiguous [bs,d,k_len] window and make a SINGLE kernel call (was 4 padded calls +
+        online-softmax combine); (3) all_gather over attn-sp is the ONLY exchange primitive
+        (Neuron has no P2P — run sdjkl). Result is byte-identical to the baseline full-window
+        attention (concatenation of raw slices in rank order == the window). q_kern [bs,d,Sq];
+        k_kern [bs,d,Sk]; v_kern [bs,Sk,d]."""
         sp = self.sp_degree
         r = self.sp_rank
         assert k_len_int % sp == 0, f"ring-shard: k_len={k_len_int} not divisible by sp={sp}"
         seg = k_len_int // sp
-        bs, d_dim, _ = k_kern.shape
-        BUF = ((seg + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
+        bs, d_dim, Sk = k_kern.shape
 
-        # this rank's OWNED native slice (global segment r) — padded once to a legal buffer.
-        def _slice_buf(idx):
-            kb = k_kern.new_zeros((bs, d_dim, BUF))
-            vb = v_kern.new_zeros((bs, BUF, d_dim))
-            kb[:, :, :seg] = k_kern[:, :, idx * seg:(idx + 1) * seg]
-            vb[:, :seg, :] = v_kern[:, idx * seg:(idx + 1) * seg, :]
-            return kb.contiguous(), vb.contiguous()
-
-        # Neuron's distributed backend has NO P2P (isend/irecv unsupported — run sdjkl:
-        # "No backend type associated with device type neuron"). So the ring exchange is done
-        # with all_gather over attn-sp: each rank contributes its own L/sp slice, receives all
-        # sp slices. Same RESULT as a rotation; no send/recv overlap (collective is a barrier),
-        # but P2P isn't available on this hardware. Then flash-partial each slice + global-order
-        # combine (proven: verify_ring_rotation / verify_sharded_cache_ring, max|Δ|<1e-12).
-        k_own, v_own = _slice_buf(r)                    # this rank's slice, padded to BUF
-        k_all = torch.empty((sp,) + tuple(k_own.shape), dtype=k_own.dtype, device=k_own.device)
-        v_all = torch.empty((sp,) + tuple(v_own.shape), dtype=v_own.dtype, device=v_own.device)
-        ps.all_gather_into_tensor(k_all.view(-1, *k_own.shape[1:]), k_own, "attn-sp")
-        ps.all_gather_into_tensor(v_all.view(-1, *v_own.shape[1:]), v_own, "attn-sp")
-        parts = {}  # global slice idx -> (O_unnorm, row_max, row_sum)
-        for owner in range(sp):
-            O_s, mx, sm = wan_flash_self_attn(
-                q_kern, k_all[owner].contiguous(), v_all[owner].contiguous(),
-                softmax_scale=self.softmax_scale, actual_seqlen_k=seg,
-                use_dynamic_loop=False, return_partials=True)
-            parts[owner] = (O_s, mx, sm)
-        # combine in GLOBAL slice order (ascending) — bit-exact vs flash tile order.
-        m = l = acc = None
-        for s in range(sp):
-            O_s, mx, sm = parts[s]
-            if m is None:
-                m, l, acc = mx, sm, O_s
-            else:
-                m_new = torch.maximum(m, mx)
-                cp = torch.exp(m - m_new); cc = torch.exp(mx - m_new)
-                l = l * cp + sm * cc
-                acc = acc * cp + O_s * cc
-                m = m_new
-        out = (acc / l).to(q_kern.dtype)
+        # this rank's RAW slice (global segment r), no padding.
+        k_own = k_kern[:, :, r * seg:(r + 1) * seg].contiguous()          # [bs,d,seg]
+        v_own = v_kern[:, r * seg:(r + 1) * seg, :].contiguous()          # [bs,seg,d]
+        # all_gather RAW slices over attn-sp -> contiguous window in rank order.
+        # k gathered on the LAST (seqlen) axis, v on the MIDDLE (seqlen) axis.
+        k_cat = torch.empty((bs, d_dim, sp * seg), dtype=k_own.dtype, device=k_own.device)
+        v_cat = torch.empty((bs, sp * seg, d_dim), dtype=v_own.dtype, device=v_own.device)
+        # all_gather_into_tensor concatenates on dim 0; gather into a [sp,...] view then
+        # move the sp axis into the seqlen position to get the contiguous window.
+        k_g = torch.empty((sp, bs, d_dim, seg), dtype=k_own.dtype, device=k_own.device)
+        v_g = torch.empty((sp, bs, seg, d_dim), dtype=v_own.dtype, device=v_own.device)
+        ps.all_gather_into_tensor(k_g.view(sp * bs, d_dim, seg), k_own, "attn-sp")
+        ps.all_gather_into_tensor(v_g.view(sp * bs, seg, d_dim), v_own, "attn-sp")
+        # k_g[s] is rank s's [bs,d,seg]; window = concat over s on seqlen -> [bs,d,sp*seg].
+        k_cat = k_g.permute(1, 2, 0, 3).reshape(bs, d_dim, sp * seg).contiguous()
+        v_cat = v_g.permute(1, 0, 2, 3).reshape(bs, sp * seg, d_dim).contiguous()
+        # ONE flash call over the reassembled contiguous window (baseline-identical path).
+        out = wan_flash_self_attn(
+            q_kern, k_cat, v_cat,
+            softmax_scale=self.softmax_scale,
+            actual_seqlen_k=k_len_int,
+            use_dynamic_loop=False,
+        )
         return out.unsqueeze(0).flatten(2)
 
     def _output_proj(self, out):
