@@ -716,7 +716,13 @@ class CausalWanSelfAttention(nn.Module):
 
         gathered = torch.empty(N * L_full_N, self.dim, dtype=cu_dn_sep.dtype, device=cu_dn_sep.device)
         ps.all_gather_into_tensor(gathered, cu_dn_sep, "world")
-        full = restore_layout(gathered, N=N, nfpb=3, max_frames=15,
+        # Derive nfpb/max_frames from this forward's actual geometry instead of
+        # hardcoding the T=5 shape (nfpb=3, max_frames=15). f_full and nfpb_cu are
+        # the same values used to build L_cu/L_dn above, so restore_layout's internal
+        # L_full == L_cu + L_dn assertion holds for any denoising-step count T
+        # (T=4 -> max_frames=12, T=5 -> max_frames=15).
+        full = restore_layout(gathered, N=N, nfpb=nfpb_cu,
+                              max_frames=(f_full - nfpb_cu),
                               frame_seqlen=self.frame_length)
         rank_world = ps.get_rank("world")
         out = full[rank_world * L_full_N:(rank_world + 1) * L_full_N]
