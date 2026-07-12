@@ -82,6 +82,18 @@ class CausalWanSelfAttention(nn.Module):
         self.kv_cache_logical_size = 24 * self.frame_length
         self.layer_idx = layer_idx
 
+        # TRUE CACHE-SHARDING (RF_RING_CACHESHARD): each rank stores ONLY its 1/world token
+        # slice of the persistent cache (16x memory). The bookkeeping divides cleanly by
+        # world_size — each rank's stream is structurally identical to the full stream at
+        # 1/world scale (proven: verify_cache_shard.py max|Δ|=0). Sharded sizes used by
+        # _cache_write / _assemble_kv when the flag is on.
+        import os as _os_cs
+        self._cache_shard = (_os_cs.environ.get("RF_RING_CACHESHARD", "0") == "1")
+        # sharded (per-rank, 1/world) position sizes — set after world_size is known below.
+        self._cs_block_length = None
+        self._cs_max_attention_size = None
+        self._cs_kv_cache_logical_size = None
+
         tp_degree = ps.get_world_size("attn-tp")
         sp_degree = ps.get_world_size("attn-sp")
         assert num_heads % tp_degree == 0, (
@@ -92,6 +104,14 @@ class CausalWanSelfAttention(nn.Module):
         self.heads_per_shard = num_heads // tp_degree
         self.sp_rank = ps.get_rank("attn-sp")
         self.tp_rank = ps.get_rank("attn-tp")
+
+        if self._cache_shard and self.world_size > 1:
+            assert self.block_length % self.world_size == 0
+            assert self.max_attention_size % self.world_size == 0
+            assert self.kv_cache_logical_size % self.world_size == 0
+            self._cs_block_length = self.block_length // self.world_size
+            self._cs_max_attention_size = self.max_attention_size // self.world_size
+            self._cs_kv_cache_logical_size = self.kv_cache_logical_size // self.world_size
 
         self.q = _compile(nn.Linear(dim, dim))
         self.k = _compile(nn.Linear(dim, dim))
@@ -283,8 +303,10 @@ class CausalWanSelfAttention(nn.Module):
                 start_frame_int=start_frame_int,
                 head_start=h_start, head_end=h_end,
                 tok_offset=sp_start, tok_len=sp_shard_len)
-            # v: gather full (attention reads whole V window), slice heads as before.
-            _, _, v_full = self._gather_qkv(q_local, k_local, v_local, L, gather_q=False)
+            # SINGLE k/v world-gather (was 3 redundant gathers — ntrace: sharding cost is
+            # LAUNCHES not compute, so collapse them). _gather_qkv(gather_q=False) gathers
+            # BOTH k and v in one call; reuse for v AND the anchor-k path.
+            _, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L, gather_q=False)
             v = self._slice_heads(v_full)
             # k: RoPE this rank's world-shard at its global offset, gather the ROPED shards.
             world_rank = ps.get_rank("world")
@@ -301,9 +323,8 @@ class CausalWanSelfAttention(nn.Module):
             rk_gathered = torch.empty(L, n_local * d, dtype=rk_flat.dtype, device=rk_flat.device)
             ps.all_gather_into_tensor(rk_gathered, rk_flat, "world")
             roped_key = rk_gathered.view(L, n_local, d).unsqueeze(0)
-            # k (unroped, head-sliced) still needed for anchor write path -> gather k too.
+            # k (unroped, head-sliced) for anchor write — reuse the k_full already gathered.
             if kv_cache is None or self._will_anchor_write(kv_cache, current_start):
-                _, k_full, _ = self._gather_qkv(q_local, k_local, v_local, L, gather_q=False)
                 k = self._slice_heads(k_full)
             else:
                 k = None
