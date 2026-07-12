@@ -95,6 +95,16 @@ class Trainer:
         self.iters = int(getattr(config, "iters", 10000))
         self.save_every = int(getattr(config, "save_every", 200))
         self.timestep_shift = getattr(config, "timestep_shift", 5.0)
+        # EMA of the generator weights (upstream configs/rolling_forcing_dmd.yaml:
+        # ema_weight=0.99, ema_start_step=200). DMD is adversarial-like: the raw
+        # generator loss OSCILLATES around an equilibrium and never monotonically
+        # decreases — you ship the EMA-averaged weights, NOT the raw snapshot. This is
+        # what the shipped inference ckpt's `generator_ema` key is, and why raw-weight
+        # checkpoints render blurry (a noisy point on the oscillation). We maintain
+        # generator_ema on the student's ssrc rank and save it alongside `generator`.
+        self.ema_weight = float(getattr(config, "ema_weight", 0.99))
+        self.ema_start_step = int(getattr(config, "ema_start_step", 200))
+        self._ema_state = None  # dict[name -> cpu fp32 tensor]; lazy-init at ema_start_step
         self.num_train_timestep = getattr(config, "num_train_timestep", 1000)
         self.min_step = int(0.02 * self.num_train_timestep)
         self.max_step = int(0.98 * self.num_train_timestep)
@@ -379,6 +389,10 @@ class Trainer:
                         self.opt_g.step()
                         if self.my_rank == self.ssrc:
                             print(f"[grad] it {it}: grad_norm={gn:.6e}", flush=True)
+                        # EMA update AFTER a real optimizer step (upstream: start at
+                        # ema_start_step, w=0.99). Kept on the LOCAL sharded params (cheap,
+                        # no gather per step); materialized to full only at save time.
+                        self._ema_update(it)
                     self._g_since_step = 0
                     # FREE THE GRADS NOW, not at the next G-step. The probe showed .grad
                     # (full fp32 grads on every student param) + FSDP backward buffers
@@ -531,6 +545,31 @@ class Trainer:
         ).unflatten(0, (b, num_frame))
         return x0d, x_t, tt, num_frame
 
+    def _ema_update(self, it):
+        # Maintain an exponential moving average of the generator weights (upstream
+        # ema_weight/ema_start_step). Only the student ranks hold generator params.
+        # Kept as fp32 clones of each param's LOCAL shard, updated in-place per G-step
+        # (cheap, no cross-rank gather) — materialized to full only in _save_ckpt.
+        if not self.in_student or it < self.ema_start_step:
+            return
+        w = self.ema_weight
+        if self._ema_state is None:
+            # lazy-init from the current weights at ema_start_step (upstream: EMA begins
+            # tracking here, so the average is over the CONVERGED-region oscillation, not
+            # the noisy warmup/descent).
+            self._ema_state = {}
+            for name, p in self.generator.named_parameters():
+                self._ema_state[name] = p.detach().float().clone()
+            if self.my_rank == self.ssrc:
+                print(f"[ema] init at it {it} (w={w}, {len(self._ema_state)} params)", flush=True)
+            return
+        for name, p in self.generator.named_parameters():
+            e = self._ema_state.get(name)
+            if e is None:
+                self._ema_state[name] = p.detach().float().clone()
+            else:
+                e.mul_(w).add_(p.detach().float(), alpha=1.0 - w)
+
     def _save_ckpt(self, it):
         # FSDP2 (fully_shard) student: gather the full state_dict via
         # get_model_state_dict(full_state_dict=True, cpu_offload=True) (SD save_ckpt path),
@@ -540,16 +579,24 @@ class Trainer:
                 dist.barrier()
             return
         from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+        from torch.distributed.tensor import DTensor
         full = get_model_state_dict(
             self.generator, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
         if len(full) == 0:
-            from torch.distributed.tensor import DTensor
             raw = self.generator.state_dict()
             full = {}
             for k, v in raw.items():
                 if isinstance(v, DTensor):
                     v = v.full_tensor()
                 full[k] = v.detach().to("cpu")
+        # Materialize the EMA to FULL tensors the same way (each EMA entry mirrors a
+        # generator param's sharding, so full_tensor() gathers it). All student ranks must
+        # participate in full_tensor() collectives; only ssrc keeps the result.
+        ema_full = {}
+        if self._ema_state is not None:
+            for name, e in self._ema_state.items():
+                v = e.full_tensor() if isinstance(e, DTensor) else e
+                ema_full[name] = v.detach().to("cpu")
         if dist.is_initialized():
             dist.barrier()
         if self.my_rank == self.ssrc:
@@ -557,9 +604,13 @@ class Trainer:
                 return (k.replace("_fsdp_wrapped_module.", "").replace("_checkpoint_wrapped_module.", "")
                         .replace("_orig_mod.", "").replace("_checkpoint_wrapped_module", ""))
             payload = {"generator": {_clean(k): v for k, v in full.items()}, "distill_iter": it}
+            if ema_full:
+                payload["generator_ema"] = {_clean(k): v for k, v in ema_full.items()}
             out = os.path.join(self.output_path, f"model.iter{it}.pt")
             torch.save(payload, out)
-            print(f"[ckpt] wrote {out} ({len(payload['generator'])} tensors)", flush=True)
+            _ema_n = len(payload.get("generator_ema", {}))
+            print(f"[ckpt] wrote {out} ({len(payload['generator'])} tensors, "
+                  f"generator_ema={_ema_n} tensors)", flush=True)
             if self.mirror_dir:
                 import subprocess
                 dst = os.path.join(self.mirror_dir, os.path.basename(out))

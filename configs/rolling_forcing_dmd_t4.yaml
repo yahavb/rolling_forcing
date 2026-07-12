@@ -75,16 +75,21 @@ data_path: prompts/distill_poc_single.txt         # PROOF-OF-CONCEPT: single pro
                                                   # vidprom_filtered_extended.txt for a broader model.
 batch_size: 1
 # EMA DISABLED to match StreamDiffusionV2's proven-stable Neuron distill (branch
-# exp/fps-1.3b, 1000s of iters, no OOM): SD's trainer has NO EMA at all. Reason,
-# straight from SD's code: EMA_FSDP updates via FSDP.summon_full_params, which
-# all-gathers the FULL fp32 params onto EVERY rank's HBM (a 5.287GB on-device spike
-# for the 1.3B student) — every generator step once ema_start_step is reached, plus
-# once at build. SD's rule is that the full unsharded fp32 model NEVER co-resides
-# on-device; its ONLY full-param gather (checkpoint save) uses cpu_offload=True so it
-# lands on CPU, not HBM. EMA's summon violates that rule, so SD removed EMA entirely.
-# ema_weight=0 disables both summon sites (build + per-step update) here. EMA is a
-# quality nicety, not required for the DMD loop.
-ema_weight: 0.0
+# EMA of the generator weights — RE-ENABLED (2026-07). DMD is adversarial-like: the raw
+# generator loss OSCILLATES around an equilibrium (dmdnorm_avg50 bounced 0.42<->0.81 over
+# a single-prompt run) and you ship the EMA-averaged weights, not a raw snapshot — which
+# is why raw-weight iter200 rendered BLURRY. Upstream configs/rolling_forcing_dmd.yaml
+# ships ema_weight=0.99/ema_start_step=200 and the inference ckpt's `generator_ema` key.
+#
+# The OLD reason EMA was disabled (ema_weight=0.0): SD's EMA_FSDP used
+# FSDP.summon_full_params -> all-gathers the FULL fp32 model onto EVERY rank's HBM
+# (5.287GB/rank spike) every G-step. OUR trainer's _ema_update AVOIDS that: it keeps a
+# SHARDED fp32 clone of each param and updates the LOCAL shard in place (no gather); the
+# full gather happens only at save time via full_tensor() -> CPU (same as `generator`).
+# So the "full unsharded fp32 never co-resides on-device" rule still holds; cost is only
+# ~1.3GB/rank of sharded fp32 state. Watch the it<=18 memprobe for creep.
+# ema_weight=0.999: slightly longer averaging window than upstream's 0.99.
+ema_weight: 0.999
 ema_start_step: 200
 total_batch_size: 64
 log_iters: 100
