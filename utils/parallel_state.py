@@ -62,3 +62,21 @@ def reduce_scatter_tensor(output, input, group_name):
 
 def all_reduce(tensor, group_name, op=dist.ReduceOp.SUM):
     dist.all_reduce(tensor, op=op, group=_get(group_name))
+
+
+def ring_exchange(send_tensor, recv_tensor, group_name):
+    """One ring step over group_name: send send_tensor to next rank (rank+1)%W, receive
+    prev rank's send_tensor into recv_tensor (from (rank-1)%W). Point-to-point via
+    batch_isend_irecv so the transfer can overlap compute (the ring-attention win). Blocks
+    until this step's transfer completes (caller overlaps by computing on the CURRENT hand
+    before calling the next exchange). Uses GLOBAL ranks (batch_isend_irecv needs them)."""
+    g = _get(group_name)
+    w = dist.get_world_size(g)
+    r = dist.get_rank(g)
+    # map group-relative next/prev to GLOBAL ranks
+    nxt = dist.get_global_rank(g, (r + 1) % w)
+    prv = dist.get_global_rank(g, (r - 1) % w)
+    ops = [dist.P2POp(dist.isend, send_tensor.contiguous(), nxt, group=g),
+           dist.P2POp(dist.irecv, recv_tensor, prv, group=g)]
+    for req in dist.batch_isend_irecv(ops):
+        req.wait()

@@ -416,6 +416,8 @@ class CausalWanSelfAttention(nn.Module):
         assert v_kern.shape[1] % ATTN_SEQLEN_MULTIPLE == 0
 
         import os as _os
+        if _os.environ.get("RF_RING_SHARD", "0") == "1" and self.sp_degree > 1:
+            return self._attend_ring_shard(q_kern, k_kern, v_kern, k_len_int)
         if _os.environ.get("RF_RING", "0") == "1" and self.sp_degree > 1:
             return self._attend_ring(q_kern, k_kern, v_kern, k_len_int)
 
@@ -573,6 +575,67 @@ class CausalWanSelfAttention(nn.Module):
         out = out.to(q_kern.dtype)
         # match default _attend contract exactly: out.unsqueeze(0).flatten(2)
         # -> [1, Sq, bs*d]  (same as wan_flash_self_attn result path).
+        return out.unsqueeze(0).flatten(2)
+
+    def _attend_ring_shard(self, q_kern, k_kern, v_kern, k_len_int):
+        """STAGE 3b: ring-rotation attention. Each rank owns ONLY window-slice sp_rank; it
+        rotates slices around the sp ring (send-next/recv-prev via ps.ring_exchange), flash-
+        partials each slice it holds, and combines all sp partials in GLOBAL slice order with
+        online-softmax. Removes the redundant full-window materialization: point-to-point
+        rotation instead of every rank holding the whole window.
+        Proven CPU-equivalent: verify_ring_rotation.py + verify_sharded_cache_ring.py
+        (max|Δ|<1e-12). q_kern [bs,d,Sq]; k_kern [bs,d,Sk]; v_kern [bs,Sk,d].
+        NOTE: this variant takes its slice from the already-assembled (replicated) window, so
+        it does not yet cut the gather volume — it measures whether ring send/recv OVERLAPS
+        NKI compute on device (the win condition). True cache-shard (no assembly) is the
+        follow-on once overlap is confirmed."""
+        sp = self.sp_degree
+        r = self.sp_rank
+        assert k_len_int % sp == 0, f"ring-shard: k_len={k_len_int} not divisible by sp={sp}"
+        seg = k_len_int // sp
+        bs, d_dim, _ = k_kern.shape
+        BUF = ((seg + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
+
+        # this rank's OWNED native slice (global segment r) — padded once to a legal buffer.
+        def _slice_buf(idx):
+            kb = k_kern.new_zeros((bs, d_dim, BUF))
+            vb = v_kern.new_zeros((bs, BUF, d_dim))
+            kb[:, :, :seg] = k_kern[:, :, idx * seg:(idx + 1) * seg]
+            vb[:, :seg, :] = v_kern[:, idx * seg:(idx + 1) * seg, :]
+            return kb.contiguous(), vb.contiguous()
+
+        k_hand, v_hand = _slice_buf(r)
+        k_recv = torch.empty_like(k_hand)
+        v_recv = torch.empty_like(v_hand)
+        parts = {}  # global slice idx -> (O_unnorm, row_max, row_sum)
+        for t in range(sp):
+            owner = (r - t) % sp                       # slice currently in hand
+            # kick off the NEXT rotation BEFORE computing on the current hand, so the
+            # point-to-point transfer overlaps the flash-partial compute (the ring win).
+            if t < sp - 1:
+                ps.ring_exchange(k_hand, k_recv, "attn-sp")
+                ps.ring_exchange(v_hand, v_recv, "attn-sp")
+            O_s, mx, sm = wan_flash_self_attn(
+                q_kern, k_hand, v_hand,
+                softmax_scale=self.softmax_scale, actual_seqlen_k=seg,
+                use_dynamic_loop=False, return_partials=True)
+            parts[owner] = (O_s, mx, sm)
+            if t < sp - 1:
+                k_hand, k_recv = k_recv, k_hand
+                v_hand, v_recv = v_recv, v_hand
+        # combine in GLOBAL slice order (ascending) — bit-exact vs flash tile order.
+        m = l = acc = None
+        for s in range(sp):
+            O_s, mx, sm = parts[s]
+            if m is None:
+                m, l, acc = mx, sm, O_s
+            else:
+                m_new = torch.maximum(m, mx)
+                cp = torch.exp(m - m_new); cc = torch.exp(mx - m_new)
+                l = l * cp + sm * cc
+                acc = acc * cp + O_s * cc
+                m = m_new
+        out = (acc / l).to(q_kern.dtype)
         return out.unsqueeze(0).flatten(2)
 
     def _output_proj(self, out):
