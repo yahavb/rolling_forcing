@@ -604,25 +604,24 @@ class CausalWanSelfAttention(nn.Module):
             vb[:, :seg, :] = v_kern[:, idx * seg:(idx + 1) * seg, :]
             return kb.contiguous(), vb.contiguous()
 
-        k_hand, v_hand = _slice_buf(r)
-        k_recv = torch.empty_like(k_hand)
-        v_recv = torch.empty_like(v_hand)
+        # Neuron's distributed backend has NO P2P (isend/irecv unsupported — run sdjkl:
+        # "No backend type associated with device type neuron"). So the ring exchange is done
+        # with all_gather over attn-sp: each rank contributes its own L/sp slice, receives all
+        # sp slices. Same RESULT as a rotation; no send/recv overlap (collective is a barrier),
+        # but P2P isn't available on this hardware. Then flash-partial each slice + global-order
+        # combine (proven: verify_ring_rotation / verify_sharded_cache_ring, max|Δ|<1e-12).
+        k_own, v_own = _slice_buf(r)                    # this rank's slice, padded to BUF
+        k_all = torch.empty((sp,) + tuple(k_own.shape), dtype=k_own.dtype, device=k_own.device)
+        v_all = torch.empty((sp,) + tuple(v_own.shape), dtype=v_own.dtype, device=v_own.device)
+        ps.all_gather_into_tensor(k_all.view(-1, *k_own.shape[1:]), k_own, "attn-sp")
+        ps.all_gather_into_tensor(v_all.view(-1, *v_own.shape[1:]), v_own, "attn-sp")
         parts = {}  # global slice idx -> (O_unnorm, row_max, row_sum)
-        for t in range(sp):
-            owner = (r - t) % sp                       # slice currently in hand
-            # kick off the NEXT rotation BEFORE computing on the current hand, so the
-            # point-to-point transfer overlaps the flash-partial compute (the ring win).
-            if t < sp - 1:
-                ps.ring_exchange(k_hand, k_recv, "attn-sp")
-                ps.ring_exchange(v_hand, v_recv, "attn-sp")
+        for owner in range(sp):
             O_s, mx, sm = wan_flash_self_attn(
-                q_kern, k_hand, v_hand,
+                q_kern, k_all[owner].contiguous(), v_all[owner].contiguous(),
                 softmax_scale=self.softmax_scale, actual_seqlen_k=seg,
                 use_dynamic_loop=False, return_partials=True)
             parts[owner] = (O_s, mx, sm)
-            if t < sp - 1:
-                k_hand, k_recv = k_recv, k_hand
-                v_hand, v_recv = v_recv, v_hand
         # combine in GLOBAL slice order (ascending) — bit-exact vs flash tile order.
         m = l = acc = None
         for s in range(sp):
