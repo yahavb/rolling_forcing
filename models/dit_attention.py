@@ -458,6 +458,19 @@ class CausalWanSelfAttention(nn.Module):
         assert k_len_int % nseg == 0, (
             f"ring: valid window k_len_int={k_len_int} must be divisible by nseg={nseg}")
         bs, d_dim, Sk = k_kern.shape
+        # FAST PATH (nseg==1): the whole window is on this rank in one piece. combine-of-one
+        # is identity, so skip the return_partials/combine machinery entirely and make a
+        # single plain kernel call — byte-identical to the baseline _attend, baseline speed.
+        # RF_RING=1 RF_RING_NSEG=1 => ring plumbing at 14fps (proves the ring path costs
+        # nothing when K/V is not sharded). Sharded K/V (nseg=sp) is the real win.
+        if nseg == 1:
+            out = wan_flash_self_attn(
+                q_kern, k_kern, v_kern,
+                softmax_scale=self.softmax_scale,
+                actual_seqlen_k=k_len_int,
+                use_dynamic_loop=False,
+            )
+            return out.unsqueeze(0).flatten(2)
         seg = k_len_int // nseg
         buf_w = ((seg + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
         buf_full = ((k_len_int + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
