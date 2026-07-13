@@ -806,6 +806,39 @@ class CausalWanSelfAttention(nn.Module):
         v_g = torch.empty((N, bs, k_len_int, d_dim), dtype=v_own.dtype, device=v_own.device)
         ps.all_gather_into_tensor(k_g.view(N * bs, d_dim, k_len_int), k_own, "world")
         ps.all_gather_into_tensor(v_g.view(N * bs, k_len_int, d_dim), v_own, "world")
+
+        # NO-REASSEMBLY COMBINE (RF_CACHESHARD_COMBINE): isolate whether the strided
+        # per-block reassembly copy is the fps killer (torch path = 12.25 WITH it; in-kernel
+        # strided dma_copy = 5.29). Instead of rebuilding the full window, flash each shard
+        # segment in GLOBAL ORDER (per block b, per rank r: the contiguous [b*ws:+ws] slice)
+        # with return_partials and online-softmax-merge (bit-exact, verify_ring_attention_exact
+        # requires global order). Each gathered slice k_g[r,:, :, b*ws:+ws] is CONTIGUOUS — no
+        # strided copy. Torch can't overlap (all_gather is a barrier) but this measures the
+        # reassembly cost cleanly; if it recovers toward 14, move this combine in-kernel.
+        if _os_ik.environ.get("RF_CACHESHARD_COMBINE", "0") == "1":
+            ws = ws_block
+            buf_w = ((ws + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
+            m = l = acc = None
+            for b in range(nblocks):
+                for r in range(N):                       # GLOBAL order: block b, rank 0..N-1
+                    k_seg = k_own.new_zeros((bs, d_dim, buf_w))
+                    v_seg = v_own.new_zeros((bs, buf_w, d_dim))
+                    k_seg[:, :, :ws] = k_g[r, :, :, b * ws:(b + 1) * ws]
+                    v_seg[:, :ws, :] = v_g[r, :, b * ws:(b + 1) * ws, :]
+                    O_s, max_s, sum_s = wan_flash_self_attn(
+                        q_kern, k_seg.contiguous(), v_seg.contiguous(),
+                        softmax_scale=self.softmax_scale, actual_seqlen_k=ws,
+                        use_dynamic_loop=False, return_partials=True)
+                    if m is None:
+                        m, l, acc = max_s, sum_s, O_s
+                    else:
+                        m_new = torch.maximum(m, max_s)
+                        a, b_ = torch.exp(m - m_new), torch.exp(max_s - m_new)
+                        l = a * l + b_ * sum_s
+                        acc = a.unsqueeze(-1) * acc + b_.unsqueeze(-1) * O_s
+                        m = m_new
+            out = (acc / l.unsqueeze(-1)).to(q_kern.dtype)
+            return out.unsqueeze(0).flatten(2)
         # PER-BLOCK INTERLEAVE: each rank's window-shard holds nblocks blocks of ws_block
         # tokens each; the full window = for each block, concat rank0..N-1 (verify_cache_shard).
         full_len = N * k_len_int
