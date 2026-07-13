@@ -1,0 +1,298 @@
+{
+  "peak_tflops": 3040.0,
+  "num_cores": 16,
+  "total_flops": 3.638041583340749e+16,
+  "total_time_s": 390.7832309209625,
+  "avg_tflops": 93.09615396666183,
+  "avg_mfu": 0.030623734857454548,
+  "per_stage": [
+    {
+      "stage": "T5 (prompt 0)",
+      "elapsed_s": 1.7618532319902442,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 2.7497881332687686,
+      "mfu": 0.0009045355701542002,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 0)",
+      "elapsed_s": 131.05809897201834,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 17.312407888371016,
+      "mfu": 0.005694871015911518,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 1)",
+      "elapsed_s": 0.04272200103150681,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 113.40112805847022,
+      "mfu": 0.03730300265081257,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 1)",
+      "elapsed_s": 17.133979192003608,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 132.4229031127215,
+      "mfu": 0.04356016549760576,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 2)",
+      "elapsed_s": 0.024858469958417118,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 194.89224871813033,
+      "mfu": 0.06410929234149024,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 2)",
+      "elapsed_s": 16.981410676031373,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 133.6126491352448,
+      "mfu": 0.043951529320804206,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 3)",
+      "elapsed_s": 0.04285158199490979,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 113.05820892361662,
+      "mfu": 0.03719020030382126,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 3)",
+      "elapsed_s": 17.013743774965405,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 133.3587302411749,
+      "mfu": 0.04386800336880753,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 4)",
+      "elapsed_s": 0.044458110991399735,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 108.97276114194763,
+      "mfu": 0.03584630300721962,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 4)",
+      "elapsed_s": 17.295157205022406,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 131.1888200599412,
+      "mfu": 0.04315421712498066,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 5)",
+      "elapsed_s": 0.04445506201591343,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 108.98023510019515,
+      "mfu": 0.035848761546116825,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 5)",
+      "elapsed_s": 17.241074522025883,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 131.60033985001726,
+      "mfu": 0.043289585476979364,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 6)",
+      "elapsed_s": 0.033153870957903564,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 146.12842995134676,
+      "mfu": 0.048068562483995644,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 6)",
+      "elapsed_s": 17.224503302015364,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 131.72694891077657,
+      "mfu": 0.0433312331943344,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 7)",
+      "elapsed_s": 0.04377501195995137,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 110.67325611059368,
+      "mfu": 0.03640567635216897,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 7)",
+      "elapsed_s": 17.183491014991887,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 132.04134506186963,
+      "mfu": 0.04343465298087817,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 8)",
+      "elapsed_s": 0.04253650602186099,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 113.89565253427558,
+      "mfu": 0.037465675175748545,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 8)",
+      "elapsed_s": 17.165466344042215,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 132.17999563790355,
+      "mfu": 0.04348026172299459,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 9)",
+      "elapsed_s": 0.04498186899581924,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 107.70390866458403,
+      "mfu": 0.035428917323876326,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 9)",
+      "elapsed_s": 17.23490928299725,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 131.64741567374818,
+      "mfu": 0.043305070945311906,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 10)",
+      "elapsed_s": 0.04400769801577553,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 110.08808295656142,
+      "mfu": 0.036213185183079415,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 10)",
+      "elapsed_s": 17.2510434690048,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 131.52429130183933,
+      "mfu": 0.04326456950718399,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 11)",
+      "elapsed_s": 0.044641977990977466,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 108.5239348235681,
+      "mfu": 0.03569866277091056,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 11)",
+      "elapsed_s": 16.963911269034725,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 133.75047950290218,
+      "mfu": 0.043996868257533614,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 12)",
+      "elapsed_s": 0.04279256798326969,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 113.21412427929324,
+      "mfu": 0.037241488249767515,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 12)",
+      "elapsed_s": 16.99493154400261,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 133.50634926674766,
+      "mfu": 0.04391656225879857,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 13)",
+      "elapsed_s": 0.042981652019079775,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 112.71607493675214,
+      "mfu": 0.03707765622919478,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 13)",
+      "elapsed_s": 17.21901165001327,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 131.76896053010864,
+      "mfu": 0.04334505280595679,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 14)",
+      "elapsed_s": 0.02545285498490557,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 190.34104868632966,
+      "mfu": 0.0626121870678716,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 14)",
+      "elapsed_s": 17.185468786978163,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 132.02614921958389,
+      "mfu": 0.04342965434854733,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "T5 (prompt 15)",
+      "elapsed_s": 0.03986193495802581,
+      "flops": 4844723109888.0,
+      "tflops_achieved": 121.53758002438771,
+      "mfu": 0.03997946711328543,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    },
+    {
+      "stage": "DiT+VAE (prompt 15)",
+      "elapsed_s": 17.27164551394526,
+      "flops": 2268931266478080.0,
+      "tflops_achieved": 131.36740588186154,
+      "mfu": 0.04321296246113866,
+      "peak_tflops": 3040.0,
+      "num_cores": 16
+    }
+  ]
+}

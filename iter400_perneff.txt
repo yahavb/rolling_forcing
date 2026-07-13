@@ -1,0 +1,811 @@
+=== PER-NEFF ENGINE UTILIZATION (760 NEFFs, by wall time) ===
+neff              tot_us  %oftot  tensor%  gpsimd%  vector%    dma%  class
+b6041713a3964f    7285.6    4.7%      5.9     89.4      1.2    47.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9eadc5d102904e    5828.4    3.8%      5.8     89.5      1.2    47.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+1072ae8772648e    4492.1    2.9%     69.2      3.6      1.7    96.8  COMPUTE-BOUND (matmul-hot)
+0ce8b46a0b1241    4444.4    2.9%     71.2      3.3      1.6    97.8  COMPUTE-BOUND (matmul-hot)
+41dc09ec92d0f4    4274.7    2.8%     72.6      3.5      1.6    97.3  COMPUTE-BOUND (matmul-hot)
+2e477c2932dabf    4050.6    2.6%     66.1      2.2      2.3    39.6  COMPUTE-BOUND (matmul-hot)
+3e7e69e06b10d4    4031.5    2.6%     66.7      4.7      2.5    40.6  COMPUTE-BOUND (matmul-hot)
+53780211ad667f    3793.2    2.5%     71.1      4.9      2.6    37.8  COMPUTE-BOUND (matmul-hot)
+c9dd13a421a2e1    3729.7    2.4%     50.6      6.6      4.7    54.7  COMPUTE-BOUND (matmul-hot)
+a17a415fb31493    3652.4    2.4%     73.3      1.9      2.6    33.2  COMPUTE-BOUND (matmul-hot)
+286e91cf3a9559    3643.7    2.4%     73.8      1.8      2.4    33.4  COMPUTE-BOUND (matmul-hot)
+f9b98abb1375e2    3621.4    2.4%     74.6      5.5      2.6    37.1  COMPUTE-BOUND (matmul-hot)
+7dfcdac7053319    3226.8    2.1%     59.0      7.4      5.1    48.8  COMPUTE-BOUND (matmul-hot)
+8e7f535e3f39d8    3194.1    2.1%     59.1      7.6      5.1    50.7  COMPUTE-BOUND (matmul-hot)
+0f1fd29313492e    2200.6    1.4%     62.3      3.4     86.9    17.1  COMPUTE-BOUND (matmul-hot)
+32235749cc4839    2093.2    1.4%     65.5      8.3      3.6    43.9  COMPUTE-BOUND (matmul-hot)
+12929beecb475f    1964.6    1.3%     70.9      8.6      4.1    36.0  COMPUTE-BOUND (matmul-hot)
+d509f223f6f720    1885.2    1.2%     72.6      9.0      3.8    39.8  COMPUTE-BOUND (matmul-hot)
+7679526b3f386a    1662.8    1.1%     39.6     35.1     39.8    87.3  MIXED
+13fba11a1204f7    1552.6    1.0%     58.0      2.7      2.8    46.9  COMPUTE-BOUND (matmul-hot)
+7275a633c90305    1387.0    0.9%     64.8      2.7      3.1    40.7  COMPUTE-BOUND (matmul-hot)
+1a504685efec00    1381.0    0.9%     65.0      6.4      3.3    45.0  COMPUTE-BOUND (matmul-hot)
+931abd0191d3c9    1375.0    0.9%     65.7      2.7      2.9    39.6  COMPUTE-BOUND (matmul-hot)
+b1c2fb53036f69    1322.5    0.9%      0.2      5.4     12.4    30.7  MIXED
+051ad37886e875    1300.2    0.8%     79.1      7.8     21.4    60.5  COMPUTE-BOUND (matmul-hot)
+7843ac61d0c2e6    1296.2    0.8%     69.3      6.9      3.4    40.1  COMPUTE-BOUND (matmul-hot)
+915fc3910fa13b    1265.9    0.8%     28.5     15.3      9.5    89.3  MIXED
+7b8d8aa2f755f8    1235.6    0.8%     58.3     24.0     63.6    80.9  COMPUTE-BOUND (matmul-hot)
+25941bb9bd697c    1231.0    0.8%     73.3      7.0      3.4    38.6  COMPUTE-BOUND (matmul-hot)
+777bde4fbc06d3    1105.3    0.7%     55.4      7.7      5.8    50.0  COMPUTE-BOUND (matmul-hot)
+1698fbcdaf5dcd    1051.9    0.7%     58.3     26.5     64.4    83.1  COMPUTE-BOUND (matmul-hot)
+101f747941ab83    1034.6    0.7%     80.5      9.6     21.4    57.0  COMPUTE-BOUND (matmul-hot)
+28431fab8af4ba     995.1    0.6%     62.1      8.7      6.1    42.7  COMPUTE-BOUND (matmul-hot)
+dc55f4ad811a3f     987.8    0.6%     92.7      7.2      4.2    10.1  COMPUTE-BOUND (matmul-hot)
+21d6ff7bb38b28     987.5    0.6%     93.9      6.6      3.4     9.8  COMPUTE-BOUND (matmul-hot)
+1d798d134b85f1     985.8    0.6%     93.1      6.8      3.5    10.5  COMPUTE-BOUND (matmul-hot)
+114061d01c7e06     971.1    0.6%     39.0     35.3     39.8    86.9  MIXED
+6b1fd55d903fbf     953.2    0.6%     65.4      9.1      6.2    43.3  COMPUTE-BOUND (matmul-hot)
+76e798bee7a176     931.3    0.6%     56.9      8.4     59.2    22.1  COMPUTE-BOUND (matmul-hot)
+248e114c98a47b     913.7    0.6%     58.0     28.8     60.4    85.0  COMPUTE-BOUND (matmul-hot)
+00f4f0b6e86b71     891.0    0.6%     90.8      4.7      5.0    12.4  COMPUTE-BOUND (matmul-hot)
+6ce4d1b4cff1aa     875.4    0.6%     92.1      4.7      4.7    12.3  COMPUTE-BOUND (matmul-hot)
+862789e4a20f6b     874.4    0.6%     92.2      4.5      4.9    12.4  COMPUTE-BOUND (matmul-hot)
+c5feec5b1a671b     873.1    0.6%     32.9     17.9     11.5    80.5  MIXED
+e352a5e0935aa2     861.5    0.6%      0.2     33.4     75.1    78.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+371be1df3b706f     755.1    0.5%     55.2     32.7     62.5    83.5  COMPUTE-BOUND (matmul-hot)
+332accfe0465ab     745.4    0.5%      0.3     32.6     72.2    78.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0e8e9185e31121     728.1    0.5%     64.3      3.7     87.7    17.3  COMPUTE-BOUND (matmul-hot)
+08d589c901e44e     646.2    0.4%     53.4     35.6     56.3    85.8  COMPUTE-BOUND (matmul-hot)
+8bc8aa4aec52ae     624.5    0.4%      0.4      9.9     15.3    26.7  MIXED
+a04f46c72cc42d     592.5    0.4%     91.2      5.8      4.4    12.6  COMPUTE-BOUND (matmul-hot)
+36084ea1cb067e     591.5    0.4%     91.6      5.6      4.1    12.1  COMPUTE-BOUND (matmul-hot)
+d95d7f7ca9bbda     588.3    0.4%     92.0      5.6      4.1    12.0  COMPUTE-BOUND (matmul-hot)
+7a3ae548480561     571.6    0.4%      3.3      1.1      0.8    86.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+fa068233202f6a     563.4    0.4%     38.7     34.8     39.2    87.3  MIXED
+8a667264951e28     536.0    0.3%      0.4     19.7     25.0    97.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+6a26c3db6f7c4c     531.1    0.3%      3.8      1.1      0.8    82.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0a75736b338169     524.4    0.3%      3.9      1.1      0.8    81.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+abaa610c246dcb     517.0    0.3%     89.1     12.5      6.4    17.6  COMPUTE-BOUND (matmul-hot)
+e1e3bb0bca2cf5     507.4    0.3%     90.3     12.9      6.7    18.9  COMPUTE-BOUND (matmul-hot)
+0c0e494ae26123     506.6    0.3%     90.5     13.8      7.8    19.2  COMPUTE-BOUND (matmul-hot)
+fe1efcb16e3554     495.3    0.3%     53.3     43.1     50.8    82.0  COMPUTE-BOUND (matmul-hot)
+25c8652144ac8a     478.6    0.3%     51.6      6.9      4.7    54.8  COMPUTE-BOUND (matmul-hot)
+02858a5535ae5c     474.6    0.3%     52.0      7.4      5.0    55.9  COMPUTE-BOUND (matmul-hot)
+f354382e95b9ed     470.1    0.3%     52.5      6.9      4.7    55.2  COMPUTE-BOUND (matmul-hot)
+054ced60a359f1     466.7    0.3%     46.5     45.8     13.5    83.8  COMPUTE-BOUND (matmul-hot)
+2b1bd7d4f6010d     440.1    0.3%      0.5     34.9     92.9    85.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9a836738ba1ba1     416.6    0.3%     39.5     35.7     40.1    88.8  MIXED
+d428a171b92939     389.1    0.3%      0.6      5.4     13.1    19.6  MIXED
+9cc1ae9ef0048f     372.4    0.2%     42.2     52.7     42.7    76.6  COMPUTE-BOUND (matmul-hot)
+1ace87341d2f65     366.6    0.2%      0.6      8.4      0.5    97.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+14265bafb5633f     361.7    0.2%      0.6     14.5     32.7    63.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+6a3116756a1d4b     361.0    0.2%     51.6     40.7     51.4    74.5  COMPUTE-BOUND (matmul-hot)
+0ed08cdbbcb260     357.5    0.2%      0.6     74.7     94.2    25.4  MIXED
+168e1640993574     345.4    0.2%      0.7     68.0     86.1    59.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+2263cfb2396d82     342.7    0.2%     82.4      7.7     10.5    24.6  COMPUTE-BOUND (matmul-hot)
+1d4a4f3b05dbb0     342.2    0.2%     83.0      6.8      9.9    24.5  COMPUTE-BOUND (matmul-hot)
+7cd1e14b43f0c1     334.4    0.2%      0.6     14.6      0.6    95.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+79119556b9042c     329.5    0.2%     85.3      7.3     10.3    26.2  COMPUTE-BOUND (matmul-hot)
+607d1f60d6f3ea     325.6    0.2%      0.6     89.8      0.6    59.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+416ded696e617f     323.5    0.2%     49.2     40.2     49.3    72.3  COMPUTE-BOUND (matmul-hot)
+e00e3e391fadde     292.8    0.2%     54.3      9.6     63.4    22.2  COMPUTE-BOUND (matmul-hot)
+bfeefe99f2c757     289.8    0.2%     82.9     12.0      7.6    18.6  COMPUTE-BOUND (matmul-hot)
+16046953e1d008     289.5    0.2%     82.7     11.0      6.7    18.9  COMPUTE-BOUND (matmul-hot)
+cfd7993c58312d     289.0    0.2%     83.1     11.1      6.9    18.4  COMPUTE-BOUND (matmul-hot)
+3b374e879c39de     282.2    0.2%      0.7     67.1     84.2    59.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+4f4d3403675c66     274.4    0.2%      1.2     93.8      0.8    31.3  MIXED
+4107a7bd3414ad     270.6    0.2%     49.1     42.4     48.4    71.4  COMPUTE-BOUND (matmul-hot)
+ee62ef60712d7a     269.2    0.2%     28.5     64.0     23.3    81.1  MIXED
+6adee62c2d02e8     265.8    0.2%      0.2      0.2     39.1    14.8  MIXED
+53739e1de31d0e     265.2    0.2%     86.7     13.0     10.6    27.7  COMPUTE-BOUND (matmul-hot)
+d59baea7609e85     263.9    0.2%     87.1     12.4     10.3    27.1  COMPUTE-BOUND (matmul-hot)
+b0d0b7e888c6c8     263.6    0.2%     88.1     13.1     10.4    27.2  COMPUTE-BOUND (matmul-hot)
+457474a9f2d552     251.1    0.2%     43.7     47.1     57.6    67.1  COMPUTE-BOUND (matmul-hot)
+246c7a233281b9     248.7    0.2%     74.0     47.5     16.7    69.6  COMPUTE-BOUND (matmul-hot)
+25346b5867edb2     239.2    0.2%     41.0     43.0     55.2    60.9  COMPUTE-BOUND (matmul-hot)
+fdbbaab1709d3d     235.4    0.2%     82.7      8.8      7.7    22.2  COMPUTE-BOUND (matmul-hot)
+5e435d52d205e2     229.2    0.1%     82.7      8.7      7.9    23.1  COMPUTE-BOUND (matmul-hot)
+53ced942376b3f     227.9    0.1%     82.9      8.5      8.1    23.0  COMPUTE-BOUND (matmul-hot)
+5e05a65e903df7     227.6    0.1%      1.0      9.8     15.2    23.0  MIXED
+d855647b0585a6     221.9    0.1%      1.0     41.6     37.3    93.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9d695ec1540744     219.1    0.1%     83.9     14.0     10.2    21.4  COMPUTE-BOUND (matmul-hot)
+e57129c87f9e33     217.6    0.1%     84.2     13.3      8.9    21.0  COMPUTE-BOUND (matmul-hot)
+4220d5c543b270     217.3    0.1%     84.1     13.5      8.8    21.3  COMPUTE-BOUND (matmul-hot)
+7cf276c5787b5c     214.8    0.1%     80.0     15.8     13.5    29.4  COMPUTE-BOUND (matmul-hot)
+37182b7390c9ff     212.8    0.1%     71.7     12.0     14.7    38.2  COMPUTE-BOUND (matmul-hot)
+2df6ae88abb5cf     211.5    0.1%     72.5     12.2     15.0    38.2  COMPUTE-BOUND (matmul-hot)
+bcba4b82667829     211.3    0.1%     72.1     12.4     16.5    38.7  COMPUTE-BOUND (matmul-hot)
+6aab3326718571     210.1    0.1%     48.5     46.5     49.6    72.3  COMPUTE-BOUND (matmul-hot)
+c62aa00645f85e     209.3    0.1%      1.0     17.1     34.6    62.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+87b013d40c037e     207.1    0.1%     83.7     23.4      3.2    36.5  COMPUTE-BOUND (matmul-hot)
+7bf79298578301     206.2    0.1%      1.0     88.7      1.0    73.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+6636c943d36175     205.8    0.1%      1.1     89.3      1.0    74.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+3a87450b82862b     205.7    0.1%      1.1     89.3      1.0    74.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+fafd105af15c09     205.6    0.1%      1.0     88.7      1.0    74.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+caba8d4042853c     204.3    0.1%     56.4      4.4     79.2    15.4  COMPUTE-BOUND (matmul-hot)
+6b61aa1852a166     203.1    0.1%     36.9     37.2     42.0    89.9  MIXED
+b9fb43ce25012f     189.8    0.1%      1.1     87.9      1.1    43.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+cc3a422dbd89db     189.7    0.1%     76.4     50.4     15.8    72.5  COMPUTE-BOUND (matmul-hot)
+67620f73b8ee4c     188.8    0.1%      1.3     88.7      1.2    45.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+97aa18fcffdf14     188.7    0.1%      1.2     88.8      1.1    44.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9e4cbbc6b0671a     188.6    0.1%      1.3     88.6      1.1    45.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0037d2f1d668b5     186.8    0.1%      1.2     23.7      1.1    94.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+09b2744e8d692f     184.4    0.1%     84.6     13.7     10.1    25.5  COMPUTE-BOUND (matmul-hot)
+b788eb089daf4e     182.7    0.1%     85.2     13.1      9.8    26.6  COMPUTE-BOUND (matmul-hot)
+78d1edd079e1c5     181.6    0.1%     72.6      6.2     15.8    41.4  COMPUTE-BOUND (matmul-hot)
+6a43c9688d7c87     181.2    0.1%     85.5     13.3     10.1    26.2  COMPUTE-BOUND (matmul-hot)
+2259105902f636     178.1    0.1%     44.0     18.8     25.6    81.0  COMPUTE-BOUND (matmul-hot)
+d8ed06451f0706     175.2    0.1%     72.2      5.9     15.6    42.2  COMPUTE-BOUND (matmul-hot)
+2f4e41104652fa     174.1    0.1%      1.2     41.4      1.1    93.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+2086f54af1f0db     172.8    0.1%     72.1      6.1     16.0    42.8  COMPUTE-BOUND (matmul-hot)
+0b39843b4bb4b7     172.2    0.1%      1.2     87.2      1.5    71.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+46ba50008b09a9     171.6    0.1%      1.2     87.5      1.1    72.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+73981d78c5435d     171.6    0.1%      1.4     22.1      1.1    93.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0cb2195b93cd21     168.7    0.1%      1.3     87.2      1.5    72.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b3b36d12b3c4e1     168.7    0.1%      1.3     87.2      1.5    72.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+99ed765f9a1be0     168.7    0.1%      1.3     87.4      1.5    72.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9d2629faf2f77c     168.6    0.1%      1.3     87.2      1.5    73.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+1d8cedee518b22     168.6    0.1%      1.3     87.4      1.8    79.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+121bb7cd182784     168.5    0.1%      1.3     87.2      1.6    73.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+db2c7d2b39c140     168.5    0.1%      1.3     87.1      1.5    73.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+e0639ac71c125e     168.5    0.1%      1.3     87.1      1.5    73.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+a342d7d4092951     168.5    0.1%      1.3     87.3      1.3    72.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c61abdc076ba72     168.2    0.1%      1.3     87.2      1.1    73.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c9e3b633769453     168.1    0.1%      1.3     87.4      1.2    73.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+a4ff93d28dadfc     167.4    0.1%      1.3     88.7      1.2    48.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+72ec5a81911d19     163.7    0.1%      1.3      8.3     15.8    19.1  MIXED
+53eca38413b98f     157.5    0.1%      1.3     35.0     87.6    81.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+fe80ccc0d70563     156.0    0.1%     77.3     13.7      8.2    22.8  COMPUTE-BOUND (matmul-hot)
+a61d920224e7f2     155.6    0.1%     77.1     14.2      9.1    23.0  COMPUTE-BOUND (matmul-hot)
+52c49851010f0f     155.2    0.1%     78.1     13.6      8.2    22.2  COMPUTE-BOUND (matmul-hot)
+4137b36fb1237f     152.9    0.1%     45.4      8.3     55.5    19.1  COMPUTE-BOUND (matmul-hot)
+0f2623b9c02583     151.5    0.1%      1.4     14.7      1.3    93.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+a0f3dccbc37528     149.5    0.1%      1.4     14.8      1.3    92.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+5739be192d11d6     145.9    0.1%     52.1     55.3     49.6    78.6  COMPUTE-BOUND (matmul-hot)
+fffb1bdbac7dd1     143.4    0.1%     73.2     11.8     10.9    35.8  COMPUTE-BOUND (matmul-hot)
+a5dbc343dfbd76     142.6    0.1%     72.1     12.7     11.8    35.1  COMPUTE-BOUND (matmul-hot)
+f87a015fe5e0d0     140.6    0.1%     73.6     12.3     12.0    35.0  COMPUTE-BOUND (matmul-hot)
+dc55ba76463548     139.0    0.1%     63.8     36.1      3.1    57.7  COMPUTE-BOUND (matmul-hot)
+8328d4a79bcefd     138.0    0.1%     79.9     44.4     13.2    46.5  COMPUTE-BOUND (matmul-hot)
+d701f6740116c7     136.3    0.1%     37.6     37.5     42.9    91.4  MIXED
+bacb9a09762431     133.2    0.1%     21.4     15.6     20.0    45.5  MIXED
+b9725efe55f7b6     132.3    0.1%     48.8      7.9     55.1    18.4  COMPUTE-BOUND (matmul-hot)
+4bbd35ead0b62b     130.3    0.1%     65.2     38.6      2.7    61.5  COMPUTE-BOUND (matmul-hot)
+3d6721b413621a     128.3    0.1%     47.3     20.2     23.2    52.7  COMPUTE-BOUND (matmul-hot)
+80373465253978     128.3    0.1%      1.6      9.1      1.5    91.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9ff9c52e6bbf3a     126.4    0.1%     44.8     18.8     22.9    52.9  COMPUTE-BOUND (matmul-hot)
+1cfad4461611ed     126.1    0.1%     46.2     17.9     22.2    53.1  COMPUTE-BOUND (matmul-hot)
+5458e3dd0a901d     125.3    0.1%     36.4     50.8     36.4    65.0  MIXED
+d0f70cf6868436     121.2    0.1%      1.9     25.4     34.5    91.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0c8a964f926e6f     120.1    0.1%      1.8     26.5      1.8    90.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9f835d525c7356     119.5    0.1%     79.8     17.7      4.3    29.8  COMPUTE-BOUND (matmul-hot)
+59bfc4d49608b7     117.1    0.1%     78.2     40.6     12.0    44.4  COMPUTE-BOUND (matmul-hot)
+09736e763e85d8     107.6    0.1%      4.0     80.9      4.1    26.1  MIXED
+ec011ce314de8d     106.6    0.1%      2.0     57.6     75.4    50.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f4e36654e07d32     105.6    0.1%      4.5     19.8     66.3    35.6  MIXED
+b7885bd862e6ee     104.4    0.1%     59.9     21.6      8.7    39.0  COMPUTE-BOUND (matmul-hot)
+a8a178fc0800dd     104.0    0.1%     69.6     22.1     53.3    54.1  COMPUTE-BOUND (matmul-hot)
+ed19e48c4def86     104.0    0.1%     69.1     22.0     53.3    54.2  COMPUTE-BOUND (matmul-hot)
+996327818f5966     103.9    0.1%      2.0      7.8     17.5    28.7  MIXED
+be35f6d6182387     103.8    0.1%     77.5     14.7      6.9    27.9  COMPUTE-BOUND (matmul-hot)
+84bfaa866765db     102.2    0.1%     59.8      9.8     28.7    21.6  COMPUTE-BOUND (matmul-hot)
+3926e8eb7a2d21     101.6    0.1%      2.1     26.1      1.9    89.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+25e9abf4aea742      98.7    0.1%      2.1     91.5      1.9    64.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c4ec7c57be5290      98.6    0.1%      2.1     91.6      1.9    64.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+43ee62d8e22656      98.6    0.1%      2.1     91.7      1.9    65.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+161aba339f70ec      98.5    0.1%      2.1     91.6      1.9    65.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+e7887f4ccb5949      97.5    0.1%      2.2     35.7     47.1    75.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f915d42a221489      95.7    0.1%     67.4     14.3     11.4    27.5  COMPUTE-BOUND (matmul-hot)
+d6b11169767f1f      95.1    0.1%     68.7     15.1     14.8    27.6  COMPUTE-BOUND (matmul-hot)
+41c76cab103979      94.7    0.1%     68.3     14.6     11.6    27.3  COMPUTE-BOUND (matmul-hot)
+61a51eeace0764      93.5    0.1%      5.3     16.8     67.2    33.3  MIXED
+7d48b788ed35b3      93.5    0.1%      2.4     65.5     83.6    56.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9380930f8511fb      91.3    0.1%      2.1     30.3      2.1    87.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+384fd3056fb6f8      90.9    0.1%     70.0     24.6     57.1    50.1  COMPUTE-BOUND (matmul-hot)
+e0177ee9f094d0      90.7    0.1%     70.1     24.5     57.1    50.2  COMPUTE-BOUND (matmul-hot)
+ceafe2cb3c2e52      90.7    0.1%     70.1     24.5     57.0    50.5  COMPUTE-BOUND (matmul-hot)
+8ede0ef80a4614      90.7    0.1%     70.1     24.5     57.0    50.3  COMPUTE-BOUND (matmul-hot)
+ec8e581d47fa5e      90.7    0.1%     70.1     24.5     57.1    50.4  COMPUTE-BOUND (matmul-hot)
+b7509c348bb24a      90.7    0.1%     70.1     24.6     57.2    50.2  COMPUTE-BOUND (matmul-hot)
+f1a1a3db0cd2d9      90.6    0.1%     70.2     24.6     57.3    50.2  COMPUTE-BOUND (matmul-hot)
+17921c67eeb1db      90.5    0.1%     70.3     24.6     57.2    50.5  COMPUTE-BOUND (matmul-hot)
+2945dfadb0c014      89.6    0.1%      2.4     84.7      2.2    54.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+374f8a290be9a0      89.4    0.1%      2.4     22.5      2.1    88.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+85cdc4ef424b33      87.4    0.1%     20.0     47.2     15.8    78.2  MIXED
+8933b27650a138      87.0    0.1%     20.1     47.5     15.8    77.9  MIXED
+dec94611ecf0b5      86.6    0.1%     20.2     47.5     15.9    76.9  MIXED
+04ff9e38030ed0      86.4    0.1%     20.3     47.6     15.9    75.7  MIXED
+3885835a0a706f      86.2    0.1%     20.6     52.0     16.0    74.1  MIXED
+c5bec09ab8a084      86.1    0.1%     20.6     56.7     16.0    77.2  MIXED
+9a50d8d0527b44      85.9    0.1%      2.5     27.8     41.8    65.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+4f076785ff9813      85.6    0.1%      2.6     75.3      3.2    79.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+177ca8e30f1cdc      85.4    0.1%      2.5     75.1      3.0    78.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b85e05b33367ea      85.4    0.1%      2.5     75.2      3.0    78.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c84ef51730effe      85.4    0.1%      2.5     75.1      3.0    79.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0003fa2811e187      85.4    0.1%      2.5     75.2      3.0    78.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+30a370953174e2      85.4    0.1%      2.5     75.2      3.0    78.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+2c26b36b09dd3b      85.4    0.1%      2.5     75.2      3.0    78.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+aa6ff634beb734      85.4    0.1%      2.5     75.2      3.0    79.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+5f36c95e711b6a      85.3    0.1%      2.5     75.2      3.0    79.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+4fa059f943c388      85.3    0.1%      2.5     75.3      3.0    79.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f9596608031ba8      85.2    0.1%      2.5     75.3      3.0    79.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+66b1d720b3e016      85.2    0.1%      2.5     75.2      3.0    79.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+a19af085ebceac      85.2    0.1%      2.5     75.3      3.0    78.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+e3cfb246eb9d3a      85.2    0.1%     44.3     10.6     56.8    20.2  COMPUTE-BOUND (matmul-hot)
+2d7b374ddbc856      85.1    0.1%      2.5     75.4      3.0    79.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+8c8ab591dd2f7e      85.1    0.1%      2.5     75.4      3.0    79.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+e9604ff840cc90      85.1    0.1%      2.5     75.7      3.2    78.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b8655a444e8886      84.8    0.1%     20.6     43.3     16.2    77.1  MIXED
+64c92becb73ad2      84.8    0.1%     18.6     27.0     10.0    60.7  MIXED
+4573b125eaa496      84.8    0.1%     18.2     27.1     10.0    61.9  MIXED
+51a3a5a62c8b6a      84.6    0.1%     18.3     26.8      9.7    61.3  MIXED
+ed37c3c6370e64      84.4    0.1%     20.7     53.2     16.3    78.0  MIXED
+ea422771b34726      84.4    0.1%     21.0     58.0     16.3    80.0  MIXED
+784b8027d24f0c      84.3    0.1%      2.5     25.4      2.3    86.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+d59be002afe86d      84.0    0.1%     21.1     48.3     16.4    76.9  MIXED
+47e6805ba2a9c8      83.9    0.1%     21.1     58.4     16.4    78.0  MIXED
+a817eed6933f9b      83.8    0.1%     20.9     43.7     16.4    75.5  MIXED
+35163a69086811      83.6    0.1%     17.2     42.3      2.6    34.3  MIXED
+0e817418d8a14a      83.5    0.1%     17.3     42.5      2.7    34.7  MIXED
+c0d042191f11d6      83.4    0.1%     17.3     42.6      2.7    34.2  MIXED
+4bc21458c61ca2      83.2    0.1%     17.1     42.5      2.5    33.8  MIXED
+8b6a3049a9492b      83.2    0.1%     17.1     42.5      2.5    34.4  MIXED
+c9856bece9b08a      83.2    0.1%     17.4     42.7      2.7    34.8  MIXED
+03b9247224f7a9      83.1    0.1%     17.3     42.4      2.5    34.2  MIXED
+8c587949b42fa8      83.1    0.1%     17.5     42.8      2.8    34.4  MIXED
+989ff35ce88d5d      83.0    0.1%     21.1     49.4     16.7    80.5  MIXED
+def5cc968a5f0e      83.0    0.1%     17.3     42.6      2.5    33.9  MIXED
+64ecbfe3df3626      83.0    0.1%     17.4     42.8      2.7    34.3  MIXED
+c1c5876655d679      82.9    0.1%     17.4     42.8      2.7    34.6  MIXED
+949a40473f860d      82.9    0.1%     17.3     42.7      2.7    35.2  MIXED
+18f2ae7d25b482      82.9    0.1%     17.3     42.6      2.5    33.5  MIXED
+522eaa0bee8abb      82.9    0.1%     17.3     42.6      2.5    35.1  MIXED
+08f667bb8a005b      82.9    0.1%     17.3     42.6      2.5    33.1  MIXED
+d1522a0409a20a      82.8    0.1%     17.4     42.7      2.5    34.1  MIXED
+67163d2f44780e      82.6    0.1%      2.7     39.2      2.6    86.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+5f30a49a5484c1      82.0    0.1%     21.4     44.6     16.8    75.7  MIXED
+4038e076b37202      79.1    0.1%      2.7     40.7     36.4    86.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+e35d1c9bb9f3c3      78.8    0.1%     52.3     70.6      9.5    70.3  COMPUTE-BOUND (matmul-hot)
+90fba011251c83      78.6    0.1%      2.4     24.6     55.9    58.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+45d3dc9b5f5dd6      77.9    0.1%     22.5     42.9     17.7    71.2  MIXED
+0aad39df2a6dfb      77.8    0.1%     47.4     26.6     34.8    41.9  COMPUTE-BOUND (matmul-hot)
+f60df8165733c3      77.4    0.1%     49.6     26.7     35.0    41.5  COMPUTE-BOUND (matmul-hot)
+6c4348fecb7a44      76.3    0.0%     23.2     54.2     18.0    75.4  MIXED
+dc070f19591090      76.3    0.0%     23.0     44.0     18.1    73.7  MIXED
+235248e93d3fa0      76.1    0.0%     23.2     54.2     18.1    75.9  MIXED
+5b6faeeb447803      76.1    0.0%     23.2     44.2     18.4    73.6  MIXED
+b0d4057683f29b      76.0    0.0%     23.0     44.1     18.1    74.3  MIXED
+2aeb2900d75202      75.9    0.0%     23.3     54.3     18.1    75.0  MIXED
+43bdf3cc2b98e2      75.5    0.0%     23.5     54.6     18.2    75.3  MIXED
+dd6a89a232cfe2      74.1    0.0%      2.8     15.7     77.8    37.6  MIXED
+f2bfa354a26dac      73.8    0.0%      2.9     77.3      3.4    80.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+98449dcf766760      73.5    0.0%      2.9     77.7      3.4    81.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+2ec3734eff7c51      73.5    0.0%      2.9     77.7      3.4    80.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+84078206d5e26b      73.4    0.0%      2.9     77.9      3.6    80.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+34810416a270cd      73.3    0.0%      2.9     77.8      3.4    81.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+a4616e73e2fd78      73.3    0.0%      2.9     77.8      3.4    80.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+e58f3eede2b350      72.9    0.0%      3.0     78.6      3.8    81.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c43291a49a6e8d      72.8    0.0%      2.9     78.3      3.5    81.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+3579497238c957      72.8    0.0%      2.9     78.3      3.5    81.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+663053294193aa      72.8    0.0%      2.9     78.4      3.5    81.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+33cf0458fc9732      72.8    0.0%      2.9     78.4      3.5    80.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+6e0a0c51827cad      72.8    0.0%      2.9     78.4      3.5    80.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0c9bd5564e87db      72.7    0.0%      2.9     78.4      3.5    81.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+5649061d6b063a      72.7    0.0%      2.9     78.4      3.5    80.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+7d78ee194f19aa      72.7    0.0%      2.9     78.4      3.5    81.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+83b0a2401819d0      72.6    0.0%      2.9     78.5      3.5    82.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+7311859421757c      70.9    0.0%      3.0     76.4     56.3    71.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+2f15d3c258e4ab      70.7    0.0%      2.7     20.2     56.2    48.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+cac6df1ab18041      70.1    0.0%     55.6     14.3     12.3    31.4  COMPUTE-BOUND (matmul-hot)
+44c96de4484fbc      70.1    0.0%     56.1     13.0     12.0    29.9  COMPUTE-BOUND (matmul-hot)
+e434fdbecff8a4      69.6    0.0%     55.3     15.9     12.3    30.2  COMPUTE-BOUND (matmul-hot)
+0e7fbb7f627be0      69.5    0.0%     71.1     17.1      6.0    32.2  COMPUTE-BOUND (matmul-hot)
+ad6179ca027882      68.3    0.0%      3.4     84.6     26.6    82.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+3d5295c35b22ec      67.5    0.0%      3.2     26.0      2.8    84.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9c6a8acce2226d      67.3    0.0%     36.1      9.7     44.5    17.2  MIXED
+73f4ffd31a946b      66.3    0.0%      3.6     83.2      3.0    18.0  MIXED
+61fd568f0abc30      65.4    0.0%     17.8     12.4     15.6    33.2  MIXED
+051f9b4f480355      63.4    0.0%      3.5     27.5     38.1    58.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+fdf1b9fc3c58dc      63.4    0.0%      5.4     21.2     58.6    35.8  MIXED
+09989bc1be742c      62.3    0.0%     44.9     27.0     13.1    46.7  COMPUTE-BOUND (matmul-hot)
+502ee3634e1c48      60.5    0.0%      3.5     11.8     16.7    22.3  MIXED
+10bb007ca803dd      59.7    0.0%     32.0     10.0     44.3    15.1  MIXED
+cc9079a83ae6dd      59.7    0.0%      5.7     38.8     61.9    64.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+54ec082662920b      59.5    0.0%     51.1     27.3     32.2    42.8  COMPUTE-BOUND (matmul-hot)
+df627ebb1f117f      59.4    0.0%      6.1     38.8     62.3    64.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+34d2f0cd36b7ce      57.1    0.0%      3.7     25.7     35.1    52.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+aa7b444b3fa564      57.0    0.0%      3.7     10.3     16.2    19.1  MIXED
+9d7bd9b49fd8c0      56.1    0.0%      4.2     21.9      3.4    80.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+4a906cf296875e      56.0    0.0%      3.8     21.7      3.4    81.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c0cfbf446cc8b1      55.5    0.0%      4.0      7.4      3.8    77.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9139229e4e7fa5      55.2    0.0%      3.8     44.7     64.6    56.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+27b1734bacbbc2      55.1    0.0%      3.8     79.7     39.3    74.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+3fc736f30a1140      55.1    0.0%      6.4     18.6     61.4    32.9  MIXED
+493870c47e0732      54.8    0.0%      3.8     31.7     26.3    75.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+fa7cdaaf63557e      54.7    0.0%     59.0     25.5     14.7    49.3  COMPUTE-BOUND (matmul-hot)
+e5d1502b8a4ab1      54.6    0.0%      3.9     23.2     34.3    53.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+d9c736cbe97e22      54.4    0.0%      3.9     31.9     33.3    77.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+1df55991a19cda      53.0    0.0%      4.0     78.8     32.8    77.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+94d1377ea5e280      52.9    0.0%      4.0     79.0     39.4    77.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+7a4a6666266e72      50.8    0.0%      6.7     35.5     54.2    59.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+3137c64dd7003f      50.8    0.0%     30.3     31.0     14.9    48.3  MIXED
+8e8b5036dead2f      50.1    0.0%      4.2     22.1     30.2    79.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+ea56d639a94042      48.9    0.0%      4.8     81.0      5.4    65.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+05c329b8f5747a      48.7    0.0%      4.5     81.6      6.7    68.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b75a611fb001e6      48.7    0.0%      4.5     81.7      5.6    64.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c4314e71791caf      48.7    0.0%      4.4     81.6      5.2    65.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+fb93f2cf7375a2      48.6    0.0%      4.4     81.5      5.2    65.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f21308bbbe5f29      48.5    0.0%      4.4     82.0      5.2    65.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+ef721b38ae507c      48.4    0.0%      4.5     25.9      4.3    76.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9911f33eb15dd1      48.2    0.0%      4.6     82.3      4.5    63.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+8151587c3720a3      48.0    0.0%      4.9     81.0      4.2    64.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f193f37e67bc63      47.7    0.0%      4.4     82.2      4.0    64.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f2d5ec80625d46      47.6    0.0%      4.5     82.3      4.0    64.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9722bc4428b2ed      46.2    0.0%      5.0     62.1      5.9    76.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+e014a80d4cd984      45.5    0.0%      4.6     37.9      4.2    76.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+6e9d3d1dcc9cc7      44.4    0.0%      4.9     31.3     30.4    46.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+cf31e68d4df036      44.0    0.0%      4.8     55.2     32.3    58.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+dec4a5ded3f494      43.0    0.0%      4.9     18.1      4.4    50.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+d6305731b95bbe      42.9    0.0%     29.2     10.8     38.1    14.2  MIXED
+5173af3e4e2df0      42.7    0.0%     34.9     53.1     18.9    59.0  MIXED
+83c0f941ee4eed      42.6    0.0%      4.9     29.1     30.4    47.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+3ee1a76de3bf14      42.6    0.0%      4.5     40.8     27.5    67.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+6cc99fca2b9338      42.6    0.0%     31.5     35.8     22.8    55.0  MIXED
+43d1347773e1a2      41.9    0.0%     54.1     28.0      9.9    43.6  COMPUTE-BOUND (matmul-hot)
+8c8f1025182c9c      41.4    0.0%      5.1     60.3      6.5    74.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+aacc7a36d5ae6b      41.1    0.0%      5.1     36.7     52.5    35.6  MIXED
+cbcaf32aa68a09      40.7    0.0%      5.2     68.1     17.9     1.3  MIXED
+004940e36fe7bd      40.5    0.0%      5.2     58.5      4.7    71.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9852cb59e8bb43      40.3    0.0%      5.2     58.8      4.7    70.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+847673029bb8d4      40.2    0.0%      5.2     58.8      4.7    71.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c97914710d2679      40.2    0.0%      5.2     68.9     18.1     1.2  MIXED
+7de530095c9970      40.1    0.0%      5.3     59.0      4.7    71.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+5f3341e7911f9d      39.8    0.0%     53.7     29.5      7.1    45.8  COMPUTE-BOUND (matmul-hot)
+c79fb0f9df76d0      39.0    0.0%      5.4     65.0     13.6    33.9  MIXED
+f540942bc27b96      38.9    0.0%     29.9     37.5     20.0    50.4  MIXED
+ccb054759b6705      38.7    0.0%      5.5     34.6      4.9    73.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+78e1f0e3883099      38.6    0.0%      5.7     35.0      5.4    73.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c2934112196ef4      38.4    0.0%      5.5     31.9     31.7    65.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+05e1355d5cb372      38.0    0.0%     28.9     17.4     37.2    18.0  MIXED
+ba5163ec588c74      37.9    0.0%     13.0     14.6     47.1    25.0  MIXED
+b6c216c1e79151      37.7    0.0%     29.3     10.5     33.0    11.6  MIXED
+ff1abfbd0234a8      37.7    0.0%      5.6     20.6     29.8    50.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+aeec246bc2ede1      36.5    0.0%      5.8     11.0     13.5    16.7  MIXED
+0ce380e50df2ed      36.5    0.0%      6.0     30.4     29.2    43.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+242d83c878132b      36.5    0.0%      6.0     27.2     22.8    70.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+5d405b9039d4ed      36.2    0.0%      6.2     27.5     23.2    70.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b5ab37c2593bc8      36.0    0.0%      5.8     26.9     22.6    70.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+140d4682b43126      35.5    0.0%      6.0     28.6      5.3    62.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f92926c3790555      35.5    0.0%      1.8      1.8      1.7    66.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+aeb3774af3bbf8      35.3    0.0%      6.0      9.4      5.4    71.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+133bc8258e7045      35.0    0.0%      5.5     35.6      5.4    66.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+ea1aff5146bb67      34.9    0.0%      6.1     68.0      5.4    16.3  MIXED
+95073d7b894e5e      34.9    0.0%      6.3     68.8      6.1    16.4  MIXED
+84156dd7313dcc      34.7    0.0%      6.1     68.4      5.4    15.9  MIXED
+aff864478a6f06      34.6    0.0%      5.5     32.4     29.9    69.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b7fe24f7b493f2      34.5    0.0%      6.3     32.7      6.1    68.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+036f3a0e38eacc      34.3    0.0%      6.1     15.9     59.9    24.3  MIXED
+884e3027a4b35f      34.0    0.0%      6.2     32.8      5.6    70.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+07203a20b6e051      33.6    0.0%     45.6     23.3     10.5    31.3  COMPUTE-BOUND (matmul-hot)
+84d9dea2c9411e      33.3    0.0%     35.8     21.5      9.0    23.6  MIXED
+b799544a225515      33.1    0.0%      6.4     29.5     21.6    67.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+5e985628614cf6      33.0    0.0%      6.4     29.7     21.9    67.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9177f71aed8480      32.9    0.0%      6.4     29.7     22.2    68.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+08520d771f6a95      32.6    0.0%      2.0      2.0      1.8    71.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+718060bb06137a      32.4    0.0%     35.1     28.6     16.4    38.7  MIXED
+e0ee7934a1b4d7      32.3    0.0%     17.4     16.7     11.0    39.9  MIXED
+bc006b1c5178fc      32.2    0.0%     17.2     16.8     11.0    41.1  MIXED
+dbcb5272450b9c      32.0    0.0%     17.6     16.9     11.1    40.3  MIXED
+8322b594867f7b      31.7    0.0%      6.7     30.6     26.0    65.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+51c923784c3642      31.7    0.0%      6.6     10.5     15.3    13.4  MIXED
+44cf6623658bcd      31.4    0.0%      7.0     66.9      8.8    63.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+ac7a81b4d3ff20      31.2    0.0%      6.8     66.6      8.1    64.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+6b901f98ef5ad1      31.2    0.0%      6.8     66.5      8.0    64.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c76cee7189b041      31.2    0.0%      6.8     54.2      6.1    60.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+88f3bb3b52bfe6      31.2    0.0%      6.8     66.7      8.1    64.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+02673e32de6856      31.2    0.0%      6.8     66.7      8.1    64.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+406bdf0c5560b9      31.1    0.0%      6.8     66.9      8.2    64.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+6ef11f2585d8f5      31.1    0.0%      6.8     67.0      8.2    63.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b7c876a0c3f0d0      31.1    0.0%      6.8     66.9      8.2    64.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b33ef8c7dc6783      31.0    0.0%      6.8     67.0      8.2    63.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+e2afa68708473b      31.0    0.0%      6.8     67.1      8.2    65.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+485ef0fe8c6a59      31.0    0.0%      6.8     67.1      8.2    64.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+d742d018a122f4      30.9    0.0%      6.8     67.2      8.2    64.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+60d35b58646ce6      30.9    0.0%      6.8     67.2      8.2    64.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f6107d81866c83      30.9    0.0%      6.8     67.7      8.6    63.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+7f0abb4b1fd360      30.9    0.0%      6.8     35.4      6.3    66.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+a58e84511d9d02      30.9    0.0%      7.2     55.5      6.9    59.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+ec0e22b1e16f74      30.8    0.0%      6.8     67.4      8.2    63.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+11bc4f4b4450f6      30.8    0.0%      6.8     67.5      8.2    64.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+83a7df0dc5b898      30.8    0.0%     30.7     21.3      9.7    25.0  MIXED
+3a8f05b784d44a      30.8    0.0%      6.9     55.0      6.2    60.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+411b1dfe00f562      30.7    0.0%      6.9     55.2      6.2    60.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+2bcb2c7496697f      30.7    0.0%     31.1     21.4      9.7    23.7  MIXED
+a1f9597f1b5fb2      30.4    0.0%      7.0     30.9      6.2    65.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+67e226c657ad76      30.2    0.0%      7.0     28.3      6.2    63.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+ddd13ea8d15b35      30.1    0.0%      7.3     33.2     21.1    63.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+55018da83a5558      30.0    0.0%      7.0     32.6     20.3    64.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+ea5a61a97bcc12      29.7    0.0%      7.1     32.8     20.8    65.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b7f1e5aff86cf0      29.7    0.0%      7.1     32.9     20.5    64.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+03270a6b17d389      29.5    0.0%      7.2     50.0      6.7    46.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+28555839b43dbb      29.1    0.0%      7.2     32.8      6.9    17.3  MIXED
+66def806d9635d      29.0    0.0%      7.3     33.2     29.9    63.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+1fe2b278ac617f      29.0    0.0%      7.6     27.6     25.6    53.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+fb6d3f60646c45      29.0    0.0%     29.2     44.6      7.9    40.5  MIXED
+6f2aed46b3463f      28.9    0.0%      7.3     21.4     26.7    39.7  MIXED
+d0b0ccb5dfa05a      28.7    0.0%      7.4     20.6      6.6    64.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+5e514e5299c9cc      28.6    0.0%      6.7     50.1      8.8    51.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f156a203b3b913      28.5    0.0%      7.0     51.2      9.7    50.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b818700c9e35db      28.4    0.0%      6.7     50.5      8.9    51.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+9af1cbd293a0c4      28.4    0.0%      6.8     50.5      8.9    50.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+8f6c3c18dd6b96      28.4    0.0%      6.8     50.5      8.9    50.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+11e3bac14d4a54      28.4    0.0%      2.3      2.3      2.1    59.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+07bd3e7d02226a      28.3    0.0%      6.8     50.6      8.9    51.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+bf8c2e6e9e6112      28.2    0.0%     25.9     17.4     16.3    15.8  MIXED
+f9d7dd489f9bd8      27.9    0.0%      7.6     63.0      9.0    61.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b1f4ac82c72f6f      27.8    0.0%      7.6     63.3      9.1    61.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0e404b26d88525      27.8    0.0%      6.9     51.7      9.1    52.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+744b53733502e5      27.7    0.0%      6.9     51.8      9.1    52.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c9cd3368ac2e1e      27.1    0.0%     23.2     18.9      7.6    14.8  MIXED
+ed38719967d31a      27.1    0.0%      7.8     31.2     18.4    58.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c7fa1346a4d8aa      27.1    0.0%      7.5     53.9     10.3    53.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+670fd32d085edd      26.9    0.0%      8.3     50.3     56.2    31.8  MIXED
+9fc43662fe01be      26.9    0.0%      7.9     49.4     55.5    31.7  MIXED
+927aafea136bb4      26.8    0.0%      8.2     50.4     56.4    33.4  MIXED
+c32a1d87df6591      26.8    0.0%      7.2     53.7      9.4    53.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+eedb1c15a1c7f2      26.7    0.0%      7.2     28.0     21.9    49.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+2858d77f38f826      26.7    0.0%      7.9     49.8     55.7    33.3  MIXED
+cd121f757f1974      26.7    0.0%      8.1     53.8      9.6    54.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+7ba907f5d21415      26.7    0.0%      7.2     53.8      9.5    54.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+dda4a094642ff5      26.7    0.0%      7.9     59.1      7.1    55.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+017737cf200b35      26.6    0.0%      8.0     25.6      7.1    45.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b235ad7609f87b      26.5    0.0%      8.4     60.2      8.1    54.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+414b3cf3541cad      26.4    0.0%     25.3     15.1     22.3     8.5  MIXED
+9adba52242c084      26.4    0.0%      8.4     60.6      8.0    53.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f6bfd0987db32d      26.2    0.0%      8.4     60.9      8.0    53.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+8821a55767042c      26.2    0.0%      7.3     54.8      9.7    55.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+48455b23321299      26.2    0.0%      7.3     54.8      9.6    54.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+ea5b64e3aac07d      26.1    0.0%      7.3     54.9      9.6    55.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+bd46aa16304548      26.1    0.0%      7.4     55.0      9.7    55.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+23e34fdcad2973      25.9    0.0%      2.5      2.5      2.3    64.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+ad837b3d64c384      25.7    0.0%      8.6     28.8     29.6    53.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c5f62735ed5f86      25.7    0.0%      8.2     21.6     25.2    33.9  MIXED
+d0d4e7c889b6b9      25.6    0.0%      8.2     22.9      7.4    58.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+44cdbc5084f5f7      25.5    0.0%      8.3     23.0      7.4    58.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+7bc2addeda78a6      25.5    0.0%      8.3     23.0      7.4    59.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+471db30812d1a8      25.5    0.0%      8.3     23.1      7.5    59.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+1bfe3f82b8ea98      25.2    0.0%      8.4     11.8      7.5    58.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+27c3e0e3da5a9b      25.1    0.0%     38.0     28.7     10.9    28.3  MIXED
+4a3114003643f5      25.0    0.0%      8.6     27.1     23.1    36.8  MIXED
+ac6b936e79a462      24.6    0.0%      7.8     27.4     24.7    39.9  MIXED
+1c3f77736cfc0e      24.4    0.0%      8.6     16.4     46.3    17.3  MIXED
+f072dee57249d8      23.6    0.0%      9.0     19.9     19.4    35.6  MIXED
+ad58387e417788      23.6    0.0%      9.3     42.0      9.0    14.2  MIXED
+b331559ecd9799      23.5    0.0%      9.3     31.8     20.7    41.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+586925a6f58bae      23.4    0.0%      8.2     48.0     13.1    43.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+d7fc670a7bc9e2      23.3    0.0%      8.2     48.1     13.1    42.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+dc22eb3c02e267      23.2    0.0%      8.2     37.3      8.2    14.7  MIXED
+56266011d30345      23.2    0.0%      9.1     14.1      8.2    55.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+4874bbc0f17471      23.0    0.0%      9.2     14.2      8.3    55.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f5aa54e1764da2      22.7    0.0%      9.3     61.2      8.3    48.5  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+7993b5104e0ec0      22.7    0.0%      8.9     37.7      9.5    29.5  MIXED
+48b6f609218512      22.6    0.0%     24.5     38.8     15.7    31.9  MIXED
+3d8a2f7b268095      22.6    0.0%      9.7     62.7      9.4    44.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+cb8701387bb795      22.3    0.0%      8.6     37.2      8.5    30.0  MIXED
+490f24d8798545      22.3    0.0%      9.5     62.5      8.6    48.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0f774fbd5a8f3a      22.2    0.0%      9.5     62.5      8.5    48.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+2e10546dea34c8      22.1    0.0%      8.7     37.8      8.9    29.0  MIXED
+8b5b022d3a4570      22.1    0.0%      8.6     32.7     11.5    33.5  MIXED
+c844607c81465b      21.9    0.0%      9.7     26.8      8.6    50.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+7c2f34fc5dc382      21.9    0.0%      8.7     33.0     11.5    33.0  MIXED
+f3afbb3e0c0a1c      21.8    0.0%      8.8     33.2     11.6    33.8  MIXED
+1358bcc8e3ade9      21.8    0.0%      8.8     33.2     11.6    32.8  MIXED
+feb5874d7ed809      21.7    0.0%      8.8     33.3     11.7    32.3  MIXED
+9dd3e317c85e6c      21.7    0.0%      8.8     33.2     11.6    34.7  MIXED
+09b88455bb5db0      21.7    0.0%      8.8     33.3     11.7    32.4  MIXED
+c862f1b19295f3      21.7    0.0%      9.8     27.2      8.8    52.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+8c11ffa17fe685      21.7    0.0%      9.7     15.4     13.6    10.2  MIXED
+f67929475ae48c      21.7    0.0%      9.7     54.4     11.6    47.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+609d2a5fefeba1      21.7    0.0%      8.8     33.3     11.7    31.9  MIXED
+1063ec412a6c3a      21.7    0.0%      9.8     54.5     11.7    48.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+23085fc3781949      21.7    0.0%      9.8     54.4     11.6    48.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+8b21459c144671      21.7    0.0%      9.8     54.5     11.7    48.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+1ebd240bcbf022      21.6    0.0%     10.1     33.5     11.7    32.9  MIXED
+b1adf5949f2ef6      21.6    0.0%      9.8     54.5     11.7    48.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+6dca3e49c5674f      21.6    0.0%      9.8     54.6     11.7    47.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+6eba41896c5a55      21.6    0.0%      9.8     54.6     11.7    49.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+3b086b9ce1e452      21.6    0.0%      8.9     38.3      8.8    31.1  MIXED
+ae9f0e479271bb      21.6    0.0%      9.8     28.6     19.8    35.0  MIXED
+45dc4a1c7fa656      21.6    0.0%      9.8     27.3      8.8    51.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+5c2826237f6f5a      21.6    0.0%      9.8     54.7     11.7    47.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+2cc5903cacb69e      21.6    0.0%      9.8     54.7     11.7    48.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+43cc50204ef9de      21.5    0.0%      9.8     54.8     11.8    47.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+4c1dd64ed67c48      21.5    0.0%      9.8     54.8     11.8    49.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+aeaf1d41fccda1      21.5    0.0%      9.8     54.8     11.7    47.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+8345ef9bda8b25      21.5    0.0%      9.8     54.8     11.7    47.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+325c29a7b82544      21.5    0.0%      9.8     27.3      8.8    51.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+f6a95a6b847bf3      21.5    0.0%      9.8     54.8     11.7    47.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+5495584d5bfbac      21.5    0.0%      9.8     54.9     11.8    48.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+88f5e7caa06a56      21.5    0.0%      9.9     54.9     11.8    47.7  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+286795e716f587      21.3    0.0%      3.0      3.0      2.8    44.0  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0cd49350ed9ee6      21.0    0.0%     10.0     37.2      9.0    48.3  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+2c24166702e9df      20.9    0.0%     21.5     22.7     19.0    11.1  MIXED
+c7c3c49a4f9bd8      20.7    0.0%     10.2     19.1     19.7    30.6  MIXED
+71f3dabe24677a      20.4    0.0%     11.0     36.7     10.5    43.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+47e08c5d0866f6      20.0    0.0%     10.6     26.7      9.5    47.8  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+1c7014ff75cffb      20.0    0.0%     10.5     18.5     17.5    23.3  MIXED
+1b492b3edd1468      19.9    0.0%     10.6     46.7     15.3    41.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+bee1c7c4fed114      19.8    0.0%     10.6     46.9     15.4    42.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+36e7158c495f75      19.7    0.0%     10.0     37.7     13.8    36.2  MIXED
+fc122c474748ab      19.6    0.0%      9.7     36.8     12.9    35.6  MIXED
+72ea122e170d6f      19.6    0.0%      9.7     36.9     12.9    36.3  MIXED
+afa21a67d603b0      19.5    0.0%     10.8     30.6      9.8    47.9  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0a61930d19e453      19.3    0.0%      9.9     37.3     13.1    38.2  MIXED
+b665de10ffdf45      19.3    0.0%     11.4     31.8     11.0    44.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+b1582fa9d02cfc      19.3    0.0%     10.9     30.6      9.9    38.1  MIXED
+d3af0717fac3cc      19.1    0.0%     10.0     37.8     13.2    37.9  MIXED
+1d00259f34ff22      19.1    0.0%     10.0     38.0     13.2    36.9  MIXED
+816e9ccc26d87a      19.0    0.0%     11.1     31.1      9.9    45.4  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+c4d116b7a530c4      19.0    0.0%     11.1     31.1     10.0    46.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+cd9ff1e7a3246f      19.0    0.0%     11.1     31.1      9.9    46.1  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+0bc57cf5edb739      18.9    0.0%     10.1     38.2     13.3    36.5  MIXED
+ddb1195d8d7b93      18.9    0.0%      3.4      3.4      3.2    37.2  MIXED
+afd7a613f28793      18.5    0.0%      3.5      3.5      3.2    36.0  MIXED
+d3e5902af600fd      18.4    0.0%     11.5     32.2     10.3    34.3  MIXED
+8d60cd66aa11a8      18.4    0.0%      3.5      3.5      3.2    49.6  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+ed5132abdf2b6b      18.3    0.0%      3.5      3.5      3.2    35.7  MIXED
+e29a904c49db90      18.2    0.0%      3.5      3.5      3.2    34.3  MIXED
+f325c4bd0a3759      18.2    0.0%     11.6     26.7     10.5    28.8  MIXED
+10f931641fe8ea      18.2    0.0%     11.6     25.1     11.0     8.6  MIXED
+d63e3aa00b912a      18.1    0.0%      3.5      3.5      3.3    36.6  MIXED
+827007449b8e02      18.0    0.0%     11.7     40.0     10.5    30.7  MIXED
+27e1d6fc0508a8      18.0    0.0%     11.7     27.0     10.5    28.0  MIXED
+b17a68f707a114      18.0    0.0%     11.1     37.8     15.3    31.3  MIXED
+445407316a6015      18.0    0.0%     19.6     21.6     14.2     9.3  MIXED
+a399321efc9012      18.0    0.0%     11.3     38.0     15.3    32.0  MIXED
+311d112bfc7906      17.9    0.0%     10.6     36.8     14.1    32.3  MIXED
+f891a000526463      17.9    0.0%     19.7     21.7     15.7     8.3  MIXED
+3840c4eb12978f      17.9    0.0%     12.3     28.6     11.9    26.9  MIXED
+7e834293801dde      17.9    0.0%     11.9     27.2     10.6    28.2  MIXED
+36b4f1fd1272b3      17.8    0.0%     10.7     36.9     14.2    32.7  MIXED
+a5733d30b84620      17.8    0.0%     10.8     36.9     14.2    33.7  MIXED
+1c400aa8d94c45      17.8    0.0%     10.7     36.9     14.2    32.1  MIXED
+5260ebbdbe7a58      17.8    0.0%     10.8     37.7     15.0    31.9  MIXED
+edf4f2e2d3b921      17.8    0.0%     10.6     37.7     14.8    32.3  MIXED
+210180f13cf306      17.8    0.0%     10.8     37.5     14.6    31.9  MIXED
+c7df26ab5908e5      17.8    0.0%     10.8     37.1     14.2    32.4  MIXED
+dd4588b357e517      17.7    0.0%     10.8     37.1     14.2    32.9  MIXED
+f53643bbd2befc      17.7    0.0%     10.8     37.1     14.3    32.0  MIXED
+bf6b85a55fbd26      17.7    0.0%     10.8     37.1     14.3    33.0  MIXED
+4f89620281451e      17.7    0.0%     10.8     37.2     14.3    32.4  MIXED
+5701651d492d11      17.7    0.0%     10.7     37.8     14.9    32.3  MIXED
+2db6d301486e96      17.6    0.0%     10.9     37.3     14.3    32.9  MIXED
+9775ecb871323f      17.6    0.0%     12.0     44.4     10.8    29.0  MIXED
+6620511182697a      17.5    0.0%     10.9     37.6     14.3    34.0  MIXED
+b7556ea42a077a      17.5    0.0%     10.9     37.6     14.4    33.8  MIXED
+2c046570ac3d12      17.5    0.0%     11.0     38.4     15.1    32.5  MIXED
+e5f08eae7088d3      17.5    0.0%     11.4     38.7     15.5    32.8  MIXED
+d70a16c825653a      17.5    0.0%     11.0     37.7     14.4    32.6  MIXED
+2661300d146c5c      17.5    0.0%     12.1     19.6     11.0    39.3  MIXED
+aac76e8bfca837      17.5    0.0%     10.9     37.7     14.4    32.4  MIXED
+500ffcb9ec6d7c      17.4    0.0%     11.0     37.7     14.5    33.0  MIXED
+e52579699a906d      17.4    0.0%     11.0     38.4     15.2    32.7  MIXED
+6532df4b18c596      17.4    0.0%     11.0     37.9     14.5    33.0  MIXED
+99c0f63cb4ded3      17.4    0.0%     11.8     39.3     15.9    32.8  MIXED
+e1b28572c4b36e      17.4    0.0%     11.0     37.9     14.5    32.9  MIXED
+eb972f4c8b1de4      17.4    0.0%     12.2     19.6     10.9    39.2  MIXED
+8046d94760a471      17.4    0.0%     11.0     37.9     14.5    32.9  MIXED
+f1269a3e8af73b      17.4    0.0%     11.0     37.9     14.5    33.1  MIXED
+37a409ef27613c      17.3    0.0%     11.1     38.0     14.5    32.8  MIXED
+33dcc941ea0985      17.3    0.0%     11.1     38.0     14.6    32.7  MIXED
+060ce857871f1e      17.3    0.0%     11.0     38.0     14.6    32.9  MIXED
+a9a822d58567d7      17.2    0.0%     12.3     34.4     31.8    15.2  MIXED
+8ba27c65398052      17.2    0.0%     12.3     33.8     31.3    12.9  MIXED
+cc79d4b55ae06e      17.1    0.0%     12.4     34.0     31.4    13.8  MIXED
+c85742a2dbe975      17.0    0.0%     12.4     34.1     31.5    14.4  MIXED
+8fe944393d6036      17.0    0.0%     12.4     23.0     11.1    39.9  MIXED
+8bf24177cd4d3b      16.9    0.0%     12.5     27.7     11.2    38.2  MIXED
+3afce526d148bd      16.8    0.0%     12.7     35.4     15.0    27.9  MIXED
+740ca3e5f55dd9      16.5    0.0%     11.6     16.4     15.4    12.9  MIXED
+ae61c62b052960      16.3    0.0%     11.7     16.6     15.5    12.2  MIXED
+dffb5dcd453485      16.3    0.0%     19.0     26.6     13.0     8.4  MIXED
+50ea2ef699671d      16.3    0.0%     13.0     24.5     16.7    21.0  MIXED
+9eab8a14e02ce8      16.2    0.0%     11.8     16.7     15.5    13.3  MIXED
+e2447ba4dd3d65      16.2    0.0%     11.8     16.7     15.6    13.2  MIXED
+62c14839ffb430      16.1    0.0%     11.8     16.8     15.6    11.9  MIXED
+e9f247ba90e144      16.1    0.0%     11.9     16.8     15.6    12.0  MIXED
+f63d9d8c3b0392      15.9    0.0%     13.8     38.6     17.3    29.7  MIXED
+8f200815267db7      15.9    0.0%     11.9     17.8     16.6    11.8  MIXED
+36e86944fcb681      15.8    0.0%     13.8     39.0     17.3    29.5  MIXED
+40c8c3f54fe3c9      15.7    0.0%     13.9     39.1     17.5    29.5  MIXED
+0e7db4f92f164d      15.7    0.0%     12.7     18.6     17.6    12.4  MIXED
+8f1d633ced5127      15.7    0.0%     14.0     23.6     13.5    33.4  MIXED
+781967e0f6a799      15.7    0.0%     13.5     38.0     16.1    30.0  MIXED
+7a627ef39cd79a      15.6    0.0%     15.2     38.1     16.3    29.9  MIXED
+dab6c323a0e6d4      15.6    0.0%     13.6     38.1     16.3    32.3  MIXED
+db5b64e15a9fa5      15.6    0.0%     13.6     38.2     16.2    30.6  MIXED
+763bb5b67b177b      15.5    0.0%     13.6     38.2     16.3    30.5  MIXED
+4b6577dc8126d6      15.5    0.0%      4.1      4.1      3.8    40.2  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+809f0e0dcd2cdc      15.5    0.0%     13.6     38.4     16.3    30.8  MIXED
+75f35abbef646d      15.4    0.0%     13.7     38.6     16.4    29.8  MIXED
+bda30b52d17c6f      15.4    0.0%     13.7     38.9     16.7    30.6  MIXED
+0bb1111355cd9f      15.4    0.0%     13.7     38.6     16.4    29.7  MIXED
+b9a50f2be27d05      15.4    0.0%     13.7     38.5     16.4    31.1  MIXED
+679eea18bc0da8      15.4    0.0%      4.2      4.2      3.8    25.8  MIXED
+6ffffd146b2b64      15.3    0.0%     13.7     38.7     16.5    30.5  MIXED
+bf2d7f7c54d538      15.3    0.0%     13.8     38.7     16.5    31.8  MIXED
+3199620e5f4952      15.1    0.0%      4.3      4.3      3.9    24.2  MIXED
+5b752278689631      15.1    0.0%     13.9     26.2     12.8     3.7  MIXED
+cd69cefbcb8d2a      15.0    0.0%     15.5     26.3     12.7     3.7  MIXED
+a260a7b936fb48      14.8    0.0%     14.3     22.9     12.9    26.7  MIXED
+11355d7d03acf5      14.5    0.0%      4.4      4.4      4.0    24.1  MIXED
+9b643684aa21be      14.5    0.0%     14.6     23.3     13.1    25.9  MIXED
+c92153022ca524      14.4    0.0%     13.5     20.0     18.8    13.7  MIXED
+73491f95bc7101      14.3    0.0%     15.3     34.9     19.2    24.3  MIXED
+35ed8c7dde9e15      14.3    0.0%      4.5      4.5      4.1    26.1  MIXED
+05368cb9d83399      14.3    0.0%     14.9     18.9     17.7    13.6  MIXED
+26fd0ebf86d98b      14.3    0.0%     14.8     19.0     17.8    13.8  MIXED
+811648b6d42378      14.2    0.0%     14.0     20.3     19.1    13.7  MIXED
+35bc87fdbefad2      14.2    0.0%     14.9     33.6     17.8    24.5  MIXED
+654ee179044c34      14.2    0.0%      4.5      4.5      4.1    26.3  MIXED
+c21b2d5ebb10ac      14.2    0.0%     14.9     33.6     17.7    24.8  MIXED
+d209362cd33bb9      14.2    0.0%     14.9     33.6     17.8    24.8  MIXED
+f35dcf6e3e62dd      14.2    0.0%     14.9     33.8     17.9    25.6  MIXED
+42e4cc25e39f35      14.1    0.0%     15.0     33.7     17.9    24.9  MIXED
+a3068842744a28      14.1    0.0%     14.7     21.0     19.9    13.8  MIXED
+6ba0dc1903553f      14.1    0.0%     14.9     33.8     17.9    24.3  MIXED
+13b1c6fbe2dc54      14.1    0.0%     15.0     33.9     18.0    24.9  MIXED
+1ff43de88c0dea      14.1    0.0%     15.0     34.0     18.0    24.9  MIXED
+4f89b715ba5787      14.1    0.0%     15.1     33.9     18.0    26.3  MIXED
+b83932e6f086eb      14.1    0.0%     15.1     34.1     18.1    25.6  MIXED
+5dbc5b8048a0b3      14.0    0.0%     15.1     34.0     17.9    24.7  MIXED
+4b33aa0a8494db      14.0    0.0%     15.9     31.7     15.2     4.0  MIXED
+918197f4d29387      14.0    0.0%     15.1     34.0     18.1    24.8  MIXED
+2e991f54401d59      14.0    0.0%     15.2     21.8     20.3    13.8  MIXED
+ec786eac3c45e6      14.0    0.0%     15.0     34.1     18.0    24.3  MIXED
+e5c7528134a0a1      14.0    0.0%     15.2     34.2     18.0    24.4  MIXED
+1d946b4dbc59b9      13.9    0.0%     15.2     34.3     18.2    24.2  MIXED
+8c9bf3140bb99d      13.9    0.0%     15.1     30.4     13.6     4.2  MIXED
+70b89cb0984b5e      13.9    0.0%     13.7     19.4     18.2    15.5  MIXED
+fc3b718673f720      13.9    0.0%     15.1     29.9     13.6     4.9  MIXED
+6d3f988ac7a31d      13.9    0.0%     15.1     30.3     13.7     3.8  MIXED
+7b406c5836c43e      13.9    0.0%     15.2     29.9     13.6     4.3  MIXED
+4af73b2d216f7e      13.9    0.0%     13.8     19.4     18.2    14.7  MIXED
+15f7a440d337a7      13.8    0.0%     15.2     30.0     13.7     5.5  MIXED
+f57fda21b7cc88      13.8    0.0%     16.1     31.7     15.4     4.2  MIXED
+6b57c7c451f4fc      13.8    0.0%     13.8     19.7     18.3    14.0  MIXED
+87274e32d1de1d      13.8    0.0%     14.0     19.5     18.3    13.9  MIXED
+8e6dce23ebcf82      13.8    0.0%     15.3     30.3     13.7     3.8  MIXED
+b924a27f9e2890      13.8    0.0%     13.8     19.6     18.3    14.1  MIXED
+e3332758bf1869      13.8    0.0%     15.3     30.7     13.7     4.1  MIXED
+771e7c02a5048d      13.8    0.0%     13.9     19.7     18.3    15.4  MIXED
+6f5fd07efd08e4      13.7    0.0%     15.3     19.7     18.4    14.4  MIXED
+bf4f9fb1ae81eb      13.7    0.0%     15.4     30.1     13.8     4.1  MIXED
+cf73e2ff5b0932      13.7    0.0%     13.9     19.8     18.4    14.1  MIXED
+3967436fc5cfeb      13.7    0.0%      4.7      4.7      4.3    28.9  MIXED
+da81bcc046258d      13.7    0.0%     14.0     19.8     18.5    14.1  MIXED
+6aad2b27defc57      13.6    0.0%     14.0     19.8     18.5    14.9  MIXED
+51d756d1ec40ee      13.6    0.0%     15.5     24.1     13.9    23.4  MIXED
+4a40440715cf6d      13.6    0.0%     14.0     19.8     18.6    15.4  MIXED
+a28574ee6db598      13.6    0.0%     14.0     19.9     18.5    15.6  MIXED
+32e8b22fa6ff52      13.6    0.0%      4.7      4.7      4.3    28.3  MIXED
+1ea100506bb8fb      13.6    0.0%     14.1     19.8     18.6    14.2  MIXED
+e42329faab0078      13.5    0.0%     14.1     19.9     18.7    14.8  MIXED
+9338f84d07fd87      13.5    0.0%     14.2     20.0     18.8    14.2  MIXED
+f99cc91977d21a      13.5    0.0%     14.2     20.0     18.7    15.3  MIXED
+51cdf590130d51      13.5    0.0%     14.2     20.1     18.8    15.0  MIXED
+d82106352accdd      13.5    0.0%     14.2     20.0     18.8    15.1  MIXED
+8abf3239e7ebc5      13.4    0.0%     15.7     28.3     14.1     6.8  MIXED
+51080511a7f7ad      13.3    0.0%      4.8      4.8      4.4    27.8  MIXED
+e022005a9e488f      13.3    0.0%      4.9      4.9      4.5    27.4  MIXED
+10e41b2e8bd330      13.1    0.0%     16.1     25.3     14.6     3.3  MIXED
+145eb0da747c3c      13.0    0.0%     16.2     25.0     14.6     7.9  MIXED
+b498a249111da1      13.0    0.0%     16.3     25.5     17.5     3.4  MIXED
+33f6fb6a90c199      12.9    0.0%     16.3     25.6     16.8     2.9  MIXED
+871781dfe74adc      12.9    0.0%     16.4     25.6     17.4     4.2  MIXED
+9ad866ba6d9f4c      12.9    0.0%      5.0      5.0      4.6    30.1  MIXED
+e24f7f804f35b5      12.8    0.0%     16.5     30.5     14.8    19.2  MIXED
+661454c1af51c7      12.7    0.0%      5.0      5.0      4.6    29.3  MIXED
+d1c55b61259cea      12.7    0.0%     16.5     26.1     14.9     3.4  MIXED
+9f086d9c27e730      11.7    0.0%     18.0     28.2     16.2     8.8  MIXED
+19e99b3f79696b      11.7    0.0%     18.0     24.7     17.7     2.5  MIXED
+11bf5135893bfa      11.5    0.0%     18.4     28.7     16.5     8.8  MIXED
+neff_109868314      11.0    0.0%      5.8      7.3     13.3     2.2  MIXED
+3a5a145086288c      10.8    0.0%     19.5     24.8     18.6     2.8  MIXED
+b0fd7c0e724d33      10.8    0.0%     19.7     25.0     18.6     2.4  MIXED
+3f40be3f646f0f      10.8    0.0%     19.6     24.9     17.6     2.9  MIXED
+6df03f96e2fc7b      10.8    0.0%     19.8     24.9     18.7     2.8  MIXED
+84833abbf0b6a6      10.8    0.0%     22.1     24.8     20.1     5.7  MIXED
+bfacf2554c66cc      10.7    0.0%     19.7     25.1     17.8     2.3  MIXED
+4581fababc7c8e      10.7    0.0%     19.7     24.6     17.8     6.3  MIXED
+e629b66e76e61a      10.7    0.0%     20.9     27.4     21.1     3.1  MIXED
+eb1172dc517e0f      10.7    0.0%     19.8     25.1     18.8     2.8  MIXED
+d9df6091eeab10      10.6    0.0%     20.3     27.0     20.7     3.0  MIXED
+a8e36acd4ef541      10.6    0.0%      6.1      6.1      5.6     5.9  MIXED
+82b457189c85d9      10.6    0.0%     20.6     27.3     21.0     3.0  MIXED
+047f94fbdfd318      10.6    0.0%     19.9     25.1     20.1     3.4  MIXED
+ea1fea463c37d1      10.6    0.0%     19.9     25.4     19.1     2.3  MIXED
+b1735ecde0bbc7      10.6    0.0%     20.0     25.5     19.0     2.9  MIXED
+552b2734c543a1      10.6    0.0%     20.0     25.4     19.0     2.8  MIXED
+df01a7f961797c      10.6    0.0%     20.7     27.4     21.1     2.6  MIXED
+9fedad52b0587d      10.6    0.0%     20.2     25.5     19.2     2.8  MIXED
+669c37700e5a17      10.6    0.0%     20.1     25.0     20.3     3.7  MIXED
+f8be084df3e7bc      10.5    0.0%     20.1     25.0     20.3     4.2  MIXED
+1a6d2f212f0eab      10.5    0.0%     20.0     25.5     19.1     2.3  MIXED
+fce1c0d1ed76b3      10.5    0.0%     20.1     25.6     19.0     2.6  MIXED
+70a5162ab71e3c      10.5    0.0%     20.2     25.6     19.1     2.8  MIXED
+6f97d96a20b7f2      10.5    0.0%     20.1     25.3     20.2     4.5  MIXED
+1b9068ff50cf01      10.5    0.0%     20.1     25.2     20.4     3.4  MIXED
+bd17c25020fa90      10.5    0.0%     20.1     25.6     19.0     2.6  MIXED
+951ed4afd99bd2      10.5    0.0%     21.1     27.9     21.5     3.0  MIXED
+06f51eeb8ae1ab      10.5    0.0%     20.0     26.2     21.4     4.2  MIXED
+df417e9c9a3010      10.5    0.0%     20.0     26.4     21.5     4.4  MIXED
+3e09d63c1d0102      10.5    0.0%     20.1     25.2     20.4     3.7  MIXED
+41e982d5c6ba57      10.5    0.0%     20.3     25.7     19.4     4.2  MIXED
+47c1d7bfbb05b7      10.5    0.0%     20.2     25.5     20.5     3.6  MIXED
+4613fea218b7ed      10.5    0.0%     20.3     25.7     19.3     6.3  MIXED
+7930e875f20869      10.5    0.0%     20.2     26.0     19.4     2.6  MIXED
+4a64c23eb7db63      10.4    0.0%     20.2     25.5     20.5     3.7  MIXED
+e790b7eaa01a96      10.4    0.0%     20.2     25.7     19.3     2.4  MIXED
+4ebe3032d35c73      10.4    0.0%     20.2     25.3     20.5     3.6  MIXED
+a39d46891bfc9d      10.4    0.0%     20.8     27.3     22.4     3.6  MIXED
+5947499258fec0      10.4    0.0%     20.3     25.8     19.3     2.3  MIXED
+b2cd23388dfbb3      10.4    0.0%     20.3     25.8     19.4     2.7  MIXED
+7dfdc2d388507c      10.4    0.0%     20.3     25.8     19.4     2.4  MIXED
+024895d41e3385      10.4    0.0%     20.3     26.0     19.4     4.8  MIXED
+42b187e9f8b0e2      10.4    0.0%     20.3     25.4     20.5     3.7  MIXED
+8db84c4f0c11aa      10.4    0.0%     20.3     25.8     19.3     2.6  MIXED
+f3e40d0afc7ddf      10.4    0.0%     20.2     25.8     19.4     2.9  MIXED
+4167612e78bd12      10.4    0.0%     20.4     25.9     19.2     4.6  MIXED
+460fb9db765c14      10.4    0.0%     20.3     25.9     19.4     2.3  MIXED
+fb6a0ec44b0d16      10.4    0.0%     20.3     27.0     21.9     4.3  MIXED
+d120180340aee6      10.4    0.0%     20.3     25.8     19.4     4.5  MIXED
+d63c8fed9cadb0      10.4    0.0%     20.2     26.9     21.4     3.1  MIXED
+1a1da6ef9d599b      10.4    0.0%     20.3     26.0     19.3     3.1  MIXED
+c3f3336dfeadd2      10.4    0.0%     20.3     25.9     19.4     3.1  MIXED
+99965f5c2d41c6      10.4    0.0%     20.4     25.6     20.7     3.7  MIXED
+3048eec5a95ddb      10.3    0.0%      6.2      7.9     14.4     2.4  MIXED
+cf8755e7c5eae8      10.2    0.0%      6.3      6.3      5.8    11.5  MIXED
+5ac47561629014      10.1    0.0%      6.4      8.3      7.7     1.2  MIXED
+
+=== MODEL-LEVEL MFU (from tflops_report.json) ===
+  peak 3040 TFLOPS @ 16 cores | avg 37.1 TFLOPS | MFU 1.22%
+    T5 (prompt 0)              1762.0 ms     2.7 TFLOPS  MFU  0.09%
+    DiT+VAE (prompt 0)       105315.3 ms    21.5 TFLOPS  MFU  0.71%
+    T5 (prompt 1)                43.2 ms   112.1 TFLOPS  MFU  3.69%
+    DiT+VAE (prompt 1)        58366.9 ms    38.9 TFLOPS  MFU  1.28%
+    T5 (prompt 2)                25.5 ms   189.8 TFLOPS  MFU  6.24%
+    DiT+VAE (prompt 2)        58406.7 ms    38.8 TFLOPS  MFU  1.28%
+    T5 (prompt 3)                43.8 ms   110.6 TFLOPS  MFU  3.64%
+    DiT+VAE (prompt 3)        58259.5 ms    38.9 TFLOPS  MFU  1.28%
+    T5 (prompt 4)                24.9 ms   194.7 TFLOPS  MFU  6.40%
+    DiT+VAE (prompt 4)        58301.0 ms    38.9 TFLOPS  MFU  1.28%
+    T5 (prompt 5)                25.8 ms   187.8 TFLOPS  MFU  6.18%
+    DiT+VAE (prompt 5)        58109.1 ms    39.0 TFLOPS  MFU  1.28%
+    T5 (prompt 6)                25.8 ms   187.7 TFLOPS  MFU  6.17%
+    DiT+VAE (prompt 6)        58319.8 ms    38.9 TFLOPS  MFU  1.28%
+    T5 (prompt 7)                43.4 ms   111.7 TFLOPS  MFU  3.67%
+    DiT+VAE (prompt 7)        58116.8 ms    39.0 TFLOPS  MFU  1.28%
+    T5 (prompt 8)                25.7 ms   188.7 TFLOPS  MFU  6.21%
+    DiT+VAE (prompt 8)        58206.3 ms    39.0 TFLOPS  MFU  1.28%
+    T5 (prompt 9)                25.3 ms   191.3 TFLOPS  MFU  6.29%
+    DiT+VAE (prompt 9)        58235.4 ms    39.0 TFLOPS  MFU  1.28%
+    T5 (prompt 10)               25.1 ms   193.1 TFLOPS  MFU  6.35%
+    DiT+VAE (prompt 10)       58313.2 ms    38.9 TFLOPS  MFU  1.28%
+    T5 (prompt 11)               25.6 ms   188.9 TFLOPS  MFU  6.21%
+    DiT+VAE (prompt 11)       58348.5 ms    38.9 TFLOPS  MFU  1.28%
+    T5 (prompt 12)               43.2 ms   112.2 TFLOPS  MFU  3.69%
+    DiT+VAE (prompt 12)       58317.2 ms    38.9 TFLOPS  MFU  1.28%
+    T5 (prompt 13)               24.9 ms   194.9 TFLOPS  MFU  6.41%
+    DiT+VAE (prompt 13)       58140.2 ms    39.0 TFLOPS  MFU  1.28%
+    T5 (prompt 14)               43.9 ms   110.5 TFLOPS  MFU  3.63%
+    DiT+VAE (prompt 14)       58144.6 ms    39.0 TFLOPS  MFU  1.28%
+    T5 (prompt 15)               43.8 ms   110.6 TFLOPS  MFU  3.64%
+    DiT+VAE (prompt 15)       58291.8 ms    38.9 TFLOPS  MFU  1.28%
+
+=== OPTIMIZATION PRIORITY (highest wall-time first) ===
+  Fix top-of-list first; OVERHEAD-BOUND = layout/kernel fix (no quality risk),
+  COMPUTE-BOUND = already-hot matmul (lower ceiling, needs algo/precision change).
+  P1  b6041713a3964f   7285.6us   4.7% (cum  4.7%)  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+  P2  9eadc5d102904e   5828.4us   3.8% (cum  8.5%)  OVERHEAD-BOUND (dma/stall) <- OPTIMIZE
+  P3  1072ae8772648e   4492.1us   2.9% (cum 11.4%)  COMPUTE-BOUND (matmul-hot)
+  P4  0ce8b46a0b1241   4444.4us   2.9% (cum 14.3%)  COMPUTE-BOUND (matmul-hot)
+  P5  41dc09ec92d0f4   4274.7us   2.8% (cum 17.1%)  COMPUTE-BOUND (matmul-hot)
+  P6  2e477c2932dabf   4050.6us   2.6% (cum 19.7%)  COMPUTE-BOUND (matmul-hot)
+  P7  3e7e69e06b10d4   4031.5us   2.6% (cum 22.4%)  COMPUTE-BOUND (matmul-hot)
+  P8  53780211ad667f   3793.2us   2.5% (cum 24.8%)  COMPUTE-BOUND (matmul-hot)
+  P9  c9dd13a421a2e1   3729.7us   2.4% (cum 27.2%)  COMPUTE-BOUND (matmul-hot)
+  P10 a17a415fb31493   3652.4us   2.4% (cum 29.6%)  COMPUTE-BOUND (matmul-hot)

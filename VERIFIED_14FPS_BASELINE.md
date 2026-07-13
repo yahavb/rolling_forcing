@@ -63,3 +63,40 @@ Expect: `branch : main`, block-1 lines ~14 fps, no `TP4xSP2` banner.
 - rf-iter1000-mhjhb : main 4e7e1d6, iter1000-job.yaml, CP4 1200 RING → 13.92 block-1
 - rolling-forcing-9jhs7 : main 4e7e1d6, rf-job.yaml (my edit), CP4 1200 RING=1 NSEG=1 → 13.89 block-1
 - rolling-forcing-cwd8x/knjcp/... : pre-CP branch tp4-sp4-16core d51799b → 8-9 (SP2) / ~13.2 (SP 16r)
+
+## KV-OVERLAP EXPERIMENT RESULT (branch kv-overlap-exchange, run xlskl, 2026-07-13)
+In-kernel ncc.all_gather cache-shard (RF_RING_CACHESHARD=1 RF_CACHESHARD_INKERNEL=1):
+- COMPILES + RUNS end-to-end (after 3 fixes: in-func import, strided-view ap(), dma_copy reassembly).
+- fps = **5.29 steady @ 1200** (DiT ~2200ms) vs 14.18 baseline. **2.7x SLOWER — regressed.**
+- Cause: gather did NOT overlap compute. dma_copy->shared_hbm->ncc.all_gather->dma_copy-reassembly
+  ->flash is a SERIAL chain; flash waits for the full window. Worse than torch-shard (12.25).
+- To actually win: interleave the gather with the flash K-tile loop (gather block N+1 while
+  computing block N) like attention_kv_parallel_segmented_cte — a full kernel rewrite, not a wrapper.
+- Correctness: ran to completion producing video; no max|Δ|=0 numeric gate in this path (RING GATE only).
+
+## KV-OVERLAP: WHY THE NAIVE KERNEL REGRESSED + THE CORRECT DESIGN (2026-07-13)
+ROOT CAUSE of 5.29fps (MFU 3.16%, DiT 2200ms vs baseline 680ms): the kernel REASSEMBLED the
+FULL window (16x KV in HBM, twice, via strided dma_copy) then flashed the WHOLE window on
+EVERY rank. That is baseline attention compute PLUS a 16x gather PLUS 2 fat HBM round-trips —
+strictly worse. It inverted the point of sharding.
+
+THE POINT OF SHARDING (what CORE attention_kv_parallel_segmented_cte does): each rank flashes
+ONLY its 1/world KV shard (16x LESS attention compute) -> emits a PARTIAL (unnorm O, row_max,
+row_sum) -> combine partials across ranks. Exchanged data = partials [Sq,bs,d]+[Sq,bs], NOT the
+16x window. Overlap = compute local partial WHILE the collective moves other ranks' partials.
+RF ALREADY has the partial machinery: wan_flash_self_attn(return_partials=True) + _attend_ring
+online-softmax combine.
+
+KEY: in the cache-shard path each rank ALREADY HOLDS its native 1/world shard (k_own/v_own,
+_attend_cache_shard:782 — k_len_int is the SHARDED length). So local flash needs ZERO pre-gather;
+only the PARTIALS get combined after.
+
+HARD CONSTRAINT (verify_ring_attention_exact.py): ACC-gate max|Δ|=0 REQUIRES the online-softmax
+merge in GLOBAL POSITION ORDER (shard 0,1,..,15) with the same fp32 as flash. Rotation/arrival
+order -> ~1e-16 -> fails the pixel gate. AND each rank's shard is PER-BLOCK-INTERLEAVED (block b's
+r-th slice), not contiguous global positions — so the combine must map interleaved->global order.
+
+NEXT (Option A, the right small step): sharded local flash (return_partials) on k_own/v_own +
+all_gather the small PARTIALS + ordered global combine. Reuses proven combine math; tests whether
+sharded-partial (NOT full-reassembly) recovers fps. Option B = full in-kernel all_to_all ring
+(harder, ordered-merge baked into schedule). Do A first, ACC-gate, then profile overlap.
