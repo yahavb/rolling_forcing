@@ -186,6 +186,11 @@ class CausalWanSelfAttention(nn.Module):
         block_length = self._cs_block_length if self._cache_shard else self.block_length
         kv_cache_size = (self._cs_kv_cache_logical_size if self._cache_shard
                          else self.kv_cache_logical_size)
+        # cache_start arrives in FULL sequence coords (advances by full block/phase); convert
+        # to sharded coords so cache_end / global_end_index / eviction all live at 1/world
+        # scale consistently (verify_cache_start_shardcoords.py: sharded == full // world).
+        if self._cache_shard and self.world_size > 1:
+            cache_start = cache_start // self.world_size
         cache_end = cache_start + block_length
         global_end_index = kv_cache["global_end_index"]
         local_end_index_current = kv_cache["local_end_index"]
@@ -414,6 +419,11 @@ class CausalWanSelfAttention(nn.Module):
         block_length = self._cs_block_length if self._cache_shard else self.block_length
         kv_cache_size = (self._cs_kv_cache_logical_size if self._cache_shard
                          else self.kv_cache_logical_size)
+        # cache_start arrives in FULL sequence coords; convert to sharded coords so cache_end /
+        # global_end_index / num_evicted / evict slice all live at 1/world scale consistently
+        # (verify_cache_start_shardcoords.py: sharded bookkeeping == full // world every phase).
+        if self._cache_shard and self.world_size > 1:
+            cache_start = cache_start // self.world_size
         cache_end = cache_start + block_length
         global_end_index = kv_cache["global_end_index"]
         local_end_index_current = kv_cache["local_end_index"]
