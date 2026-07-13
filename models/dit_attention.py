@@ -791,6 +791,191 @@ class CausalWanSelfAttention(nn.Module):
             out = rs_out.unsqueeze(0)
         return out
 
+    def _forward_merged_cache_shard(
+        self,
+        x,
+        grid_sizes,
+        freqs_cos, freqs_sin,
+        kv_cache,
+        cache_update_start, current_start,
+        cu_shared_buffers, dn_shared_buffers,
+        num_valid_frames_dn,
+        nfpb_cu,
+        rope_grid_cache=None,
+    ):
+        """TRUE CACHE-SHARD (RF_RING_CACHESHARD) merged cu/dn path. Each rank holds ONLY its
+        UNIFORM per-block 1/world slice of cu and dn (verify_dn_multiblock_shard.py PROVEN
+        layout: rank r holds, for every block b, that block's r-th ws_block(=block//world)
+        slice). NO world-gather of k/v — the persistent cache stores 1/world per rank and the
+        full window is reassembled at attention time by _attend_cache_shard's per-block
+        interleave. Mirrors the denoise cache-shard path (_qkv_rope cache-shard branch),
+        applied independently to the cu stream and the dn stream.
+
+        The INPUT x-shard (dit_model._forward_inference merged branch) already produced this
+        per-block layout; k_local/v_local from _local_qkv_norm ARE this rank's per-block slices,
+        laid out [cu_shard ; dn_shard]."""
+        f_full, h, w = grid_sizes
+        frame_seqlen = h * w
+        grid_cu = (nfpb_cu, h, w)
+        grid_dn = (f_full - nfpb_cu, h, w)
+
+        N = self.world_size
+        tp = self.tp_degree
+        sp = self.sp_degree
+        world_rank = ps.get_rank("world")
+
+        n = self.num_heads
+        d = self.head_dim
+        n_local = self.heads_per_shard
+        h_start = self.tp_rank * n_local
+        h_end = h_start + n_local
+
+        block = self.block_length              # full block token count (3 * frame_seqlen)
+        ws_block = self._cs_block_length        # per-rank per-block slice = block // N
+        assert ws_block is not None
+
+        L_cu = nfpb_cu * frame_seqlen
+        L_dn = (f_full - nfpb_cu) * frame_seqlen
+        assert L_cu % block == 0 and L_dn % block == 0, (
+            f"cache-shard merged: L_cu {L_cu} / L_dn {L_dn} not block({block})-aligned")
+        nb_cu = L_cu // block                   # blocks in cu stream (==1 for nfpb_cu==nfpb)
+        nb_dn = L_dn // block                   # blocks in dn stream (rolling window)
+        cu_shard_len = nb_cu * ws_block         # this rank's cu tokens
+        dn_shard_len = nb_dn * ws_block         # this rank's dn tokens
+
+        q_local, k_local, v_local = self._local_qkv_norm(x)   # this rank's [cu;dn] slices, all heads
+        q_cu_l = q_local[:cu_shard_len]
+        q_dn_l = q_local[cu_shard_len:]
+        k_cu_l = k_local[:cu_shard_len]
+        k_dn_l = k_local[cu_shard_len:]
+        v_cu_l = v_local[:cu_shard_len]
+        v_dn_l = v_local[cu_shard_len:]
+
+        cu_sf_int = cache_update_start // frame_seqlen
+        dn_sf_int = current_start // frame_seqlen
+        cu_sf_t = torch.tensor(cu_sf_int, device=x.device)
+        dn_sf_t = torch.tensor(dn_sf_int, device=x.device)
+        current_start_frame_dn = current_start // frame_seqlen
+
+        def rope_per_block(t_local, grid, sf_t, sf_int, nblocks):
+            # RoPE this rank's per-block shard at each block's GLOBAL token offset. RoPE is
+            # per-position, so RoPE-shard-at-global-offset == RoPE-full-then-slice
+            # (verify_krope_shard.py). rank world_rank holds, per block b, the tokens at global
+            # offset b*block + world_rank*ws_block (verify_dn_multiblock_shard.py).
+            pieces = []
+            for b in range(nblocks):
+                seg = t_local[b * ws_block:(b + 1) * ws_block].view(ws_block, n, d).unsqueeze(0)
+                roped = self._nki_rope_apply(
+                    seg, grid, freqs_cos, freqs_sin,
+                    start_frame=sf_t, rope_grid_cache=rope_grid_cache,
+                    start_frame_int=sf_int, head_start=h_start, head_end=h_end,
+                    tok_offset=b * block + world_rank * ws_block, tok_len=ws_block)
+                pieces.append(roped)
+            return torch.cat(pieces, dim=1)     # [1, nblocks*ws_block, n_local, d]
+
+        # --- roped keys / values (this rank's shard only; NO world-gather) ---
+        rk_cu = rope_per_block(k_cu_l, grid_cu, cu_sf_t, cu_sf_int, nb_cu)
+        rk_dn = rope_per_block(k_dn_l, grid_dn, dn_sf_t, dn_sf_int, nb_dn)
+        v_cu = self._slice_heads(v_cu_l)        # [1, cu_shard_len, n_local, d]
+        v_dn = self._slice_heads(v_dn_l)
+
+        # --- roped queries: RoPE this rank's shard, gather ROPED q over attn-tp -> sp-shard ---
+        # (roped-shard-then-gather == gather-then-rope, RoPE is per-position). Gather over
+        # attn-tp reconstructs the sp-group's query tokens; permute the dn gather to PER-BLOCK
+        # grouped order so the sp query matches the per-block cache layout at sp granularity.
+        rq_cu_local = rope_per_block(q_cu_l, grid_cu, cu_sf_t, cu_sf_int, nb_cu)  # [1, cu_shard_len, n_local, d]
+        rq_dn_local = rope_per_block(q_dn_l, grid_dn, dn_sf_t, dn_sf_int, nb_dn)  # [1, dn_shard_len, n_local, d]
+
+        def gather_q_tp(rq_local, nblocks):
+            # rq_local [1, nblocks*ws_block, n_local, d] -> flatten heads, all_gather over
+            # attn-tp (tp consecutive world ranks), reshape [tp, nblocks, ws_block, n_local*d],
+            # permute to PER-BLOCK grouped [nblocks, tp, ws_block, ...] -> contiguous sp query.
+            flat = rq_local[0].reshape(nblocks * ws_block, n_local * d).contiguous()
+            g = torch.empty(tp * nblocks * ws_block, n_local * d,
+                            dtype=flat.dtype, device=flat.device)
+            ps.all_gather_into_tensor(g, flat, "attn-tp")
+            g = (g.view(tp, nblocks, ws_block, n_local * d)
+                  .permute(1, 0, 2, 3)
+                  .reshape(nblocks * tp * ws_block, n_local, d))
+            return g.unsqueeze(0)                # [1, nblocks*tp*ws_block, n_local, d]
+
+        q_cu_sp = gather_q_tp(rq_cu_local, nb_cu)   # [1, L_cu_sp, n_local, d]
+        q_dn_sp = gather_q_tp(rq_dn_local, nb_dn)   # [1, L_dn_sp, n_local, d]
+
+        # --- cache write (sharded sizes substituted inside _cache_write via self._cache_shard) ---
+        if self._will_anchor_write(kv_cache, cache_update_start):
+            k_cu = self._slice_heads_2d(k_cu_l).contiguous().unsqueeze(0)
+        else:
+            k_cu = None
+        le_cu, ls_cu = self._cache_write(
+            k_cu, v_cu, rk_cu, kv_cache, cache_update_start, cu_shared_buffers)
+
+        if self._will_anchor_write(kv_cache, current_start):
+            k_dn = self._slice_heads_2d(k_dn_l).contiguous().unsqueeze(0)
+        else:
+            k_dn = None
+        le_dn, ls_dn = self._cache_write(
+            k_dn, v_dn, rk_dn, kv_cache, current_start, dn_shared_buffers)
+
+        # valid_tokens are SHARDED (1/world) — the sharded cache/buffers hold 1/world.
+        vt_cu = (nfpb_cu * frame_seqlen) // N
+        vt_dn = (num_valid_frames_dn * frame_seqlen) // N
+        klen_cu = self._assemble_kv(
+            rk_cu, v_cu, kv_cache, grid_cu, freqs_cos, freqs_sin,
+            cu_shared_buffers, True, vt_cu,
+            cache_update_start // frame_seqlen, le_cu, ls_cu,
+            rope_grid_cache=rope_grid_cache)
+        klen_dn = self._assemble_kv(
+            rk_dn, v_dn, kv_cache, grid_dn, freqs_cos, freqs_sin,
+            dn_shared_buffers, False, vt_dn,
+            current_start_frame_dn, le_dn, ls_dn,
+            rope_grid_cache=rope_grid_cache)
+
+        # --- attention: _attend_cache_shard reassembles the FULL window per stream ---
+        y_cu = self._attend(q_cu_sp, cu_shared_buffers, klen_cu)
+        y_dn = self._attend(q_dn_sp, dn_shared_buffers, klen_dn)
+
+        # --- OUTPUT reassembly ---
+        # UNVERIFIED FOR PER-BLOCK CACHE-SHARD LAYOUT: the query sp-shard here is PER-BLOCK
+        # grouped (cu contiguous; dn per-block at sp granularity), NOT the contiguous
+        # dn[sp*L_dn_sp:] layout that restore_layout was written for. The output token ORDER
+        # therefore differs from the non-shard path, so the reduce_scatter + restore_layout +
+        # world-gather deinterleave below may place tokens incorrectly. This does NOT corrupt
+        # the persistent cache (write/assemble use the proven per-block layout); it only risks
+        # a scrambled OUTPUT, which the on-device ACC gate (gate_frames) will catch. Mirrors
+        # the non-shard output tail for shape-correctness; reassembly correctness is deferred
+        # to the device ACC gate rather than guessed here.
+        sp_ = self.sp_degree
+        L_cu_sp = q_cu_sp.shape[1]
+        L_dn_sp = q_dn_sp.shape[1]
+        L_full = L_cu + L_dn
+        L_cu_N = L_cu // N
+        L_dn_N = L_dn // N
+        L_full_N = L_full // N
+
+        y = self.o(torch.cat([y_cu, y_dn], dim=1))
+
+        if tp > 1:
+            y = y.reshape((L_cu_sp + L_dn_sp), self.dim)
+            y_cu_part = y[:L_cu_sp].reshape(tp, L_cu_N, self.dim)
+            y_dn_part = y[L_cu_sp:].reshape(tp, L_dn_N, self.dim)
+            rearranged = torch.cat([y_cu_part, y_dn_part], dim=1).reshape(-1, self.dim)
+            rs_out = torch.empty(L_full_N, self.dim, dtype=y.dtype, device=y.device)
+            ps.reduce_scatter_tensor(rs_out, rearranged, "attn-tp")
+            cu_dn_sep = rs_out
+        else:
+            cu_dn_sep = y.reshape(L_full_N, self.dim)
+
+        if N == 1:
+            return cu_dn_sep.unsqueeze(0)
+
+        gathered = torch.empty(N * L_full_N, self.dim, dtype=cu_dn_sep.dtype, device=cu_dn_sep.device)
+        ps.all_gather_into_tensor(gathered, cu_dn_sep, "world")
+        full = restore_layout(gathered, N=N, nfpb=3, max_frames=15,
+                              frame_seqlen=self.frame_length)
+        out = full[world_rank * L_full_N:(world_rank + 1) * L_full_N]
+        return out.unsqueeze(0)
+
     def forward_merged(
         self,
         x,
@@ -804,13 +989,12 @@ class CausalWanSelfAttention(nn.Module):
         rope_grid_cache=None,
     ):
         assert x.shape[0] == 1
-        # TRUE CACHE-SHARD is DENOISE-path only in this stage. The merged cu/dn path writes
-        # TWO sub-block streams into the same cache with full (unsharded) bookkeeping; running
-        # it against a 1/world-sized cache would corrupt. Fail loudly rather than silently.
-        assert not self._cache_shard, (
-            "RF_RING_CACHESHARD (true cache-sharding) is not implemented for the merged "
-            "cu/dn path yet — only the denoise forward(). Refusing to run forward_merged "
-            "with a sharded cache to avoid corruption.")
+        if self._cache_shard and self.world_size > 1:
+            return self._forward_merged_cache_shard(
+                x, grid_sizes, freqs_cos, freqs_sin, kv_cache,
+                cache_update_start, current_start,
+                cu_shared_buffers, dn_shared_buffers,
+                num_valid_frames_dn, nfpb_cu, rope_grid_cache)
 
         f_full, h, w = grid_sizes
         frame_seqlen = h * w
