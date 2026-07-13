@@ -106,9 +106,9 @@ class CausalWanSelfAttention(nn.Module):
         self.tp_rank = ps.get_rank("attn-tp")
 
         if self._cache_shard and self.world_size > 1:
-            assert self.block_length % self.world_size == 0
-            assert self.max_attention_size % self.world_size == 0
-            assert self.kv_cache_logical_size % self.world_size == 0
+            assert self.block_length % self.world_size == 0, f"block_length {self.block_length} % world {self.world_size}"
+            assert self.max_attention_size % self.world_size == 0, f"max_attn {self.max_attention_size} % world {self.world_size}"
+            assert self.kv_cache_logical_size % self.world_size == 0, f"kv_logical {self.kv_cache_logical_size} % world {self.world_size}"
             self._cs_block_length = self.block_length // self.world_size
             self._cs_max_attention_size = self.max_attention_size // self.world_size
             self._cs_kv_cache_logical_size = self.kv_cache_logical_size // self.world_size
@@ -198,8 +198,11 @@ class CausalWanSelfAttention(nn.Module):
         return local_end_index == block_length
 
     def _cache_copy_inplace(self, k_dst, k_src, v_dst=None, v_src=None):
-        assert k_src.shape == k_dst.shape and k_src.numel() > 0
-        assert v_dst is None or v_src.shape == v_dst.shape and v_src.numel() > 0
+        assert k_src.shape == k_dst.shape and k_src.numel() > 0, (
+            f"_cache_copy_inplace K shape mismatch: src{tuple(k_src.shape)} != dst{tuple(k_dst.shape)}")
+        assert v_dst is None or v_src.shape == v_dst.shape and v_src.numel() > 0, (
+            f"_cache_copy_inplace V shape mismatch: src{tuple(v_src.shape) if v_src is not None else None} "
+            f"!= dst{tuple(v_dst.shape) if v_dst is not None else None}")
         """Device-dispatched cache copy: copy_ on CPU, NKI kernel on Neuron."""
         if v_dst is not None:
             kv_cache_copy(k_dst, k_src, v_dst, v_src)
