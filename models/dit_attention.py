@@ -473,18 +473,18 @@ class CausalWanSelfAttention(nn.Module):
                               else self.max_attention_size)
 
         # CACHE-SHARD anchor RoPE: the cached sink block below holds only THIS rank's
-        # per-block-0 shard (ws_block tokens at in-block global offset world_rank*ws_block,
-        # heads [h_start:h_end]). Pass the matching shard params so the single-block grid
-        # (3,h,w) is sliced to this rank's tokens/heads instead of asserting seq_len(block)
-        # == s(ws_block). RoPE is per-position -> bit-exact (verify_anchor_shard.py max|Δ|=0).
-        # Non-shard path: empty kwargs -> full-block RoPE, unchanged.
+        # per-block-0 TOKEN shard (ws_block tokens at in-block global offset
+        # world_rank*ws_block). Pass tok_offset/tok_len so the single-block grid (3,h,w)
+        # is sliced to this rank's tokens instead of asserting seq_len(block)==s(ws_block).
+        # Do NOT pass head_start/head_end: the cache already stores head-sliced K (n_local
+        # heads), so _nki_rope_apply defaults head_end=x.shape[2]=n_local (all cached heads).
+        # RoPE is per-position AND per-head-independent -> bit-exact (verify_anchor_shard.py
+        # max|Δ|=0). Non-shard path: empty kwargs -> full-block RoPE, unchanged.
         anchor_shard_kw = {}
         if self._cache_shard and self.world_size > 1:
             ws_block = self._cs_block_length
             world_rank = ps.get_rank("world")
-            h_start = self.tp_rank * self.heads_per_shard
             anchor_shard_kw = dict(
-                head_start=h_start, head_end=h_start + self.heads_per_shard,
                 tok_offset=world_rank * ws_block, tok_len=ws_block)
 
         if updating_cache:

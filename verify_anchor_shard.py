@@ -38,13 +38,16 @@ maxd = 0.0
 for r in range(world):
     tp_rank = r % tp                       # attn-tp rank -> head window
     h_start = tp_rank * n_local; h_end = h_start + n_local
-    # reference: RoPE the FULL block, then slice this rank's tokens + heads
+    # reference: RoPE the FULL block (all heads), then slice this rank's tokens + heads
     ref = rope_pos(Kfull, 0)[r * ws_block:(r + 1) * ws_block, h_start:h_end]
-    # sharded anchor: RoPE only this rank's ws_block tokens at global offset r*ws_block,
-    # then slice heads (== the fixed _nki_rope_apply call with tok_offset/tok_len/head_*)
-    got = rope_pos(Kloc[r], r * ws_block)[:, h_start:h_end]
+    # sharded anchor as it ACTUALLY runs: the cache already stores the head-sliced shard,
+    # so RoPE runs on the pre-sliced [ws_block, n_local, d] at global offset r*ws_block —
+    # NO head kwargs, NO post-RoPE head slice (== fixed _nki_rope_apply, tok_offset/tok_len
+    # only). RoPE is per-position AND per-head-independent, so this equals ref.
+    anchor_shard = Kloc[r][:, h_start:h_end]           # cache holds only this rank's n_local heads
+    got = rope_pos(anchor_shard, r * ws_block)         # RoPE the pre-head-sliced shard
     maxd = max(maxd, (ref - got).abs().max().item())
 
 print(f"anchor-shard vs full-anchor max|Δ|={maxd:.3e}")
 assert maxd < 1e-12, "DIVERGES"
-print("PROOF PASSED: sharded anchor RoPE (tok_offset=r*ws_block, head-sliced) == full-then-slice")
+print("PROOF PASSED: sharded anchor RoPE (tok_offset=r*ws_block, cache pre-head-sliced) == full-then-slice")
