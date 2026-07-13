@@ -6,17 +6,43 @@ the open question is **convergence**.
 
 ---
 
-## TL;DR — where we are
+## LATEST (2026-07-13) — render/quality findings, read FIRST
+
+- **Quality verdict: our T=4 distilled model is BLURRY, undertrained. NOT usable yet.**
+  Rendered the distilled checkpoints end-to-end (train→ckpt→serve→eyeball):
+  - iter200 EMA (T=4) → blurry. iter400 EMA (T=4) → blurry. **iter1000 EMA (T=4) → still blurry.**
+  - Ground truth: shipped `rf_sp4_videos/prompt_000.mp4` (T=5) is **sharp**. Ours is much worse
+    on the SAME prompt it was trained on (prompt_000 = the western/horse POC prompt).
+  - iter1000's EMA has ~800 G-steps of averaging (w=0.999, start 200) — so "EMA too early"
+    is NOT the excuse anymore. The student is genuinely **under-converged**.
+- **EMA was added** (commit `31dd612`, sharded/no-summon, saves `generator_ema`; config
+  `ema_weight=0.999 ema_start_step=200`). DMD raw loss OSCILLATES by design (avg50 cycled
+  0.35→0.68→0.49 over ~1000 iters — a full lobe, NOT divergence); you ship the EMA weights.
+  EMA render loads via `--use_ema`. But even EMA is blurry → training, not serving, is the blocker.
+- **OPEN CONFOUND before more training:** iter1000 differs from the sharp baseline by TWO
+  things — our weights AND T=4. To tell if blur is from **T=4 (4 steps too few)** vs **our
+  distillation being bad**, render the SHIPPED ckpt at T=4:
+  - shipped@T=4 blurry → 4 steps inherently degrades; distillation must fix that (hard).
+  - shipped@T=4 sharp → our weights are undertrained; more/better training is the fix.
+- **fps side-note (unresolved, low priority):** T=4 renders measured ~2 fps vs the ~14 fps
+  T=5 baseline on the SAME 16 cores — pathological since T=4 is LESS work. Profiler
+  (`per_neff_mfu.txt`, run 120726204813) showed the 2 hottest NEFFs are OVERHEAD-BOUND
+  (tensor ~6%, gpsimd ~89%, dma ~48%) with RF_RING=1 at 1200 seq len. Whether ring is the
+  cause is DISPUTED by the user (validated main+ring=14fps at 1480 seq len). Control queued:
+  original ckpt @ T=5 @ ring-on @ 1200 (iter1000-job.yaml, edited) to isolate. NOT yet run.
+  Serving-fps is a SEPARATE thread from convergence; do not let it block training work.
+
+## TL;DR — where we are (training convergence)
 
 - **Memory/OOM: SOLVED.** The 3-model DMD loop trains stably on 16 Trn2 cores, memory flat
-  across G-steps, past all historical OOM walls (ran to iter ~250).
-- **Convergence: OPEN.** Last observed `dmdnorm_avg50` **rose** 0.51→0.60 over 250 iters
-  (should DECLINE toward 0). Root cause found + fixed (paper-verified): the
-  `DISTILL_FUNCTIONAL_ATTN` flag was blinding ALL rollout blocks (deleting the KV temporal +
-  global context that IS Rolling Forcing). Fix committed `74c996d` — **not yet re-run.**
-- **NEXT ACTION:** re-run the job (below), watch the new `[grad] grad_norm=` (proves weights
-  move) and `dmdnorm_avg50` (should stop rising / decline). If still rising with grad_norm>0,
-  the next audited divergence is the **scoring-timestep coupling** (see "Open divergences").
+  across G-steps, past all historical OOM walls (ran to iter ~1050+, EMA adds ~1.3GB/rank sharded).
+- **Convergence: OPEN — and now known INSUFFICIENT for quality.** `dmdnorm_avg50` oscillates
+  ~0.35↔0.68 (expected for DMD; not divergence). `loss_fake` drifts up with spikes to 1.5–2.2
+  late (critic destabilizing — the generator/critic imbalance lever: raise
+  `dfake_gen_update_ratio` 5→10 and/or lower generator lr). The render proves the current
+  recipe under-converges regardless of EMA.
+- **NEXT ACTION:** (1) render shipped ckpt @ T=4 to resolve the T=4-vs-undertrained confound;
+  (2) if undertrained → train far longer and/or fix critic balance, re-render a late EMA ckpt.
 
 ---
 

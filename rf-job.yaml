@@ -1,14 +1,13 @@
 # Rolling Forcing — Neuron 3-run benchmark (companion to ~/StreamDiffusionV2/sd-job.yaml)
 #
-# SCALE-OUT EXPERIMENT: compare TP4xSP2 (8 ranks) vs TP4xSP8 (32 ranks) in ONE pod
-# to measure the SP2->SP8 fps speedup. tp_degree is pinned at 4 (12 heads only divide
-# by 4 and 4 is a legal collective group); the extra cores go to SP (context/sequence
-# parallel). Both passes run at 480x512 (latent_w=64, frame_seqlen=960) because SP8
-# needs every sharded token-run (frame_seqlen) divisible by world_size=32 (960=30*32;
-# 1200 fails: 1200%32=16). latent_w must be a multiple of 32 since gcd(15,32)=1.
+# SCALE-OUT EXPERIMENT: compare TP4xSP2 (8 ranks) vs TP4xSP4 (16 ranks) in ONE pod
+# to measure the SP2->SP4 fps speedup. tp_degree is pinned at 4 (12 heads only divide
+# by 4 and 4 is a legal collective group); the extra 8 cores go to SP (context/sequence
+# parallel). Both passes run at 480x640 (latent_w=80, frame_seqlen=1200) because SP4
+# needs every F*frame_seqlen divisible by 16 and the default 832-wide (1560) is not.
 # Key differences from sd-job:
-#   - Topology : TP=4 x SP=8 = 32 ranks -> torchrun --nproc_per_node 32 on l-lnc1-trn2
-#                (4 x trn2.48xlarge @ LNC1 = 32 logical cores @ 12GB). Baseline runs 8 first.
+#   - Topology : TP=4 x SP=4 = 16 ranks -> torchrun --nproc_per_node 16 on m-lnc1-trn2
+#                (count:2 -> 2 chips x 8 cores). A baseline pass runs 8 ranks first.
 #   - Entry    : e2e_pipeline.py (T5 -> DiT -> VAE fused). NO --warmup/--iters flags;
 #                it emits per-stage "T5: <N> ms" + DiT/VAE logs and tflops_report.json,
 #                NOT sd's median=/built= markers.
@@ -19,8 +18,8 @@
 # Model under test (current Neuron implementation):
 #   - DiT base : Wan-AI/Wan2.1-T2V-1.3B  (T5 encoder + VAE decoder)
 #   - DiT ckpt : TencentARC/RollingForcing -> checkpoints/rolling_forcing_dmd.pt (DMD-distilled)
-#   - Runtime  : TP-4 x SP-{2,8} (8 or 32 NeuronCores, LNC=1), bf16, eager + NKI kernels
-#   - Shape    : num_output_frames=21, chunk-size=3, fps=16, latent 60x64 (480x512)
+#   - Runtime  : TP-4 x SP-{2,4} (8 or 16 NeuronCores, LNC=1), bf16, eager + NKI kernels
+#   - Shape    : num_output_frames=21, chunk-size=3, fps=16, latent 60x80 (480x640)
 #
 # Mandatory 3-run methodology (ONE pod):
 #   [1/3] WARMUP  : compile-if-cold / load NEFFs (not timed)
@@ -47,11 +46,10 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        # l-lnc1-trn2: 4 x trn2.48xlarge @ LNC1 = 4 x 8 = 32 logical cores @ 12GB HBM.
-        # TP4xSP8 needs 32 ranks (32 logical cores) — LNC2 claims (16 logical) cap at
-        # SP4. The 8-rank TP4xSP2 baseline pass also runs in this claim.
-        - name: l-lnc1-trn2
-          resourceClaimTemplateName: l-lnc1-trn2
+        # 16 NeuronCores (2 chips x 8, LNC=1) so ONE pod can run BOTH the TP4xSP2
+        # 8-rank baseline and the TP4xSP4 16-rank test at the same resolution.
+        - name: m-lnc1-trn2
+          resourceClaimTemplateName: m-lnc1-trn2
       containers:
         - name: bench
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -128,23 +126,17 @@ spec:
 
               LOCAL_RESULTS="/tmp/results"; mkdir -p "$LOCAL_RESULTS"
 
-              # ── TOPOLOGY: this job compares TP4xSP2 (8 ranks) vs TP4xSP8 (32 ranks) ──
+              # ── TOPOLOGY: this job compares TP4xSP2 (8 ranks) vs TP4xSP4 (16 ranks) ──
               # tp_degree is fixed at 4 (Wan2.1-1.3B has 12 heads; only 4 divides them and
               # is a legal collective group). sp_degree = nproc/4, derived by e2e_pipeline.py.
-              # BOTH runs use --latent_w 64 (480x512, frame_seqlen=960) because SP8 needs
-              # every sharded token-run (frame_seqlen) divisible by world_size=32, and
-              # 960=30*32 is the smallest latent_h(60)-compatible width that satisfies it
-              # (1200 % 32 = 16 fails; latent_w must be a multiple of 32 since gcd(15,32)=1).
-              # 480x512 (960) also fits the 12GB/core HBM at LNC1 (smaller than the
-              # known-good 640-wide 1200 that ran at 24GB/core).
-              NPROC="${NPROC:-32}"          # 32 = TP4xSP8 main run; baseline pass sets 8
-              LATENT_W="${LATENT_W:-64}"
-              # e2e_pipeline.py reads frame_seq_length from the config (no CLI override) and
-              # asserts it == (latent_h/2)*(latent_w/2) AND % world_size == 0. The config
-              # ships 1200 (480x640); patch it to match --latent_w 64 -> 960 (480x512).
-              FRAME_SEQ=$(( (60/2) * (LATENT_W/2) ))
-              sed -i "s/^frame_seq_length:.*/frame_seq_length: ${FRAME_SEQ}/" configs/rolling_forcing_dmd.yaml
-              echo "patched config frame_seq_length -> ${FRAME_SEQ} (latent 60x${LATENT_W})"
+              # BOTH runs use --latent_w 80 (480x640, frame_seqlen=1200) because SP4 needs
+              # every F*frame_seqlen divisible by 16 and 1560 (the 832-wide default) is not.
+              # Running both at 80 keeps the SP2->SP4 speedup an apples-to-apples ratio.
+              # NOTE: this re-baselines 8-core at 640 wide; it is NOT the historical 8.1 fps
+              # number (that was 832 wide / frame_seqlen 1560). 640 < 832 also fits HBM
+              # (896 OOM'd: KV cache = frame_seqlen*24*heads*head_dim grew past 24GB/stack).
+              NPROC="${NPROC:-16}"          # 16 = TP4xSP4 main run; baseline pass sets 8
+              LATENT_W="${LATENT_W:-80}"
               # e2e_pipeline.py has no --warmup/--iters; it logs per-stage "T5: <N> ms" +
               # DiT/VAE and (with MEASURE_TFLOPS=1) writes <output_folder>/tflops_report.json.
               BENCH_CMD="torchrun --nproc_per_node ${NPROC} e2e_pipeline.py \
@@ -336,16 +328,16 @@ spec:
                   }' "$1"
               }
 
-              # ══ BASELINE PASS: TP4xSP2 (8 ranks) at the SAME 480x512 resolution ══
-              # This is the apples-to-apples denominator for the 32-rank speedup. It is a
-              # fresh 8-core number at latent_w=64 (frame_seqlen 960; config already patched).
-              echo "════════════ BASELINE: TP4xSP2 (8 ranks, 480x512) ════════════"
-              ( export NPROC=8 LATENT_W=64
+              # ══ BASELINE PASS: TP4xSP2 (8 ranks) at the SAME 480x640 resolution ══
+              # This is the apples-to-apples denominator for the 16-rank speedup. It is a
+              # fresh 8-core number at latent_w=80 (NOT the historical 8.1 fps @ 832).
+              echo "════════════ BASELINE: TP4xSP2 (8 ranks, 480x640) ════════════"
+              ( export NPROC=8 LATENT_W=80
                 BASE_CMD="torchrun --nproc_per_node 8 e2e_pipeline.py \
                   --prompt_file prompts/example_prompts.txt \
                   --config_path configs/rolling_forcing_dmd.yaml \
                   --checkpoint_path checkpoints/rolling_forcing_dmd.pt \
-                  --tp_degree 4 --latent_w 64 --num_output_frames 21 \
+                  --tp_degree 4 --latent_w 80 --num_output_frames 21 \
                   --chunk-size 3 --fps 16 --use_ema"
                 echo "--- [baseline warmup] ---"
                 $BASE_CMD --output_folder /tmp/base_warmup 2>&1 \
@@ -357,12 +349,12 @@ spec:
                   | tee "$LOCAL_RESULTS/base_clean.txt" \
                   | grep -iE "T5:|block +[0-9]|fps|TFLOPS|MFU|FAILED|Error" || echo "BASELINE CLEAN FAILED"
               )
-              echo "--- BASELINE (TP4xSP2, 8 ranks, 480x512) steady-state ---"
+              echo "--- BASELINE (TP4xSP2, 8 ranks, 480x640) steady-state ---"
               median_fps "$LOCAL_RESULTS/base_clean.txt" | tee "$LOCAL_RESULTS/base_fps.txt"
 
               echo "════════════ NEURON 3-RUN BENCHMARK (Rolling Forcing) ════════════"
-              echo "  model    : Wan2.1-T2V-1.3B + RollingForcing DMD ckpt, TP4xSP8 (32 cores), bf16, 21 frames"
-              echo "  topology : TP=4 x SP=8 = 32 ranks (l-lnc1-trn2 claim), 480x512 / frame_seqlen 960"
+              echo "  model    : Wan2.1-T2V-1.3B + RollingForcing DMD ckpt, TP4xSP4 (16 cores), bf16, 21 frames"
+              echo "  topology : TP=4 x SP=4 = 16 ranks (m-lnc1-trn2 claim), 480x640 / frame_seqlen 1200"
               echo "=================================================================="
 
               echo "=== [1/3] WARMUP (compile-if-cold / load NEFFs; not timed) ==="
@@ -424,19 +416,19 @@ spec:
               echo "=== [5] per-NEFF engine utilization + MFU + optimization priority ==="
               per_neff_mfu
 
-              echo "=== HEADLINE: TP4xSP2 (8 ranks) vs TP4xSP8 (32 ranks), both 480x512 ==="
+              echo "=== HEADLINE: TP4xSP2 (8 ranks) vs TP4xSP4 (16 ranks), both 480x640 ==="
               echo "  --- BASELINE TP4xSP2 (8 ranks) ---"
               cat "$LOCAL_RESULTS/base_fps.txt" 2>/dev/null || echo "  (baseline fps unavailable)"
-              echo "  --- MAIN TP4xSP8 (32 ranks) ---"
+              echo "  --- MAIN TP4xSP4 (16 ranks) ---"
               median_fps "$LOCAL_RESULTS/clean.txt" | tee "$LOCAL_RESULTS/main_fps.txt"
-              echo "  --- SPEEDUP (32-rank / 8-rank) ---"
+              echo "  --- SPEEDUP (16-rank / 8-rank) ---"
               awk '
                 function med(f,   v,n,i,j,t,m){ n=0
                   while((getline line < f)>0){ if(line ~ /MEDIAN = /){ sub(/.*MEDIAN = /,"",line); sub(/ fps.*/,"",line); return line+0 } }
                   return 0 }
                 BEGIN{
                   b=med("'"$LOCAL_RESULTS/base_fps.txt"'"); m=med("'"$LOCAL_RESULTS/main_fps.txt"'")
-                  if(b>0 && m>0) printf "  SP2=%.2f fps -> SP8=%.2f fps  =>  %.2fx speedup\n", b, m, m/b
+                  if(b>0 && m>0) printf "  SP2=%.2f fps -> SP4=%.2f fps  =>  %.2fx speedup\n", b, m, m/b
                   else print "  (need both medians to compute speedup)"
                 }'
               grep -iE "Average:.*TFLOPS|MFU" "$LOCAL_RESULTS/clean.txt" | tail -3 || true
@@ -453,15 +445,15 @@ spec:
               RUN_TS=$(date +%d%m%y%H%M%S)
               OUT="/var/mdl/rolling-forcing/runs/${RUN_TS}"
               # frames split by topology so you can tell the two apart:
-              #   frames/sp8_32rank/  <- main TP4xSP8 videos (clean + profiled runs)
+              #   frames/sp4_16rank/  <- main TP4xSP4 videos (clean + profiled runs)
               #   frames/sp2_8rank/   <- baseline TP4xSP2 videos
-              mkdir -p "$OUT/frames/sp8_32rank" "$OUT/frames/sp2_8rank"
+              mkdir -p "$OUT/frames/sp4_16rank" "$OUT/frames/sp2_8rank"
               # 1) FRAMES — every mp4, kept separate per topology (this is the model output)
               find "$LOCAL_RESULTS/clean_out" "$LOCAL_RESULTS/profiled_out" /tmp/warmup_out \
-                -name '*.mp4' -exec cp {} "$OUT/frames/sp8_32rank/" \; 2>/dev/null || true
+                -name '*.mp4' -exec cp {} "$OUT/frames/sp4_16rank/" \; 2>/dev/null || true
               find "$LOCAL_RESULTS/base_clean_out" /tmp/base_warmup \
                 -name '*.mp4' -exec cp {} "$OUT/frames/sp2_8rank/" \; 2>/dev/null || true
-              echo "frames saved: sp8_32rank=$(find "$OUT/frames/sp8_32rank" -name '*.mp4' 2>/dev/null | wc -l) mp4(s), sp2_8rank=$(find "$OUT/frames/sp2_8rank" -name '*.mp4' 2>/dev/null | wc -l) mp4(s)"
+              echo "frames saved: sp4_16rank=$(find "$OUT/frames/sp4_16rank" -name '*.mp4' 2>/dev/null | wc -l) mp4(s), sp2_8rank=$(find "$OUT/frames/sp2_8rank" -name '*.mp4' 2>/dev/null | wc -l) mp4(s)"
               # 2) harmony upload bundle as a DIRECTORY (no untar needed before upload)
               if [[ -d "$LOCAL_RESULTS/harmony_bundle" ]]; then
                 cp -r "$LOCAL_RESULTS/harmony_bundle" "$OUT/" 2>/dev/null || echo "harmony dir persist skipped"
@@ -471,7 +463,7 @@ spec:
               cp "$LOCAL_RESULTS/tflops_report.json" "$OUT/" 2>/dev/null || true
               cp "$LOCAL_RESULTS/clean.txt"          "$OUT/" 2>/dev/null || true
               cp "$LOCAL_RESULTS/profiled.txt"       "$OUT/" 2>/dev/null || true
-              # baseline (TP4xSP2) logs + fps summaries for the SP2->SP8 comparison
+              # baseline (TP4xSP2) logs + fps summaries for the SP2->SP4 comparison
               cp "$LOCAL_RESULTS/base_clean.txt"     "$OUT/" 2>/dev/null || true
               cp "$LOCAL_RESULTS/base_fps.txt"       "$OUT/" 2>/dev/null || true
               cp "$LOCAL_RESULTS/main_fps.txt"       "$OUT/" 2>/dev/null || true
@@ -501,7 +493,7 @@ spec:
               echo "═══════════════════════════════════════════"
           resources:
             claims:
-              - name: l-lnc1-trn2
+              - name: m-lnc1-trn2
             # Sized to fit the tighter node (ip-...-107-10: ~82Gi mem / ~48 vCPU free).
             # RF's host-memory footprint is small — weights live in Neuron HBM, not host
             # RAM — so the old 256Gi request only ever fit the roomier node. 64Gi limit
@@ -521,7 +513,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "rf-distill-t4"
+              value: "tp4-sp4-16core"
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL

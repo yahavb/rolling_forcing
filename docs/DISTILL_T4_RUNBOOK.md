@@ -126,3 +126,44 @@ Confirm the ~16 fps target and check quality on your prompt set.
   AdamW moments across 16 cores.
 - T=4 quality is unvalidated by the upstream authors (they use T=5); it trades
   quality for throughput. Validate on your target prompts before shipping.
+
+---
+
+## Render / quality results (2026-07-13)
+
+Serving the distilled checkpoints end-to-end (train → ckpt on PVC → e2e_pipeline
+render → eyeball vs the shipped T=5 baseline `rf_sp4_videos/prompt_000.mp4`).
+
+### Quality (the verdict)
+- iter200 EMA (T=4) — BLURRY
+- iter400 EMA (T=4) — BLURRY
+- iter1000 EMA (T=4) — STILL BLURRY (EMA has ~800 G-steps avg by here; not "too early")
+- shipped `rolling_forcing_dmd.pt` (T=5) — SHARP (ground truth)
+- => our T=4 distillation is UNDER-CONVERGED / not usable yet. Training is the blocker,
+  not serving. prompt_000 (western/horse) is the ONLY trained prompt; it is blurry, so
+  untrained prompts being blurry tells us nothing extra.
+
+### Open confound (resolve before more training)
+Render the SHIPPED ckpt at T=4 (not T=5): isolates "4 steps too few" from "our weights bad".
+- shipped@T=4 blurry -> T=4 inherently degrades quality; distillation must specifically fix it.
+- shipped@T=4 sharp  -> our distilled weights are undertrained; train more / fix critic balance.
+
+### EMA (added 2026-07-13, commit 31dd612)
+- DMD raw generator loss oscillates by design (avg50 cycled 0.35->0.68->0.49 over ~1000 iters
+  — a full lobe, NOT divergence). Ship the EMA weights, not raw snapshots.
+- Impl: sharded fp32 EMA, NO FSDP.summon_full_params (avoids the 5.3GB/rank spike that got
+  EMA disabled before); full_tensor()->CPU only at save. Saves `generator_ema` in the ckpt.
+  Config: ema_weight=0.999, ema_start_step=200. Render with `--use_ema`.
+- loss_fake drifts up late (spikes 1.5-2.2) = critic destabilizing. Lever: raise
+  dfake_gen_update_ratio 5->10 and/or lower generator lr (standard DMD2 generator/critic balance).
+
+### fps note (SEPARATE thread — do not block training)
+- T=4 renders measured ~2 fps vs ~14 fps T=5 baseline on the SAME 16 cores (TP4xCP4).
+  Pathological (T=4 is LESS work). profiler per_neff_mfu.txt (run 120726204813): 2 hottest
+  NEFFs OVERHEAD-BOUND (tensor ~6%, gpsimd ~89%, dma ~48%) under RF_RING=1 @ 1200 seq len.
+- CAUSE DISPUTED: user validated main+ring = 14fps at 1480 seq len. Control queued
+  (iter1000-job.yaml edited: original ckpt @ T=5 @ ring-on @ 1200) — NOT yet run.
+- Render jobs: iter{200,400,1000}-job.yaml. BRANCH=main (+ committed restore_layout T=4 fix
+  4e7e1d6 so T=4 geometry doesn't crash), RF_RING=1, TP4xCP4, latent_w 80 (1200), --use_ema.
+- Frames land in-pod at /tmp/results/clean_out/prompt_NNN.mp4 (kubectl cp) and on the PVC at
+  /var/mdl/rolling-forcing/runs/<TS>/frames/cp4_16rank/ (aws s3 cp) after the job's persist step.
