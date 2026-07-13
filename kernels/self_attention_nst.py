@@ -142,6 +142,107 @@ def wan_flash_self_attn(
     return result
 
 
+@wrap_nki
+@nki.jit
+def wan_flash_self_attn_gather_kv(
+    q: nl.ndarray,
+    k_shard: nl.ndarray,
+    v_shard: nl.ndarray,
+    replica_group,
+    world_size: int,
+    nblocks: int,
+    softmax_scale: Optional[float] = None,
+):
+    """IN-KERNEL KV all-gather + flash self-attention (the cache-shard fps lever).
+
+    Each rank passes ONLY its 1/world token-shard of the KV window; the kernel gathers
+    the shards over `replica_group` (= the 'world' group, all `world_size` ranks) with
+    nki.collectives.all_gather and reassembles the FULL window IN-KERNEL, then runs the
+    existing flash attention over the full window. This replaces the two torch
+    all_gather barriers in dit_attention._attend_cache_shard: the DMA->shared_hbm->
+    ncc.all_gather runs on the DMA engine and can overlap the Q-side compute, whereas the
+    torch all_gather is a hard barrier (the reason cache-shard was a memory win but not an
+    fps win). CORE idiom: attention_kv_parallel_segmented_cte.py:156 (dma_copy each slice
+    into a NAMED shared_hbm buffer FIRST — collectives cannot touch NEFF I/O tensors — then
+    ncc.all_gather over collective_dim=0).
+
+    PER-BLOCK INTERLEAVE reassembly (proven bit-exact, verify_cache_shard.py): each rank's
+    window-shard is nblocks blocks of ws_block tokens; the full window = for each block,
+    concat rank0..world-1's slice. all_gather(collective_dim=0) lands [world, bs, ...] in
+    rank order, so we reshape to interleave per block (identical index math to the torch
+    path it replaces).
+
+    q       [bs, d, seqlen_q]          (bs = heads/shard; this rank's query, already gathered over attn-tp)
+    k_shard [bs, d, k_len_shard]       (this rank's RAW valid window shard, no padding)
+    v_shard [bs, k_len_shard, d]
+    """
+    import nki.collectives as ncc
+
+    bs, d, k_len_shard = k_shard.shape
+    _bs_q, _d_q, seqlen_q = q.shape
+    kernel_assert(bs == _bs_q and d == _d_q,
+                  f"q/kv head/d mismatch: q[{_bs_q},{_d_q}] kv[{bs},{d}]")
+    kernel_assert(k_len_shard % nblocks == 0,
+                  f"k_len_shard {k_len_shard} not divisible by nblocks {nblocks}")
+    ws_block = k_len_shard // nblocks
+    full_len = world_size * k_len_shard
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(d)
+
+    # --- 1) DMA each rank's shard into a NAMED shared_hbm buffer (collectives can't read
+    #        NEFF I/O tensors directly; name= avoids NCC_IBIR440). ---
+    k_src = nl.ndarray((bs, d, k_len_shard), dtype=k_shard.dtype, buffer=nl.shared_hbm, name="k_src")
+    v_src = nl.ndarray((bs, k_len_shard, d), dtype=v_shard.dtype, buffer=nl.shared_hbm, name="v_src")
+    nisa.dma_copy(dst=k_src, src=k_shard)
+    nisa.dma_copy(dst=v_src, src=v_shard)
+
+    # --- 2) all_gather over the world replica group (DMA engine; overlaps compute). Lands
+    #        [world*bs, ...] in rank order on collective_dim=0. ---
+    k_gathered = nl.ndarray((world_size * bs, d, k_len_shard), dtype=k_shard.dtype,
+                            buffer=nl.shared_hbm, name="k_gathered")
+    v_gathered = nl.ndarray((world_size * bs, k_len_shard, d), dtype=v_shard.dtype,
+                            buffer=nl.shared_hbm, name="v_gathered")
+    ncc.all_gather(dsts=[k_gathered], srcs=[k_src], replica_group=replica_group, collective_dim=0)
+    ncc.all_gather(dsts=[v_gathered], srcs=[v_src], replica_group=replica_group, collective_dim=0)
+
+    # --- 3) PER-BLOCK INTERLEAVE into the full window (verify_cache_shard.py layout):
+    #        k_gathered [world*bs, d, k_len_shard] -> [world, bs, d, nblocks, ws_block]
+    #                   -> permute [bs, d, nblocks, world, ws_block] -> flatten to [bs, d, full_len]
+    #        (for each block, concat rank0..world-1). Same index math as the torch path it
+    #        replaces (dit_attention._attend_cache_shard). TensorView = zero-copy strided view;
+    #        the flash impl reads it via its normal DMA. NOTE: this per-block reassembly layout
+    #        is the ONE piece to confirm on-device against the torch path (max|Δ|=0 gate).
+    kv = (TensorView(k_gathered)
+          .reshape_dim(0, (world_size, bs))          # [world, bs, d, k_len_shard]
+          .reshape_dim(3, (nblocks, ws_block))       # [world, bs, d, nblocks, ws_block]
+          .permute((1, 2, 3, 0, 4))                  # [bs, d, nblocks, world, ws_block]
+          .flatten_dims(2, 4))                        # [bs, d, full_len]
+    k_full = kv.get_view()
+    vv = (TensorView(v_gathered)
+          .reshape_dim(0, (world_size, bs))          # [world, bs, k_len_shard, d]
+          .reshape_dim(2, (nblocks, ws_block))       # [world, bs, nblocks, ws_block, d]
+          .permute((1, 2, 0, 3, 4))                  # [bs, nblocks, world, ws_block, d]
+          .flatten_dims(1, 3))                        # [bs, full_len, d]
+    v_full = vv.get_view()
+
+    # --- 4) flash attention over the reassembled full window (reuse the proven impl). ---
+    result = nl.ndarray(shape=(seqlen_q, bs, d), dtype=q.dtype, buffer=nl.shared_hbm)
+    ac = AttnConfig(
+        seqlen_q=seqlen_q, seqlen_k=full_len, actual_seqlen_k=full_len,
+        d=d, bs=bs, scale=softmax_scale, dtype=q.dtype, return_partials=False,
+    )
+    use_flash_attn = full_len > _FLASH_ATTENTION_THRESHOLD
+    if use_flash_attn:
+        partial_out = nl.ndarray(shape=(bs, seqlen_q, d), dtype=nl.float32,
+                                 buffer=nl.hbm, name="gkv_partial_out_fp32")
+    else:
+        partial_out = result
+    for batch_id in range(bs):
+        _wan_flash_attn_kernel_impl(q, k_full, v_full, result, partial_out, ac, batch_id, None, None)
+    return result
+
+
 @dataclass
 class AttnConfig(nl.NKIObject):
     seqlen_q: int = None

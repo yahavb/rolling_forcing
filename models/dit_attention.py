@@ -23,7 +23,7 @@ import torch.nn as nn
 from kernels.kv_cache_copy import cache_copy, kv_cache_copy
 from kernels.restore_layout import restore_layout
 from kernels.rope import causal_rope_rotation, build_rope_grids
-from kernels.self_attention_nst import wan_flash_self_attn
+from kernels.self_attention_nst import wan_flash_self_attn, wan_flash_self_attn_gather_kv
 from utils import _compile
 from utils import parallel_state as ps
 
@@ -781,6 +781,25 @@ class CausalWanSelfAttention(nn.Module):
         # this rank's RAW valid window shard (no padding) — the leading k_len_int columns.
         k_own = k_kern[:, :, :k_len_int].contiguous()          # [bs, d, k_len_int]
         v_own = v_kern[:, :k_len_int, :].contiguous()          # [bs, k_len_int, d]
+        ws_block = self._cs_block_length
+        assert k_len_int % ws_block == 0, (
+            f"cache-shard: window shard {k_len_int} not a multiple of ws_block {ws_block}")
+        nblocks = k_len_int // ws_block
+
+        # IN-KERNEL GATHER (RF_CACHESHARD_INKERNEL): the fps lever. Replace the two torch
+        # all_gather BARRIERS below with one NKI kernel that DMAs each rank's shard to
+        # shared_hbm then ncc.all_gather (DMA engine, overlaps Q compute) + reassembles the
+        # full window in-kernel. Torch all_gather = memory win only (~12fps); in-kernel
+        # overlapping exchange is the throughput play. ReplicaGroup = the 'world' ranks.
+        import os as _os_ik
+        if _os_ik.environ.get("RF_CACHESHARD_INKERNEL", "0") == "1":
+            from nki.collectives import ReplicaGroup
+            rg = ReplicaGroup([list(range(N))])
+            out = wan_flash_self_attn_gather_kv(
+                q_kern, k_own, v_own, rg, N, nblocks,
+                softmax_scale=self.softmax_scale)
+            return out.unsqueeze(0).flatten(2)
+
         # all_gather over world: dim-0 concat into a [N, bs, ...] view (k on last/seqlen axis,
         # v on middle/seqlen axis).
         k_g = torch.empty((N, bs, d_dim, k_len_int), dtype=k_own.dtype, device=k_own.device)
@@ -789,10 +808,6 @@ class CausalWanSelfAttention(nn.Module):
         ps.all_gather_into_tensor(v_g.view(N * bs, k_len_int, d_dim), v_own, "world")
         # PER-BLOCK INTERLEAVE: each rank's window-shard holds nblocks blocks of ws_block
         # tokens each; the full window = for each block, concat rank0..N-1 (verify_cache_shard).
-        ws_block = self._cs_block_length
-        assert k_len_int % ws_block == 0, (
-            f"cache-shard: window shard {k_len_int} not a multiple of ws_block {ws_block}")
-        nblocks = k_len_int // ws_block
         full_len = N * k_len_int
         # k_g [N,bs,d,nblocks,ws_block] -> [bs,d,nblocks,N,ws_block] -> [bs,d,nblocks*N*ws_block]
         k_cat = (k_g.view(N, bs, d_dim, nblocks, ws_block)
