@@ -82,6 +82,18 @@ class CausalWanSelfAttention(nn.Module):
         self.kv_cache_logical_size = 24 * self.frame_length
         self.layer_idx = layer_idx
 
+        # TRUE CACHE-SHARDING (RF_RING_CACHESHARD): each rank stores ONLY its 1/world token
+        # slice of the persistent cache (16x memory). The bookkeeping divides cleanly by
+        # world_size — each rank's stream is structurally identical to the full stream at
+        # 1/world scale (proven: verify_cache_shard.py max|Δ|=0). Sharded sizes used by
+        # _cache_write / _assemble_kv when the flag is on.
+        import os as _os_cs
+        self._cache_shard = (_os_cs.environ.get("RF_RING_CACHESHARD", "0") == "1")
+        # sharded (per-rank, 1/world) position sizes — set after world_size is known below.
+        self._cs_block_length = None
+        self._cs_max_attention_size = None
+        self._cs_kv_cache_logical_size = None
+
         tp_degree = ps.get_world_size("attn-tp")
         sp_degree = ps.get_world_size("attn-sp")
         assert num_heads % tp_degree == 0, (
@@ -92,6 +104,14 @@ class CausalWanSelfAttention(nn.Module):
         self.heads_per_shard = num_heads // tp_degree
         self.sp_rank = ps.get_rank("attn-sp")
         self.tp_rank = ps.get_rank("attn-tp")
+
+        if self._cache_shard and self.world_size > 1:
+            assert self.block_length % self.world_size == 0, f"block_length {self.block_length} % world {self.world_size}"
+            assert self.max_attention_size % self.world_size == 0, f"max_attn {self.max_attention_size} % world {self.world_size}"
+            assert self.kv_cache_logical_size % self.world_size == 0, f"kv_logical {self.kv_cache_logical_size} % world {self.world_size}"
+            self._cs_block_length = self.block_length // self.world_size
+            self._cs_max_attention_size = self.max_attention_size // self.world_size
+            self._cs_kv_cache_logical_size = self.kv_cache_logical_size // self.world_size
 
         self.q = _compile(nn.Linear(dim, dim))
         self.k = _compile(nn.Linear(dim, dim))
@@ -161,21 +181,33 @@ class CausalWanSelfAttention(nn.Module):
         return t.view(L, n, d)[:, h_start:h_end]
 
     def _will_anchor_write(self, kv_cache, cache_start):
-        cache_end = cache_start + self.block_length
+        # TRUE CACHE-SHARD: every position quantity scales by 1/world uniformly, so the
+        # bookkeeping is structurally identical at 1/world scale (verify_cache_shard.py).
+        block_length = self._cs_block_length if self._cache_shard else self.block_length
+        kv_cache_size = (self._cs_kv_cache_logical_size if self._cache_shard
+                         else self.kv_cache_logical_size)
+        # cache_start arrives in FULL sequence coords (advances by full block/phase); convert
+        # to sharded coords so cache_end / global_end_index / eviction all live at 1/world
+        # scale consistently (verify_cache_start_shardcoords.py: sharded == full // world).
+        if self._cache_shard and self.world_size > 1:
+            cache_start = cache_start // self.world_size
+        cache_end = cache_start + block_length
         global_end_index = kv_cache["global_end_index"]
         local_end_index_current = kv_cache["local_end_index"]
         num_new_tokens = max(cache_end - global_end_index, 0)
-        kv_cache_size = self.kv_cache_logical_size
         if num_new_tokens > 0 and num_new_tokens + local_end_index_current > kv_cache_size:
             num_evicted = num_new_tokens + local_end_index_current - kv_cache_size
         else:
             num_evicted = 0
         local_end_index = local_end_index_current + num_new_tokens - num_evicted
-        return local_end_index == self.block_length
+        return local_end_index == block_length
 
     def _cache_copy_inplace(self, k_dst, k_src, v_dst=None, v_src=None):
-        assert k_src.shape == k_dst.shape and k_src.numel() > 0
-        assert v_dst is None or v_src.shape == v_dst.shape and v_src.numel() > 0
+        assert k_src.shape == k_dst.shape and k_src.numel() > 0, (
+            f"_cache_copy_inplace K shape mismatch: src{tuple(k_src.shape)} != dst{tuple(k_dst.shape)}")
+        assert v_dst is None or v_src.shape == v_dst.shape and v_src.numel() > 0, (
+            f"_cache_copy_inplace V shape mismatch: src{tuple(v_src.shape) if v_src is not None else None} "
+            f"!= dst{tuple(v_dst.shape) if v_dst is not None else None}")
         """Device-dispatched cache copy: copy_ on CPU, NKI kernel on Neuron."""
         if v_dst is not None:
             kv_cache_copy(k_dst, k_src, v_dst, v_src)
@@ -266,6 +298,81 @@ class CausalWanSelfAttention(nn.Module):
         # discarding (sp-1)/sp of it. RoPE only this shard's positions. k/v still
         # gather full L over world (attention reads the whole KV window).
         # Validated at CP2/CP4/CP8 (max|Δ|=0.0 vs the old full-gather path).
+        if self.world_size > 1 and self._cache_shard:
+            # TRUE CACHE-SHARD (RF_RING_CACHESHARD): produce k/v/roped_key as THIS RANK's
+            # 1/world token slice ONLY — do NOT world-gather them (that is the whole point:
+            # the persistent cache stores 1/world of the sequence per rank; the full window
+            # is reassembled at attention time in _attend). x is already world-sharded, so
+            # k_local/v_local ARE this rank's slice. RoPE is per-position, so RoPE the local
+            # K slice at its GLOBAL offset world_rank*world_shard (proven bit-exact vs
+            # rope-full-then-slice — verify_krope_shard.py). roped_query stays the sp-shard
+            # (same as the default world>1 path). Heads are TP-sliced exactly as elsewhere.
+            world_rank = ps.get_rank("world")
+            world_shard = L // self.world_size
+            q_tp = torch.empty(sp_shard_len, self.dim, dtype=q_local.dtype, device=q_local.device)
+            ps.all_gather_into_tensor(q_tp, q_local, "attn-tp")
+            q_tp_4d = q_tp.view(sp_shard_len, n, d).unsqueeze(0)
+            roped_query = self._nki_rope_apply(
+                q_tp_4d, grid_sizes, freqs_cos, freqs_sin,
+                start_frame=start_frame_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=start_frame_int,
+                head_start=h_start, head_end=h_end,
+                tok_offset=sp_start, tok_len=sp_shard_len)
+            v = self._slice_heads(v_local)  # [1, world_shard, n_local, d]
+            k_shard_4d = k_local.view(world_shard, n, d).unsqueeze(0)
+            roped_key = self._nki_rope_apply(
+                k_shard_4d, grid_sizes, freqs_cos, freqs_sin,
+                start_frame=start_frame_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=start_frame_int, head_start=h_start, head_end=h_end,
+                tok_offset=world_rank * world_shard, tok_len=world_shard)  # [1, world_shard, n_local, d]
+            if kv_cache is None or self._will_anchor_write(kv_cache, current_start):
+                k = self._slice_heads(k_local)  # unroped, this rank's world-shard, n_local heads
+            else:
+                k = None
+            return roped_query, k, v, roped_key
+        import os as _os_kr
+        _krope_shard = (_os_kr.environ.get("RF_RING_KROPE", "0") == "1")
+        if self.world_size > 1 and _krope_shard:
+            # SHARDED-K-RoPE (sharding-enabled win): RoPE is per-position, so RoPE only THIS
+            # rank's L/world_size K slice at its global offset, THEN world-gather the roped
+            # shards (all_gather concatenates in rank order == the full roped K). Proven
+            # bit-exact (RoPE-shard-then-gather == RoPE-full). Cuts the gpsimd-heavy K-RoPE
+            # work by world_size (16x): today every rank RoPEs the FULL L redundantly.
+            q_tp = torch.empty(sp_shard_len, self.dim, dtype=q_local.dtype, device=q_local.device)
+            ps.all_gather_into_tensor(q_tp, q_local, "attn-tp")
+            q_tp_4d = q_tp.view(sp_shard_len, n, d).unsqueeze(0)
+            roped_query = self._nki_rope_apply(
+                q_tp_4d, grid_sizes, freqs_cos, freqs_sin,
+                start_frame=start_frame_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=start_frame_int,
+                head_start=h_start, head_end=h_end,
+                tok_offset=sp_start, tok_len=sp_shard_len)
+            # SINGLE k/v world-gather (was 3 redundant gathers — ntrace: sharding cost is
+            # LAUNCHES not compute, so collapse them). _gather_qkv(gather_q=False) gathers
+            # BOTH k and v in one call; reuse for v AND the anchor-k path.
+            _, k_full, v_full = self._gather_qkv(q_local, k_local, v_local, L, gather_q=False)
+            v = self._slice_heads(v_full)
+            # k: RoPE this rank's world-shard at its global offset, gather the ROPED shards.
+            world_rank = ps.get_rank("world")
+            world_shard = L // self.world_size
+            k_shard_4d = k_local.view(world_shard, n, d).unsqueeze(0)
+            rk_shard = self._nki_rope_apply(
+                k_shard_4d, grid_sizes, freqs_cos, freqs_sin,
+                start_frame=start_frame_t, rope_grid_cache=rope_grid_cache,
+                start_frame_int=start_frame_int, head_start=h_start, head_end=h_end,
+                tok_offset=world_rank * world_shard, tok_len=world_shard)  # [1, world_shard, n_local, d]
+            # gather the per-rank roped K shards (heads already TP-sliced) over world.
+            n_local = self.heads_per_shard
+            rk_flat = rk_shard[0].reshape(world_shard, n_local * d)
+            rk_gathered = torch.empty(L, n_local * d, dtype=rk_flat.dtype, device=rk_flat.device)
+            ps.all_gather_into_tensor(rk_gathered, rk_flat, "world")
+            roped_key = rk_gathered.view(L, n_local, d).unsqueeze(0)
+            # k (unroped, head-sliced) for anchor write — reuse the k_full already gathered.
+            if kv_cache is None or self._will_anchor_write(kv_cache, current_start):
+                k = self._slice_heads(k_full)
+            else:
+                k = None
+            return roped_query, k, v, roped_key
         if self.world_size > 1:
             q_tp = torch.empty(sp_shard_len, self.dim, dtype=q_local.dtype, device=q_local.device)
             ps.all_gather_into_tensor(q_tp, q_local, "attn-tp")
@@ -305,12 +412,23 @@ class CausalWanSelfAttention(nn.Module):
         return roped_query, k, v, roped_key
 
     def _cache_write(self, k, v, roped_key, kv_cache, cache_start, shared_buffers):
-        cache_end = cache_start + self.block_length
+        # TRUE CACHE-SHARD: k/v/roped_key are this rank's 1/world slice and kv_cache["k"]/["v"]
+        # are allocated at 1/world size, so every position quantity uses the sharded size.
+        # Structure is unchanged — each rank's stream is the full stream at 1/world scale
+        # (verify_cache_shard.py max|Δ|=0).
+        block_length = self._cs_block_length if self._cache_shard else self.block_length
+        kv_cache_size = (self._cs_kv_cache_logical_size if self._cache_shard
+                         else self.kv_cache_logical_size)
+        # cache_start arrives in FULL sequence coords; convert to sharded coords so cache_end /
+        # global_end_index / num_evicted / evict slice all live at 1/world scale consistently
+        # (verify_cache_start_shardcoords.py: sharded bookkeeping == full // world every phase).
+        if self._cache_shard and self.world_size > 1:
+            cache_start = cache_start // self.world_size
+        cache_end = cache_start + block_length
         global_end_index = kv_cache["global_end_index"]
         local_end_index_current = kv_cache["local_end_index"]
         num_new_tokens = cache_end - global_end_index
-        kv_cache_size = self.kv_cache_logical_size
-        sink_tokens = self.block_length
+        sink_tokens = block_length
 
         buffer_k, buffer_v = shared_buffers
 
@@ -328,16 +446,16 @@ class CausalWanSelfAttention(nn.Module):
                 kv_cache["v"][0, sink_tokens:sink_tokens + evict_rolled], buffer_v[0, :evict_rolled])
 
         local_end_index = local_end_index_current + num_new_tokens - num_evicted
-        local_start_index = local_end_index - self.block_length
+        local_start_index = local_end_index - block_length
 
         if local_start_index == 0:
             self._cache_copy_inplace(
-                kv_cache["k"][0, :self.block_length], k[0, :self.block_length],
-                kv_cache["v"][0, :self.block_length], v[0, :self.block_length])
+                kv_cache["k"][0, :block_length], k[0, :block_length],
+                kv_cache["v"][0, :block_length], v[0, :block_length])
         else:
             self._cache_copy_inplace(
-                kv_cache["k"][0, local_start_index:local_end_index], roped_key[0, :self.block_length],
-                kv_cache["v"][0, local_start_index:local_end_index], v[0, :self.block_length])
+                kv_cache["k"][0, local_start_index:local_end_index], roped_key[0, :block_length],
+                kv_cache["v"][0, local_start_index:local_end_index], v[0, :block_length])
 
         if num_new_tokens > 0:
             kv_cache["global_end_index"] = cache_end
@@ -354,9 +472,34 @@ class CausalWanSelfAttention(nn.Module):
         buffer_k, buffer_v = shared_buffers
         device = roped_key.device
 
+        # TRUE CACHE-SHARD: every position quantity scales by 1/world (verify_cache_shard.py).
+        # In the denoise path only the final valid_tokens copy is live (updating_cache=False,
+        # local_start_index==0 at phase 0), but substitute the named sizes structurally so any
+        # future denoise phase that rolls stays consistent. valid_tokens is already sharded by
+        # the caller (forward). frame_length in the wc branch has no sharded companion; that
+        # branch is dead in the sharded denoise path (see report note).
+        block_length = self._cs_block_length if self._cache_shard else self.block_length
+        max_attention_size = (self._cs_max_attention_size if self._cache_shard
+                              else self.max_attention_size)
+
+        # CACHE-SHARD anchor RoPE: the cached sink block below holds only THIS rank's
+        # per-block-0 TOKEN shard (ws_block tokens at in-block global offset
+        # world_rank*ws_block). Pass tok_offset/tok_len so the single-block grid (3,h,w)
+        # is sliced to this rank's tokens instead of asserting seq_len(block)==s(ws_block).
+        # Do NOT pass head_start/head_end: the cache already stores head-sliced K (n_local
+        # heads), so _nki_rope_apply defaults head_end=x.shape[2]=n_local (all cached heads).
+        # RoPE is per-position AND per-head-independent -> bit-exact (verify_anchor_shard.py
+        # max|Δ|=0). Non-shard path: empty kwargs -> full-block RoPE, unchanged.
+        anchor_shard_kw = {}
+        if self._cache_shard and self.world_size > 1:
+            ws_block = self._cs_block_length
+            world_rank = ps.get_rank("world")
+            anchor_shard_kw = dict(
+                tok_offset=world_rank * ws_block, tok_len=ws_block)
+
         if updating_cache:
-            cache_len = min(local_end_index, self.max_attention_size)
-            cache_start_pos = max(0, local_end_index - self.max_attention_size)
+            cache_len = min(local_end_index, max_attention_size)
+            cache_start_pos = max(0, local_end_index - max_attention_size)
 
             self._cache_copy_inplace(
                 buffer_k[0, :cache_len],
@@ -366,34 +509,36 @@ class CausalWanSelfAttention(nn.Module):
 
             if cache_start_pos == 0:
                 anchor_roped = self._nki_rope_apply(
-                    kv_cache["k"][0, :self.block_length].unsqueeze(0),
+                    kv_cache["k"][0, :block_length].unsqueeze(0),
                     grid_sizes_one_block, freqs_cos, freqs_sin,
                     start_frame=torch.tensor(0, device=device),
-                    rope_grid_cache=rope_grid_cache, start_frame_int=0)
+                    rope_grid_cache=rope_grid_cache, start_frame_int=0,
+                    **anchor_shard_kw)
                 self._cache_copy_inplace(
-                    buffer_k[0, :self.block_length], anchor_roped[0])
+                    buffer_k[0, :block_length], anchor_roped[0])
 
             return cache_len
 
         offset = 0
         if local_start_index > 0:
-            wc_max = self.max_attention_size - valid_tokens - self.block_length
+            wc_max = max_attention_size - valid_tokens - block_length
             wc_end = local_start_index
-            wc_start = max(self.block_length, wc_end - wc_max)
+            wc_start = max(block_length, wc_end - wc_max)
             wc_len = wc_end - wc_start
 
             wc_frame_length = wc_len // self.frame_length
             rope_start_frame = current_start_frame - wc_frame_length - 3
             anchor_roped = self._nki_rope_apply(
-                kv_cache["k"][0, :self.block_length].unsqueeze(0),
+                kv_cache["k"][0, :block_length].unsqueeze(0),
                 grid_sizes_one_block, freqs_cos, freqs_sin,
                 start_frame=torch.tensor(rope_start_frame, device=device),
                 rope_grid_cache=rope_grid_cache,
-                start_frame_int=rope_start_frame)
+                start_frame_int=rope_start_frame,
+                **anchor_shard_kw)
             self._cache_copy_inplace(
-                buffer_k[0, :self.block_length], anchor_roped[0],
-                buffer_v[0, :self.block_length], kv_cache["v"][0, :self.block_length])
-            offset = self.block_length
+                buffer_k[0, :block_length], anchor_roped[0],
+                buffer_v[0, :block_length], kv_cache["v"][0, :block_length])
+            offset = block_length
 
             if wc_len > 0:
                 self._cache_copy_inplace(
@@ -412,10 +557,15 @@ class CausalWanSelfAttention(nn.Module):
         k_kern = buffer_k[0].permute(1, 2, 0).contiguous()
         v_kern = buffer_v[0].permute(1, 0, 2).contiguous()
 
+        import os as _os
+        if self._cache_shard and self.world_size > 1:
+            return self._attend_cache_shard(q_kern, k_kern, v_kern, k_len_int)
+
         assert k_kern.shape[2] % ATTN_SEQLEN_MULTIPLE == 0
         assert v_kern.shape[1] % ATTN_SEQLEN_MULTIPLE == 0
 
-        import os as _os
+        if _os.environ.get("RF_RING_SHARD", "0") == "1" and self.sp_degree > 1:
+            return self._attend_ring_shard(q_kern, k_kern, v_kern, k_len_int)
         if _os.environ.get("RF_RING", "0") == "1" and self.sp_degree > 1:
             return self._attend_ring(q_kern, k_kern, v_kern, k_len_int)
 
@@ -575,6 +725,90 @@ class CausalWanSelfAttention(nn.Module):
         # -> [1, Sq, bs*d]  (same as wan_flash_self_attn result path).
         return out.unsqueeze(0).flatten(2)
 
+    def _attend_ring_shard(self, q_kern, k_kern, v_kern, k_len_int):
+        """STAGE 3b: sharded-window attention. Each rank contributes ONLY its RAW L/sp slice;
+        all_gather over attn-sp reassembles the contiguous window; ONE flash call (like the
+        baseline). Fixes the 3 wastes of the first attempt (run w4rmj, ~5.9fps): (1) gather
+        RAW seg-length slices, NOT 8192-padded (was 9.1x byte waste); (2) reassemble into ONE
+        contiguous [bs,d,k_len] window and make a SINGLE kernel call (was 4 padded calls +
+        online-softmax combine); (3) all_gather over attn-sp is the ONLY exchange primitive
+        (Neuron has no P2P — run sdjkl). Result is byte-identical to the baseline full-window
+        attention (concatenation of raw slices in rank order == the window). q_kern [bs,d,Sq];
+        k_kern [bs,d,Sk]; v_kern [bs,Sk,d]."""
+        sp = self.sp_degree
+        r = self.sp_rank
+        assert k_len_int % sp == 0, f"ring-shard: k_len={k_len_int} not divisible by sp={sp}"
+        seg = k_len_int // sp
+        bs, d_dim, Sk = k_kern.shape
+
+        # this rank's RAW slice (global segment r), no padding.
+        k_own = k_kern[:, :, r * seg:(r + 1) * seg].contiguous()          # [bs,d,seg]
+        v_own = v_kern[:, r * seg:(r + 1) * seg, :].contiguous()          # [bs,seg,d]
+        # all_gather RAW slices over attn-sp -> contiguous window in rank order.
+        # k gathered on the LAST (seqlen) axis, v on the MIDDLE (seqlen) axis.
+        k_cat = torch.empty((bs, d_dim, sp * seg), dtype=k_own.dtype, device=k_own.device)
+        v_cat = torch.empty((bs, sp * seg, d_dim), dtype=v_own.dtype, device=v_own.device)
+        # all_gather_into_tensor concatenates on dim 0; gather into a [sp,...] view then
+        # move the sp axis into the seqlen position to get the contiguous window.
+        k_g = torch.empty((sp, bs, d_dim, seg), dtype=k_own.dtype, device=k_own.device)
+        v_g = torch.empty((sp, bs, seg, d_dim), dtype=v_own.dtype, device=v_own.device)
+        ps.all_gather_into_tensor(k_g.view(sp * bs, d_dim, seg), k_own, "attn-sp")
+        ps.all_gather_into_tensor(v_g.view(sp * bs, seg, d_dim), v_own, "attn-sp")
+        # k_g[s] is rank s's [bs,d,seg]; window = concat over s on seqlen -> [bs,d,sp*seg].
+        k_cat = k_g.permute(1, 2, 0, 3).reshape(bs, d_dim, sp * seg).contiguous()
+        v_cat = v_g.permute(1, 0, 2, 3).reshape(bs, sp * seg, d_dim).contiguous()
+        # ONE flash call over the reassembled contiguous window (baseline-identical path).
+        out = wan_flash_self_attn(
+            q_kern, k_cat, v_cat,
+            softmax_scale=self.softmax_scale,
+            actual_seqlen_k=k_len_int,
+            use_dynamic_loop=False,
+        )
+        return out.unsqueeze(0).flatten(2)
+
+    def _attend_cache_shard(self, q_kern, k_kern, v_kern, k_len_int):
+        """TRUE CACHE-SHARD attention (RF_RING_CACHESHARD). Each rank holds only its 1/world
+        token-shard of the KV window (k_len_int is the SHARDED window length). all_gather the
+        per-rank window-shards over the 'world' group and reassemble the FULL window via the
+        PER-BLOCK INTERLEAVED reshape proven bit-exact in verify_cache_shard.py:
+            full window = for each block in the window, concat rank0..rank(world-1) slices.
+        Then ONE wan_flash_self_attn call over the reassembled window (identical structure to
+        _attend_ring_shard's nseg==1 fast path). q_kern [bs,d,Sq]; k_kern [bs,d,buf_w];
+        v_kern [bs,buf_w,d] (bs = heads/shard). all_gather is the only exchange primitive
+        (Neuron has no P2P)."""
+        N = self.world_size
+        bs, d_dim, _ = k_kern.shape
+        # this rank's RAW valid window shard (no padding) — the leading k_len_int columns.
+        k_own = k_kern[:, :, :k_len_int].contiguous()          # [bs, d, k_len_int]
+        v_own = v_kern[:, :k_len_int, :].contiguous()          # [bs, k_len_int, d]
+        # all_gather over world: dim-0 concat into a [N, bs, ...] view (k on last/seqlen axis,
+        # v on middle/seqlen axis).
+        k_g = torch.empty((N, bs, d_dim, k_len_int), dtype=k_own.dtype, device=k_own.device)
+        v_g = torch.empty((N, bs, k_len_int, d_dim), dtype=v_own.dtype, device=v_own.device)
+        ps.all_gather_into_tensor(k_g.view(N * bs, d_dim, k_len_int), k_own, "world")
+        ps.all_gather_into_tensor(v_g.view(N * bs, k_len_int, d_dim), v_own, "world")
+        # PER-BLOCK INTERLEAVE: each rank's window-shard holds nblocks blocks of ws_block
+        # tokens each; the full window = for each block, concat rank0..N-1 (verify_cache_shard).
+        ws_block = self._cs_block_length
+        assert k_len_int % ws_block == 0, (
+            f"cache-shard: window shard {k_len_int} not a multiple of ws_block {ws_block}")
+        nblocks = k_len_int // ws_block
+        full_len = N * k_len_int
+        # k_g [N,bs,d,nblocks,ws_block] -> [bs,d,nblocks,N,ws_block] -> [bs,d,nblocks*N*ws_block]
+        k_cat = (k_g.view(N, bs, d_dim, nblocks, ws_block)
+                     .permute(1, 2, 3, 0, 4)
+                     .reshape(bs, d_dim, full_len).contiguous())
+        v_cat = (v_g.view(N, bs, nblocks, ws_block, d_dim)
+                     .permute(1, 2, 0, 3, 4)
+                     .reshape(bs, full_len, d_dim).contiguous())
+        out = wan_flash_self_attn(
+            q_kern, k_cat, v_cat,
+            softmax_scale=self.softmax_scale,
+            actual_seqlen_k=full_len,
+            use_dynamic_loop=False,
+        )
+        return out.unsqueeze(0).flatten(2)
+
     def _output_proj(self, out):
         out = self.o(out)
         if self.tp_degree > 1:
@@ -586,6 +820,191 @@ class CausalWanSelfAttention(nn.Module):
             ps.reduce_scatter_tensor(rs_out, out_flat, "attn-tp")
             out = rs_out.unsqueeze(0)
         return out
+
+    def _forward_merged_cache_shard(
+        self,
+        x,
+        grid_sizes,
+        freqs_cos, freqs_sin,
+        kv_cache,
+        cache_update_start, current_start,
+        cu_shared_buffers, dn_shared_buffers,
+        num_valid_frames_dn,
+        nfpb_cu,
+        rope_grid_cache=None,
+    ):
+        """TRUE CACHE-SHARD (RF_RING_CACHESHARD) merged cu/dn path. Each rank holds ONLY its
+        UNIFORM per-block 1/world slice of cu and dn (verify_dn_multiblock_shard.py PROVEN
+        layout: rank r holds, for every block b, that block's r-th ws_block(=block//world)
+        slice). NO world-gather of k/v — the persistent cache stores 1/world per rank and the
+        full window is reassembled at attention time by _attend_cache_shard's per-block
+        interleave. Mirrors the denoise cache-shard path (_qkv_rope cache-shard branch),
+        applied independently to the cu stream and the dn stream.
+
+        The INPUT x-shard (dit_model._forward_inference merged branch) already produced this
+        per-block layout; k_local/v_local from _local_qkv_norm ARE this rank's per-block slices,
+        laid out [cu_shard ; dn_shard]."""
+        f_full, h, w = grid_sizes
+        frame_seqlen = h * w
+        grid_cu = (nfpb_cu, h, w)
+        grid_dn = (f_full - nfpb_cu, h, w)
+
+        N = self.world_size
+        tp = self.tp_degree
+        sp = self.sp_degree
+        world_rank = ps.get_rank("world")
+
+        n = self.num_heads
+        d = self.head_dim
+        n_local = self.heads_per_shard
+        h_start = self.tp_rank * n_local
+        h_end = h_start + n_local
+
+        block = self.block_length              # full block token count (3 * frame_seqlen)
+        ws_block = self._cs_block_length        # per-rank per-block slice = block // N
+        assert ws_block is not None
+
+        L_cu = nfpb_cu * frame_seqlen
+        L_dn = (f_full - nfpb_cu) * frame_seqlen
+        assert L_cu % block == 0 and L_dn % block == 0, (
+            f"cache-shard merged: L_cu {L_cu} / L_dn {L_dn} not block({block})-aligned")
+        nb_cu = L_cu // block                   # blocks in cu stream (==1 for nfpb_cu==nfpb)
+        nb_dn = L_dn // block                   # blocks in dn stream (rolling window)
+        cu_shard_len = nb_cu * ws_block         # this rank's cu tokens
+        dn_shard_len = nb_dn * ws_block         # this rank's dn tokens
+
+        q_local, k_local, v_local = self._local_qkv_norm(x)   # this rank's [cu;dn] slices, all heads
+        q_cu_l = q_local[:cu_shard_len]
+        q_dn_l = q_local[cu_shard_len:]
+        k_cu_l = k_local[:cu_shard_len]
+        k_dn_l = k_local[cu_shard_len:]
+        v_cu_l = v_local[:cu_shard_len]
+        v_dn_l = v_local[cu_shard_len:]
+
+        cu_sf_int = cache_update_start // frame_seqlen
+        dn_sf_int = current_start // frame_seqlen
+        cu_sf_t = torch.tensor(cu_sf_int, device=x.device)
+        dn_sf_t = torch.tensor(dn_sf_int, device=x.device)
+        current_start_frame_dn = current_start // frame_seqlen
+
+        def rope_per_block(t_local, grid, sf_t, sf_int, nblocks):
+            # RoPE this rank's per-block shard at each block's GLOBAL token offset. RoPE is
+            # per-position, so RoPE-shard-at-global-offset == RoPE-full-then-slice
+            # (verify_krope_shard.py). rank world_rank holds, per block b, the tokens at global
+            # offset b*block + world_rank*ws_block (verify_dn_multiblock_shard.py).
+            pieces = []
+            for b in range(nblocks):
+                seg = t_local[b * ws_block:(b + 1) * ws_block].view(ws_block, n, d).unsqueeze(0)
+                roped = self._nki_rope_apply(
+                    seg, grid, freqs_cos, freqs_sin,
+                    start_frame=sf_t, rope_grid_cache=rope_grid_cache,
+                    start_frame_int=sf_int, head_start=h_start, head_end=h_end,
+                    tok_offset=b * block + world_rank * ws_block, tok_len=ws_block)
+                pieces.append(roped)
+            return torch.cat(pieces, dim=1)     # [1, nblocks*ws_block, n_local, d]
+
+        # --- roped keys / values (this rank's shard only; NO world-gather) ---
+        rk_cu = rope_per_block(k_cu_l, grid_cu, cu_sf_t, cu_sf_int, nb_cu)
+        rk_dn = rope_per_block(k_dn_l, grid_dn, dn_sf_t, dn_sf_int, nb_dn)
+        v_cu = self._slice_heads(v_cu_l)        # [1, cu_shard_len, n_local, d]
+        v_dn = self._slice_heads(v_dn_l)
+
+        # --- roped queries: RoPE this rank's shard, gather ROPED q over attn-tp -> sp-shard ---
+        # (roped-shard-then-gather == gather-then-rope, RoPE is per-position). Gather over
+        # attn-tp reconstructs the sp-group's query tokens; permute the dn gather to PER-BLOCK
+        # grouped order so the sp query matches the per-block cache layout at sp granularity.
+        rq_cu_local = rope_per_block(q_cu_l, grid_cu, cu_sf_t, cu_sf_int, nb_cu)  # [1, cu_shard_len, n_local, d]
+        rq_dn_local = rope_per_block(q_dn_l, grid_dn, dn_sf_t, dn_sf_int, nb_dn)  # [1, dn_shard_len, n_local, d]
+
+        def gather_q_tp(rq_local, nblocks):
+            # rq_local [1, nblocks*ws_block, n_local, d] -> flatten heads, all_gather over
+            # attn-tp (tp consecutive world ranks), reshape [tp, nblocks, ws_block, n_local*d],
+            # permute to PER-BLOCK grouped [nblocks, tp, ws_block, ...] -> contiguous sp query.
+            flat = rq_local[0].reshape(nblocks * ws_block, n_local * d).contiguous()
+            g = torch.empty(tp * nblocks * ws_block, n_local * d,
+                            dtype=flat.dtype, device=flat.device)
+            ps.all_gather_into_tensor(g, flat, "attn-tp")
+            g = (g.view(tp, nblocks, ws_block, n_local * d)
+                  .permute(1, 0, 2, 3)
+                  .reshape(nblocks * tp * ws_block, n_local, d))
+            return g.unsqueeze(0)                # [1, nblocks*tp*ws_block, n_local, d]
+
+        q_cu_sp = gather_q_tp(rq_cu_local, nb_cu)   # [1, L_cu_sp, n_local, d]
+        q_dn_sp = gather_q_tp(rq_dn_local, nb_dn)   # [1, L_dn_sp, n_local, d]
+
+        # --- cache write (sharded sizes substituted inside _cache_write via self._cache_shard) ---
+        if self._will_anchor_write(kv_cache, cache_update_start):
+            k_cu = self._slice_heads_2d(k_cu_l).contiguous().unsqueeze(0)
+        else:
+            k_cu = None
+        le_cu, ls_cu = self._cache_write(
+            k_cu, v_cu, rk_cu, kv_cache, cache_update_start, cu_shared_buffers)
+
+        if self._will_anchor_write(kv_cache, current_start):
+            k_dn = self._slice_heads_2d(k_dn_l).contiguous().unsqueeze(0)
+        else:
+            k_dn = None
+        le_dn, ls_dn = self._cache_write(
+            k_dn, v_dn, rk_dn, kv_cache, current_start, dn_shared_buffers)
+
+        # valid_tokens are SHARDED (1/world) — the sharded cache/buffers hold 1/world.
+        vt_cu = (nfpb_cu * frame_seqlen) // N
+        vt_dn = (num_valid_frames_dn * frame_seqlen) // N
+        klen_cu = self._assemble_kv(
+            rk_cu, v_cu, kv_cache, grid_cu, freqs_cos, freqs_sin,
+            cu_shared_buffers, True, vt_cu,
+            cache_update_start // frame_seqlen, le_cu, ls_cu,
+            rope_grid_cache=rope_grid_cache)
+        klen_dn = self._assemble_kv(
+            rk_dn, v_dn, kv_cache, grid_dn, freqs_cos, freqs_sin,
+            dn_shared_buffers, False, vt_dn,
+            current_start_frame_dn, le_dn, ls_dn,
+            rope_grid_cache=rope_grid_cache)
+
+        # --- attention: _attend_cache_shard reassembles the FULL window per stream ---
+        y_cu = self._attend(q_cu_sp, cu_shared_buffers, klen_cu)
+        y_dn = self._attend(q_dn_sp, dn_shared_buffers, klen_dn)
+
+        # --- OUTPUT reassembly ---
+        # UNVERIFIED FOR PER-BLOCK CACHE-SHARD LAYOUT: the query sp-shard here is PER-BLOCK
+        # grouped (cu contiguous; dn per-block at sp granularity), NOT the contiguous
+        # dn[sp*L_dn_sp:] layout that restore_layout was written for. The output token ORDER
+        # therefore differs from the non-shard path, so the reduce_scatter + restore_layout +
+        # world-gather deinterleave below may place tokens incorrectly. This does NOT corrupt
+        # the persistent cache (write/assemble use the proven per-block layout); it only risks
+        # a scrambled OUTPUT, which the on-device ACC gate (gate_frames) will catch. Mirrors
+        # the non-shard output tail for shape-correctness; reassembly correctness is deferred
+        # to the device ACC gate rather than guessed here.
+        sp_ = self.sp_degree
+        L_cu_sp = q_cu_sp.shape[1]
+        L_dn_sp = q_dn_sp.shape[1]
+        L_full = L_cu + L_dn
+        L_cu_N = L_cu // N
+        L_dn_N = L_dn // N
+        L_full_N = L_full // N
+
+        y = self.o(torch.cat([y_cu, y_dn], dim=1))
+
+        if tp > 1:
+            y = y.reshape((L_cu_sp + L_dn_sp), self.dim)
+            y_cu_part = y[:L_cu_sp].reshape(tp, L_cu_N, self.dim)
+            y_dn_part = y[L_cu_sp:].reshape(tp, L_dn_N, self.dim)
+            rearranged = torch.cat([y_cu_part, y_dn_part], dim=1).reshape(-1, self.dim)
+            rs_out = torch.empty(L_full_N, self.dim, dtype=y.dtype, device=y.device)
+            ps.reduce_scatter_tensor(rs_out, rearranged, "attn-tp")
+            cu_dn_sep = rs_out
+        else:
+            cu_dn_sep = y.reshape(L_full_N, self.dim)
+
+        if N == 1:
+            return cu_dn_sep.unsqueeze(0)
+
+        gathered = torch.empty(N * L_full_N, self.dim, dtype=cu_dn_sep.dtype, device=cu_dn_sep.device)
+        ps.all_gather_into_tensor(gathered, cu_dn_sep, "world")
+        full = restore_layout(gathered, N=N, nfpb=3, max_frames=15,
+                              frame_seqlen=self.frame_length)
+        out = full[world_rank * L_full_N:(world_rank + 1) * L_full_N]
+        return out.unsqueeze(0)
 
     def forward_merged(
         self,
@@ -600,6 +1019,12 @@ class CausalWanSelfAttention(nn.Module):
         rope_grid_cache=None,
     ):
         assert x.shape[0] == 1
+        if self._cache_shard and self.world_size > 1:
+            return self._forward_merged_cache_shard(
+                x, grid_sizes, freqs_cos, freqs_sin, kv_cache,
+                cache_update_start, current_start,
+                cu_shared_buffers, dn_shared_buffers,
+                num_valid_frames_dn, nfpb_cu, rope_grid_cache)
 
         f_full, h, w = grid_sizes
         frame_seqlen = h * w
@@ -761,6 +1186,16 @@ class CausalWanSelfAttention(nn.Module):
             valid_tokens = num_valid_frames * frame_seqlen
         else:
             valid_tokens = f * h * w
+
+        # TRUE CACHE-SHARD: valid_tokens (the tokens written+attended this call) also scales
+        # by 1/world — roped_key/v from _qkv_rope are this rank's 1/world slice, and the
+        # sharded cache/buffers hold 1/world. frame_seqlen % world_size == 0 (asserted in the
+        # pipeline), so this divides cleanly.
+        if self._cache_shard and self.world_size > 1:
+            assert valid_tokens % self.world_size == 0, (
+                f"valid_tokens ({valid_tokens}) not divisible by world_size "
+                f"({self.world_size})")
+            valid_tokens = valid_tokens // self.world_size
 
         local_end_index, local_start_index = self._cache_write(
             k, v, roped_key, kv_cache, cache_start, shared_buffers)

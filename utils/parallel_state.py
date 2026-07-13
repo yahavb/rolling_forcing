@@ -62,3 +62,7 @@ def reduce_scatter_tensor(output, input, group_name):
 
 def all_reduce(tensor, group_name, op=dist.ReduceOp.SUM):
     dist.all_reduce(tensor, op=op, group=_get(group_name))
+
+# NOTE: Neuron's distributed backend has NO P2P (isend/irecv/batch_isend_irecv ->
+# "No backend type associated with device type neuron", run sdjkl). Ring exchange must use
+# all_gather over the group instead — see _attend_ring_shard.

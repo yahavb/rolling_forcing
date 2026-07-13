@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import types
 from typing import List, Optional
 
@@ -160,7 +161,37 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         grid_sizes = _get_grid_sizes(x)
         x = self.patch_embedding(x)
 
-        if self.world_size > 1:
+        # TRUE CACHE-SHARD (RF_RING_CACHESHARD) merged path: the input is [cu ; dn] and the
+        # persistent cache stores each block's r-th ws_block(=block//world) slice per rank
+        # (verify_dn_multiblock_shard.py). The INPUT shard MUST match that PER-BLOCK layout,
+        # NOT the contiguous shard (which diverges at max|Δ|=13500 for multi-block dn). Denoise
+        # (mode != "merged") is a single-block stream -> contiguous == per-block, leave as-is.
+        _cache_shard = (os.environ.get("RF_RING_CACHESHARD", "0") == "1")
+        _cs_merged = _cache_shard and self.world_size > 1 and mode == "merged"
+        if _cs_merged:
+            rank = ps.get_rank("world")
+            frame_seqlen = grid_sizes[1] * grid_sizes[2]
+            nfpb = 3
+            block = nfpb * frame_seqlen                 # block_length in tokens
+            assert block % self.world_size == 0, (
+                f"block_length {block} not divisible by world_size {self.world_size}")
+            ws_block = block // self.world_size         # per-rank per-block slice (=_cs_block_length)
+            L_cu = nfpb_cu * frame_seqlen
+            L_total = x.shape[1]
+            L_dn = L_total - L_cu
+            assert L_cu % block == 0 and L_dn % block == 0, (
+                f"cache-shard merged: L_cu {L_cu} / L_dn {L_dn} not block({block})-aligned")
+            # PER-BLOCK shard for a stream starting at global token `base` with `nblocks` blocks:
+            #   rank r gets, per block b, tokens [base + b*block + r*ws_block : +ws_block].
+            def _per_block_pieces(base, nblocks):
+                pcs = []
+                for b in range(nblocks):
+                    s = base + b * block + rank * ws_block
+                    pcs.append(x[:, s:s + ws_block])
+                return pcs
+            pieces = _per_block_pieces(0, L_cu // block) + _per_block_pieces(L_cu, L_dn // block)
+            x = torch.cat(pieces, dim=1).contiguous()
+        elif self.world_size > 1:
             L = x.shape[1]
             assert L % self.world_size == 0, (
                 f"sequence length {L} not divisible by world_size {self.world_size}")
@@ -196,7 +227,33 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             rope_grid_cache=rope_grid_cache,
         )
 
-        if self.world_size > 1:
+        if _cs_merged:
+            # e-shard MUST align token-for-token with the per-block x-shard above. Expand e0
+            # to the FULL per-token layout once, then apply the IDENTICAL per-block slicing +
+            # concat used for x. Guarantees the modulation for token t is e-expanded from the
+            # same frame that produced x's token t (verify_dn_multiblock_shard.py layout).
+            num_frames = e0.shape[1]
+            frame_seqlen = grid_sizes[1] * grid_sizes[2]
+            L_full = num_frames * frame_seqlen
+            rank = ps.get_rank("world")
+            e_full = self._expand_e_shard_neuron(
+                e0, 0, num_frames, 0, L_full, frame_seqlen)  # [B, 6, L_full, C]
+            nfpb = 3
+            block = nfpb * frame_seqlen
+            ws_block = block // self.world_size
+            L_cu = nfpb_cu * frame_seqlen
+            L_dn = L_full - L_cu
+
+            def _e_per_block_pieces(base, nblocks):
+                pcs = []
+                for b in range(nblocks):
+                    s = base + b * block + rank * ws_block
+                    pcs.append(e_full[:, :, s:s + ws_block])
+                return pcs
+            e_pieces = (_e_per_block_pieces(0, L_cu // block)
+                        + _e_per_block_pieces(L_cu, L_dn // block))
+            kwargs["e"] = torch.cat(e_pieces, dim=2).contiguous()
+        elif self.world_size > 1:
             num_frames = e0.shape[1]
             frame_seqlen = grid_sizes[1] * grid_sizes[2]
             L_full = num_frames * frame_seqlen

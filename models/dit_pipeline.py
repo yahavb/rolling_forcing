@@ -555,6 +555,19 @@ class CausalInferencePipeline(torch.nn.Module):
         kv_cache_clean = []
         kv_cache_alloc_size = self.frame_seq_length * 24
         max_buffer_size = self.frame_seq_length * 21
+        # TRUE CACHE-SHARD (RF_RING_CACHESHARD): each rank stores ONLY its 1/world token slice
+        # of the persistent cache, so allocate the cache and the shared buffers at 1/world
+        # size. Every position quantity in _cache_write/_assemble_kv scales identically
+        # (verify_cache_shard.py). The ATTN_SEQLEN_MULTIPLE rounding stays on the buffer.
+        if os.environ.get("RF_RING_CACHESHARD", "0") == "1":
+            world_size = ps.get_world_size("world")
+            assert kv_cache_alloc_size % world_size == 0, (
+                f"kv_cache_alloc_size ({kv_cache_alloc_size}) not divisible by "
+                f"world_size ({world_size})")
+            assert max_buffer_size % world_size == 0, (
+                f"buffer size ({max_buffer_size}) not divisible by world_size ({world_size})")
+            kv_cache_alloc_size = kv_cache_alloc_size // world_size
+            max_buffer_size = max_buffer_size // world_size
         max_buffer_size = (max_buffer_size + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE * ATTN_SEQLEN_MULTIPLE
 
         for _ in range(self.num_transformer_blocks):
