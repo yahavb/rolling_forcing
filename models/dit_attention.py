@@ -829,15 +829,17 @@ class CausalWanSelfAttention(nn.Module):
                         q_kern, k_seg.contiguous(), v_seg.contiguous(),
                         softmax_scale=self.softmax_scale, actual_seqlen_k=ws,
                         use_dynamic_loop=False, return_partials=True)
+                    # kernel partials: O_s [Sq,bs,d], max_s/sum_s [Sq,bs,1]. Merge exactly as
+                    # _attend_ring (no extra unsqueeze — the trailing 1 broadcasts over d).
                     if m is None:
                         m, l, acc = max_s, sum_s, O_s
                     else:
                         m_new = torch.maximum(m, max_s)
-                        a, b_ = torch.exp(m - m_new), torch.exp(max_s - m_new)
-                        l = a * l + b_ * sum_s
-                        acc = a.unsqueeze(-1) * acc + b_.unsqueeze(-1) * O_s
+                        cp, cc = torch.exp(m - m_new), torch.exp(max_s - m_new)
+                        l = l * cp + sum_s * cc
+                        acc = acc * cp + O_s * cc
                         m = m_new
-            out = (acc / l.unsqueeze(-1)).to(q_kern.dtype)
+            out = (acc / l).to(q_kern.dtype)          # [Sq,bs,d]
             return out.unsqueeze(0).flatten(2)
         # PER-BLOCK INTERLEAVE: each rank's window-shard holds nblocks blocks of ws_block
         # tokens each; the full window = for each block, concat rank0..N-1 (verify_cache_shard).
