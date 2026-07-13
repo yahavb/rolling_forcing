@@ -345,9 +345,9 @@ spec:
               # writes tflops_report.json. We unset any NEURON_RT_INSPECT_* so no device-profile
               # overhead leaks into this timing.
               echo "=== [2/3] CLEAN RUN (NO device profiler) — RING NSEG=1, per-block fps + per-stage ms + TFLOPS = REAL LATENCY ==="
-              echo "    (RF_RING=1 RF_RING_NSEG=1 = ring fast path = 14.18 fps reference @ 1200)"
+              echo "    (RF_RING_CACHESHARD=1 + RF_CACHESHARD_INKERNEL=1 = in-kernel ncc.all_gather cache-shard; compare vs 14.18 baseline)"
               env -u NEURON_RT_INSPECT_ENABLE -u NEURON_RT_INSPECT_OUTPUT_DIR -u NEURON_RT_INSPECT_DEVICE_PROFILE \
-                RF_RING=1 RF_RING_NSEG=1 \
+                RF_RING=1 RF_RING_NSEG=1 RF_RING_CACHESHARD=1 RF_CACHESHARD_INKERNEL=1 \
                 PROFILE_E2E_PIPELINE=1 MEASURE_TFLOPS=1 \
                 $BENCH_CMD --output_folder "$LOCAL_RESULTS/clean_out" \
                 2>&1 | tee "$LOCAL_RESULTS/clean.txt" | grep -iE "T5:|block +[0-9]|fps|TFLOPS|MFU|SUMMARY|FAILED|Error" || echo "CLEAN RUN FAILED"
@@ -390,11 +390,11 @@ spec:
                 --tp_degree 4 --latent_w 96 --num_output_frames 21 \
                 --chunk-size 3 --fps 16 --use_ema"
               echo "--- [1440 warmup] ---"
-              RF_RING=1 RF_RING_NSEG=1 $BENCH_CMD_1440 --output_folder /tmp/warmup_1440 2>&1 \
+              RF_RING=1 RF_RING_NSEG=1 RF_RING_CACHESHARD=1 RF_CACHESHARD_INKERNEL=1 $BENCH_CMD_1440 --output_folder /tmp/warmup_1440 2>&1 \
                 | grep -iE "Building|compil|loaded|FAILED|Error" || echo "1440 warmup done"
               echo "--- [1440 clean fps, ring NSEG=1] ---"
               env -u NEURON_RT_INSPECT_ENABLE -u NEURON_RT_INSPECT_OUTPUT_DIR -u NEURON_RT_INSPECT_DEVICE_PROFILE \
-                RF_RING=1 RF_RING_NSEG=1 \
+                RF_RING=1 RF_RING_NSEG=1 RF_RING_CACHESHARD=1 RF_CACHESHARD_INKERNEL=1 \
                 PROFILE_E2E_PIPELINE=1 MEASURE_TFLOPS=1 \
                 $BENCH_CMD_1440 --output_folder "$LOCAL_RESULTS/clean_1440_out" 2>&1 \
                 | tee "$LOCAL_RESULTS/clean_1440.txt" \
@@ -414,7 +414,7 @@ spec:
                 NEURON_RT_INSPECT_OUTPUT_DIR="$PROFILE_DIR" \
                 NEURON_RT_INSPECT_DEVICE_PROFILE=session \
                 NEURON_PROFILE_ENABLE=1 NEURON_PROFILE_DIR="$PROFILE_DIR" \
-                RF_RING=1 RF_RING_NSEG=1 \
+                RF_RING=1 RF_RING_NSEG=1 RF_RING_CACHESHARD=1 RF_CACHESHARD_INKERNEL=1 \
                 PROFILE_E2E_PIPELINE=1 MEASURE_TFLOPS=1 \
                 $BENCH_CMD --output_folder "$LOCAL_RESULTS/profiled_out" \
                 2>&1 | tee "$LOCAL_RESULTS/profiled.txt" | grep -iE "T5:|block +[0-9]|fps|TFLOPS|MFU|profiler|FAILED" || echo "PROFILED RUN FAILED"
@@ -510,7 +510,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "main"
+              value: "kv-overlap-exchange"
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL
