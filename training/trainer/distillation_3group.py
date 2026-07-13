@@ -612,7 +612,18 @@ class Trainer:
             print(f"[ckpt] wrote {out} ({len(payload['generator'])} tensors, "
                   f"generator_ema={_ema_n} tensors)", flush=True)
             if self.mirror_dir:
+                # SYNCHRONOUS copy-then-delete (was Popen/async — that raced: the slow 11GB
+                # S3-FUSE cp couldn't keep up, so local copies STACKED to 113GB -> node
+                # ephemeral-storage eviction after ~24h). Blocking here guarantees only ONE
+                # checkpoint is on local disk at a time: write to fast local `out`, cp to the
+                # PVC, delete local, THEN return. Only ssrc runs this (others passed the
+                # barrier above), so it just adds a brief per-save stall, no deadlock.
                 import subprocess
                 dst = os.path.join(self.mirror_dir, os.path.basename(out))
-                subprocess.Popen(["bash", "-c", f"mkdir -p {self.mirror_dir} && cp '{out}' '{dst}' && rm -f '{out}'"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+                rc = subprocess.run(
+                    ["bash", "-c", f"mkdir -p '{self.mirror_dir}' && cp '{out}' '{dst}' && rm -f '{out}'"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+                if rc.returncode == 0:
+                    print(f"[ckpt] mirrored -> {dst} (local copy freed)", flush=True)
+                else:
+                    print(f"[ckpt] WARN mirror cp failed rc={rc.returncode}; local {out} kept", flush=True)
