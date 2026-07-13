@@ -472,6 +472,21 @@ class CausalWanSelfAttention(nn.Module):
         max_attention_size = (self._cs_max_attention_size if self._cache_shard
                               else self.max_attention_size)
 
+        # CACHE-SHARD anchor RoPE: the cached sink block below holds only THIS rank's
+        # per-block-0 shard (ws_block tokens at in-block global offset world_rank*ws_block,
+        # heads [h_start:h_end]). Pass the matching shard params so the single-block grid
+        # (3,h,w) is sliced to this rank's tokens/heads instead of asserting seq_len(block)
+        # == s(ws_block). RoPE is per-position -> bit-exact (verify_anchor_shard.py max|Δ|=0).
+        # Non-shard path: empty kwargs -> full-block RoPE, unchanged.
+        anchor_shard_kw = {}
+        if self._cache_shard and self.world_size > 1:
+            ws_block = self._cs_block_length
+            world_rank = ps.get_rank("world")
+            h_start = self.tp_rank * self.heads_per_shard
+            anchor_shard_kw = dict(
+                head_start=h_start, head_end=h_start + self.heads_per_shard,
+                tok_offset=world_rank * ws_block, tok_len=ws_block)
+
         if updating_cache:
             cache_len = min(local_end_index, max_attention_size)
             cache_start_pos = max(0, local_end_index - max_attention_size)
@@ -487,7 +502,8 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["k"][0, :block_length].unsqueeze(0),
                     grid_sizes_one_block, freqs_cos, freqs_sin,
                     start_frame=torch.tensor(0, device=device),
-                    rope_grid_cache=rope_grid_cache, start_frame_int=0)
+                    rope_grid_cache=rope_grid_cache, start_frame_int=0,
+                    **anchor_shard_kw)
                 self._cache_copy_inplace(
                     buffer_k[0, :block_length], anchor_roped[0])
 
@@ -507,7 +523,8 @@ class CausalWanSelfAttention(nn.Module):
                 grid_sizes_one_block, freqs_cos, freqs_sin,
                 start_frame=torch.tensor(rope_start_frame, device=device),
                 rope_grid_cache=rope_grid_cache,
-                start_frame_int=rope_start_frame)
+                start_frame_int=rope_start_frame,
+                **anchor_shard_kw)
             self._cache_copy_inplace(
                 buffer_k[0, :block_length], anchor_roped[0],
                 buffer_v[0, :block_length], kv_cache["v"][0, :block_length])
