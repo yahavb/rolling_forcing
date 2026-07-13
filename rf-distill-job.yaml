@@ -118,13 +118,21 @@ spec:
               test -f "$PROMPT_FILE" || { echo "PROMPT FILE MISSING: $PROMPT_FILE"; exit 1; }
               echo "Weights + prompts ready: $(wc -l < "$PROMPT_FILE") prompt(s) from $PROMPT_FILE"
 
-              # ─── one timestamped output dir; work local, mirror ckpts to S3 as saved ───
+              # ─── one timestamped output dir ON THE PVC; write ckpts straight to S3 ───
+              # EVICTION FIX (2026-07-13): the old design wrote each 11.3GB ckpt to a local
+              # /tmp RUN dir then async-cp'd to the PVC (CKPT_MIRROR_DIR) with a fire-and-forget
+              # `cp && rm`. The 11GB cp to S3-FUSE is slow, so local copies stacked up + the rm
+              # raced -> /tmp grew to 113GB -> node ephemeral-storage eviction (Exit 137) after
+              # ~24h. Fix: point --logdir DIRECTLY at the PVC so _save_ckpt writes to S3 with NO
+              # local staging, and disable the mirror (CKPT_MIRROR_DIR="" -> trainer skips the
+              # cp/rm entirely). Only the small train.log stays local.
               TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
-              RUN=/tmp/rf-distill/$TS; mkdir -p "$RUN"
-              FINAL=/var/mdl/rolling_forcing/distill/$TS; mkdir -p "$FINAL"
-              export CKPT_MIRROR_DIR="$FINAL"    # trainer mirrors each saved ckpt here (see training/README.md)
-              exec > >(tee "$RUN/train.log") 2>&1
-              echo "RUN=$RUN  (final -> $FINAL)"
+              RUN=/var/mdl/rolling_forcing/distill/$TS; mkdir -p "$RUN"
+              FINAL="$RUN"
+              export CKPT_MIRROR_DIR=""          # write straight to the PVC; no local staging/mirror
+              mkdir -p /tmp/rf-distill/$TS
+              exec > >(tee "/tmp/rf-distill/$TS/train.log") 2>&1
+              echo "RUN=$RUN  (checkpoints written directly to the PVC/S3)"
 
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
 
@@ -163,8 +171,8 @@ spec:
                 || { echo "TRAIN FAILED"; exit 1; }
               cd ..
 
-              # ─── final copy of run dir (log + any remaining ckpts) to S3 ───
-              cp -r "$RUN"/. "$FINAL"/ 2>&1 || echo "final copy to /var/mdl failed"
+              # ─── copy the local train.log to the PVC (ckpts are already there) ───
+              cp "/tmp/rf-distill/$TS/train.log" "$FINAL/train.log" 2>&1 || echo "train.log copy failed"
               echo "=== DONE. checkpoints under $FINAL/ (use the EMA weights: inference --use_ema) ==="
               ls -lhR "$FINAL" | head -60
           resources:
