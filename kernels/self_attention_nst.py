@@ -217,13 +217,18 @@ def wan_flash_self_attn_gather_kv(
           .reshape_dim(3, (nblocks, ws_block))       # [world, bs, d, nblocks, ws_block]
           .permute((1, 2, 3, 0, 4))                  # [bs, d, nblocks, world, ws_block]
           .flatten_dims(2, 4))                        # [bs, d, full_len]
-    k_full = kv.get_view()
     vv = (TensorView(v_gathered)
           .reshape_dim(0, (world_size, bs))          # [world, bs, k_len_shard, d]
           .reshape_dim(2, (nblocks, ws_block))       # [world, bs, nblocks, ws_block, d]
           .permute((1, 2, 0, 3, 4))                  # [bs, nblocks, world, ws_block, d]
           .flatten_dims(1, 3))                        # [bs, full_len, d]
-    v_full = vv.get_view()
+    # The interleave views are STRIDED; the flash impl calls .ap() which requires a
+    # CONTIGUOUS free dim. dma_copy the strided views into contiguous shared_hbm buffers
+    # (this copy IS the reassembly; runs on DMA engine).
+    k_full = nl.ndarray((bs, d, full_len), dtype=k_shard.dtype, buffer=nl.shared_hbm, name="k_full")
+    v_full = nl.ndarray((bs, full_len, d), dtype=v_shard.dtype, buffer=nl.shared_hbm, name="v_full")
+    nisa.dma_copy(dst=k_full, src=kv.get_view())
+    nisa.dma_copy(dst=v_full, src=vv.get_view())
 
     # --- 4) flash attention over the reassembled full window (reuse the proven impl). ---
     result = nl.ndarray(shape=(seqlen_q, bs, d), dtype=q.dtype, buffer=nl.shared_hbm)
