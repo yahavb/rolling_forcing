@@ -19,6 +19,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import nki.collectives as ncc
 import nki.isa as nisa
 import nki.language as nl
 from nki.isa import engine
@@ -176,8 +177,6 @@ def wan_flash_self_attn_gather_kv(
     k_shard [bs, d, k_len_shard]       (this rank's RAW valid window shard, no padding)
     v_shard [bs, k_len_shard, d]
     """
-    import nki.collectives as ncc
-
     bs, d, k_len_shard = k_shard.shape
     _bs_q, _d_q, seqlen_q = q.shape
     kernel_assert(bs == _bs_q and d == _d_q,
