@@ -159,17 +159,18 @@ def _extract_edges(x, radius):
     return edges.permute(0, *range(2, 2 + ndim - 1), 1).contiguous()
 
 
-_VAE_PROBE = {"halo_n": 0, "halo_ms": 0.0}
+_VAE_PROBE = {"halo_n": 0, "halo_ms": 0.0, "conv_n": 0, "conv_ms": 0.0}
 
 
 def _vae_probe_reset_dump(tag=""):
     import torch.distributed as _d
     p = _VAE_PROBE
-    if (not _d.is_initialized() or _d.get_rank() == 0) and p["halo_n"] > 0:
-        print(f"[VAE PROBE {tag}] halo_exchange calls={p['halo_n']} "
-              f"total_halo_ms={p['halo_ms']:.1f} avg_ms={p['halo_ms']/p['halo_n']:.3f}",
+    if (not _d.is_initialized() or _d.get_rank() == 0) and (p["halo_n"] + p["conv_n"]) > 0:
+        print(f"[VAE PROBE {tag}] halo calls={p['halo_n']} halo_ms={p['halo_ms']:.1f} | "
+              f"conv3d calls={p['conv_n']} conv_ms={p['conv_ms']:.1f} | "
+              f"halo_share={100*p['halo_ms']/max(p['halo_ms']+p['conv_ms'],1e-9):.0f}%",
               flush=True)
-    p["halo_n"] = 0; p["halo_ms"] = 0.0
+    p["halo_n"] = 0; p["halo_ms"] = 0.0; p["conv_n"] = 0; p["conv_ms"] = 0.0
 
 
 def _halo_exchange_w(x, radius, group_name=_GROUP):
@@ -263,11 +264,15 @@ class CausalConv3d(nn.Module):
             self.cache = torch.zeros(
                 B, C, CACHE_T, H, W_local, dtype=x.dtype, device=x.device)
 
+        import time as _t
         if not needs_halo:
+            _c0 = _t.perf_counter()
             output = _causal_conv3d_core(
                 x, self.cache, self.weight, self.bias, self.stride,
                 self.dilation, self.groups, self.spatial_temporal_padding,
             )
+            _VAE_PROBE["conv_n"] += 1
+            _VAE_PROBE["conv_ms"] += (_t.perf_counter() - _c0) * 1000.0
         else:
             x_tc = torch.cat([self.cache, x], dim=2)
             radius = kW // 2
@@ -278,12 +283,15 @@ class CausalConv3d(nn.Module):
             new_pad_W_l = 0 if halo_left is not None else pad_W_l
             new_pad_W_r = 0 if halo_right is not None else pad_W_r
 
+            _c0 = _t.perf_counter()
             output = _halo_cat_pad_conv3d(
                 x_tc, halo_left, halo_right,
                 self.weight, self.bias,
                 (new_pad_W_l, new_pad_W_r, pad_H_l, pad_H_r, pad_T_l, pad_T_r),
                 self.stride, self.dilation, self.groups,
             )
+            _VAE_PROBE["conv_n"] += 1
+            _VAE_PROBE["conv_ms"] += (_t.perf_counter() - _c0) * 1000.0
 
         C, H, W_local = x.shape[1], x.shape[3], x.shape[4]
         HW = H * W_local
