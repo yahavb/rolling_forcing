@@ -1,49 +1,19 @@
-# Rolling Forcing — Neuron 3-run benchmark — VERIFIED 14fps BASELINE (TP4xCP4 ONLY)
-#
-# THIS VERSION RUNS TP4xCP4 (16 ranks) WITH RING ATTENTION, AND NOTHING ELSE.
-# The TP4xSP2 8-rank baseline pass was DELETED on purpose (it produced the ~9fps number
-# that kept getting mistaken for the baseline). There is NO SP path here. See
-# VERIFIED_14FPS_BASELINE.md for the full recipe + measured runs.
-# tp_degree pinned at 4 (12 heads only divide by 4); the other axis is CP (context-parallel):
-# CP keeps the query sequence-sharded (gather Q only over attn-tp=4, RoPE only this rank's
-# shard, NEVER materialize the full Q) — that is the 14fps win, NOT ring (ring is free at 1200).
-# 480x640 (latent_w=80, frame_seqlen=1200); F*frame_seqlen must be %16==0.
-# Key differences from sd-job:
-#   - Topology : TP=4 x CP=4 = 16 ranks -> torchrun --nproc_per_node 16 on l-trn2.
-#   - Entry    : e2e_pipeline.py (T5 -> DiT -> VAE fused). NO --warmup/--iters flags;
-#                it emits per-stage "T5: <N> ms" + DiT/VAE logs and tflops_report.json,
-#                NOT sd's median=/built= markers.
-#   - Profiler : native torch_neuronx NeuronProfiler (PROFILE_E2E_PIPELINE=1) +
-#                per-NEFF neuron-profile CLI. RF has no scripts/neuron/*.py aggregator,
-#                so we enumerate the NEFF cache and summary-text the largest NEFF directly.
-#
-# Model under test (current Neuron implementation):
-#   - DiT base : Wan-AI/Wan2.1-T2V-1.3B  (T5 encoder + VAE decoder)
-#   - DiT ckpt : TencentARC/RollingForcing -> checkpoints/rolling_forcing_dmd.pt (DMD-distilled)
-#   - Runtime  : TP-4 x SP-{2,4} (8 or 16 NeuronCores, LNC=1), bf16, eager + NKI kernels
-#   - Shape    : num_output_frames=21, chunk-size=3, fps=16, latent 60x80 (480x640)
-#
-# Mandatory 3-run methodology (ONE pod):
-#   [1/3] WARMUP  : compile-if-cold / load NEFFs (not timed)
-#   [2/3] CLEAN   : NO profiler -> per-stage T5/DiT/VAE ms + tflops_report.json (REAL latency)
-#   [3/3] PROFILED: native Neuron profiler on -> NEFF+NTFF pairs -> per-NEFF engine shares
-#
 # Launch (rope-qk-fuse: fuse q/k RoPE launches 4->2 per layer in forward_merged):
-#   kubectl delete job rolling-forcing --ignore-not-found
-#   kubectl apply -f rf-job-rope-qk-fuse.yaml
-#   kubectl logs -f job/rolling-forcing
+#   kubectl delete job job-rope-qk-fuse --ignore-not-found
+#   kubectl apply -f rf-rope-qk-fuse-job.yaml
+#   kubectl logs -f job/job-rope-qk-fuse
 #   -> read steady-state MEDIAN vs main 14.20
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: rolling-forcing
+  name: job-rope-qk-fuse
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: rf-job
+        app: job-rope-qk-fuse
     spec:
       restartPolicy: Never
       nodeSelector:
