@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 from kernels.kv_cache_copy import cache_copy, kv_cache_copy
-from kernels.restore_layout import restore_layout
+from kernels.restore_layout import restore_layout, restore_layout_rank_slice
 from kernels.rope import causal_rope_rotation, build_rope_grids
 from kernels.self_attention_nst import wan_flash_self_attn
 from utils import _compile
@@ -730,11 +730,14 @@ class CausalWanSelfAttention(nn.Module):
         # the same values used to build L_cu/L_dn above, so restore_layout's internal
         # L_full == L_cu + L_dn assertion holds for any denoising-step count T
         # (T=4 -> max_frames=12, T=5 -> max_frames=15).
-        full = restore_layout(gathered, N=N, nfpb=nfpb_cu,
-                              max_frames=(f_full - nfpb_cu),
-                              frame_seqlen=self.frame_length)
+        # Win: build ONLY this rank's output slice, not the whole N x deinterleaved window
+        # (the old restore_layout DMA-copied all N ranks then we kept 1/N — ~N x wasted DMA on
+        # a 93%-dma NEFF). restore_layout_rank_slice emits just this rank's 2-6 dma sub-ranges.
+        # Bit-identical (verify_restore_rank_slice, max|Δ|=0).
         rank_world = ps.get_rank("world")
-        out = full[rank_world * L_full_N:(rank_world + 1) * L_full_N]
+        out = restore_layout_rank_slice(gathered, rank=rank_world, N=N, nfpb=nfpb_cu,
+                                        max_frames=(f_full - nfpb_cu),
+                                        frame_seqlen=self.frame_length)
         return out.unsqueeze(0)
 
     def forward(
