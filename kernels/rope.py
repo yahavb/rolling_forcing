@@ -55,8 +55,8 @@ def _causal_rope_rotation_nki(x, cos_sin, num_heads=12, head_dim=128):
         # no cost (no per-head loop, no data copy — per NKI free-dim broadcast rules). Then
         # ONE multiply/multiply/add over the full [P,N,D] tile. out = x*cos + swap(x)*sin.
         # Bit-identical to the per-head loop (verify max|Δ|=0): 3 ops/tile vs 3*N.
-        cos_b = cos_tile.reshape(P, 1, D).broadcast_to((P, N, D))
-        sin_b = sin_tile.reshape(P, 1, D).broadcast_to((P, N, D))
+        cos_b = cos_tile.reshape((P, 1, D)).broadcast_to((P, N, D))
+        sin_b = sin_tile.reshape((P, 1, D)).broadcast_to((P, N, D))
 
         out_sb = nl.ndarray((P, N, D), dtype=x.dtype, buffer=nl.sbuf)
         x_cos = nl.multiply(x_sb, cos_b)
