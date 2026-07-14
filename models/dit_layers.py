@@ -37,7 +37,13 @@ class WanRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return self._norm(x.float()).type_as(x) * self.weight
+        # fp32 ONLY for the reduction + rsqrt (a per-row scalar, where fp32 accumulation
+        # matters); the x*scale*weight elementwise stays in x's dtype (bf16). Cuts one full
+        # [L,dim] fp32 elementwise pass — the gpsimd cost — vs the old all-fp32 _norm then
+        # downcast. NOT bit-identical (bf16 elementwise): rel err ~4.4e-3, within bf16 rounding
+        # (verify_rmsnorm_bf16). Quality gated on-device (ACC/RING + frames).
+        inv = torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (x * inv.type_as(x)) * self.weight
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
