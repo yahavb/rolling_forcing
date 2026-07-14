@@ -159,18 +159,35 @@ def _extract_edges(x, radius):
     return edges.permute(0, *range(2, 2 + ndim - 1), 1).contiguous()
 
 
+_VAE_PROBE = {"halo_n": 0, "halo_ms": 0.0}
+
+
+def _vae_probe_reset_dump(tag=""):
+    import torch.distributed as _d
+    p = _VAE_PROBE
+    if (not _d.is_initialized() or _d.get_rank() == 0) and p["halo_n"] > 0:
+        print(f"[VAE PROBE {tag}] halo_exchange calls={p['halo_n']} "
+              f"total_halo_ms={p['halo_ms']:.1f} avg_ms={p['halo_ms']/p['halo_n']:.3f}",
+              flush=True)
+    p["halo_n"] = 0; p["halo_ms"] = 0.0
+
+
 def _halo_exchange_w(x, radius, group_name=_GROUP):
     world = ps.get_world_size(group_name)
     rank = ps.get_rank(group_name)
     if world == 1:
         return None, None
 
+    import time as _t
+    _t0 = _t.perf_counter()
     edges_local = _extract_edges(x, radius)
     edges_all = torch.empty(
         (world * edges_local.shape[0],) + edges_local.shape[1:],
         dtype=x.dtype, device=x.device,
     )
     ps.all_gather_into_tensor(edges_all, edges_local, group_name)
+    _VAE_PROBE["halo_n"] += 1
+    _VAE_PROBE["halo_ms"] += (_t.perf_counter() - _t0) * 1000.0
     edges_all = edges_all.reshape((world,) + edges_local.shape)
 
     halo_left = edges_all[rank - 1, 1] if rank > 0 else None
@@ -555,8 +572,10 @@ class WanVAEWrapper(nn.Module):
         scale = [self.mean.to(device=device, dtype=dtype),
                  1.0 / self.std.to(device=device, dtype=dtype)]
         if use_cache:
-            return self.model.cached_decode(
+            _r = self.model.cached_decode(
                 zs, scale, chunk_idx=chunk_idx, batch_frames=batch_frames)
+            _vae_probe_reset_dump(f"cached_decode chunk={chunk_idx}")
+            return _r
         self.model.clear_cache()
         outputs = [self.model.decoder(
             self.model.conv2(
