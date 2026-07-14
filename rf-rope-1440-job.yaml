@@ -341,7 +341,7 @@ spec:
 
               echo "=== [1/3] WARMUP (compile-if-cold / load NEFFs; not timed) ==="
               $BENCH_CMD --output_folder /tmp/warmup_out \
-                2>&1 | tee "$LOCAL_RESULTS/warmup.txt" | grep -iE "Building|compil|loaded|profiler|FAILED|Error" || echo "WARMUP done (no matching lines)"
+                2>&1 | tee "$LOCAL_RESULTS/warmup.txt" | grep -iE "SEQLEN CONFIRM|Building|compil|loaded|profiler|FAILED|Error" || echo "WARMUP done (no matching lines)"
 
               # PROFILED RUN: the native torch_neuronx profiler (NEURON_PROFILE_ENABLE) writes
               # the harmony-format artifacts per rank into $PROFILE_DIR — trace_info.pb (system
@@ -358,7 +358,7 @@ spec:
                 RF_RING=1 RF_RING_NSEG=1 \
                 PROFILE_E2E_PIPELINE=1 MEASURE_TFLOPS=1 \
                 $BENCH_CMD --output_folder "$LOCAL_RESULTS/profiled_out" \
-                2>&1 | tee "$LOCAL_RESULTS/profiled.txt" | grep -iE "T5:|block +[0-9]|fps|TFLOPS|MFU|profiler|FAILED" || echo "PROFILED RUN FAILED"
+                2>&1 | tee "$LOCAL_RESULTS/profiled.txt" | grep -iE "SEQLEN CONFIRM|T5:|block +[0-9]|fps|TFLOPS|MFU|profiler|FAILED" || echo "PROFILED RUN FAILED"
 
               echo "=== [4] assemble harmony upload bundle ==="
               build_harmony_bundle

@@ -258,6 +258,11 @@ class CausalInferencePipeline(torch.nn.Module):
         # cache slicing instead of failing. patch_size is (pT, pH, pW).
         _pT, _pH, _pW = self.generator.model.patch_size
         _runtime_frame_seqlen = (height // _pH) * (width // _pW)
+        import torch.distributed as _dist
+        if not _dist.is_initialized() or _dist.get_rank() == 0:
+            print(f"[SEQLEN CONFIRM] latent {height}x{width} patch {_pH}x{_pW} -> "
+                  f"frame_seq_length={_runtime_frame_seqlen} (config={self.frame_seq_length}) "
+                  f"num_frames={num_frames}", flush=True)
         assert _runtime_frame_seqlen == self.frame_seq_length, (
             f"frame_seq_length={self.frame_seq_length} (config) != runtime h*w="
             f"{_runtime_frame_seqlen} (latent {height}x{width} / patch {_pH}x{_pW}). "
