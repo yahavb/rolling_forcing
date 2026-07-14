@@ -656,26 +656,32 @@ class CausalWanSelfAttention(nn.Module):
         cu_sf_t = torch.tensor(cu_sf_int, device=q_cu.device)
         dn_sf_t = torch.tensor(dn_sf_int, device=q_dn.device)
 
-        rq_cu_full = self._nki_rope_apply(
-            q_cu, grid_cu, freqs_cos, freqs_sin,
+        # RoPE q/k FUSE: q and k in a region share the SAME position grid, and the RoPE
+        # kernel treats heads as a pure broadcast/free axis (cos/sin are [P,D], broadcast
+        # over N). So stacking this rank's q-heads and k-heads along the head axis and
+        # running ONE launch is bit-identical to two separate launches — halves the RoPE
+        # launch count (4->2 per layer) in a launch-bound path. Pre-slice heads here and
+        # pass head_start=0/head_end=2*nlh (already sliced); split back after.
+        nlh = h_end - h_start
+        qk_cu = torch.cat(
+            [q_cu[:, :, h_start:h_end, :], k_cu_full[:, :, h_start:h_end, :]], dim=2)
+        rqk_cu = self._nki_rope_apply(
+            qk_cu, grid_cu, freqs_cos, freqs_sin,
             start_frame=cu_sf_t, rope_grid_cache=rope_grid_cache,
             start_frame_int=cu_sf_int,
-            head_start=h_start, head_end=h_end)
-        rk_cu = self._nki_rope_apply(
-            k_cu_full, grid_cu, freqs_cos, freqs_sin,
-            start_frame=cu_sf_t, rope_grid_cache=rope_grid_cache,
-            start_frame_int=cu_sf_int,
-            head_start=h_start, head_end=h_end)
-        rq_dn_full = self._nki_rope_apply(
-            q_dn, grid_dn, freqs_cos, freqs_sin,
+            head_start=0, head_end=2 * nlh)
+        rq_cu_full = rqk_cu[:, :, :nlh, :].contiguous()
+        rk_cu = rqk_cu[:, :, nlh:, :].contiguous()
+
+        qk_dn = torch.cat(
+            [q_dn[:, :, h_start:h_end, :], k_dn_full[:, :, h_start:h_end, :]], dim=2)
+        rqk_dn = self._nki_rope_apply(
+            qk_dn, grid_dn, freqs_cos, freqs_sin,
             start_frame=dn_sf_t, rope_grid_cache=rope_grid_cache,
             start_frame_int=dn_sf_int,
-            head_start=h_start, head_end=h_end)
-        rk_dn = self._nki_rope_apply(
-            k_dn_full, grid_dn, freqs_cos, freqs_sin,
-            start_frame=dn_sf_t, rope_grid_cache=rope_grid_cache,
-            start_frame_int=dn_sf_int,
-            head_start=h_start, head_end=h_end)
+            head_start=0, head_end=2 * nlh)
+        rq_dn_full = rqk_dn[:, :, :nlh, :].contiguous()
+        rk_dn = rqk_dn[:, :, nlh:, :].contiguous()
 
         if self._will_anchor_write(kv_cache, cache_update_start):
             k_cu = self._slice_heads_2d(k_full[:L_cu]).contiguous().unsqueeze(0)
