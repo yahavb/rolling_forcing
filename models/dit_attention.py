@@ -800,6 +800,43 @@ class CausalWanSelfAttention(nn.Module):
                 softmax_scale=self.softmax_scale)
             return out.unsqueeze(0).flatten(2)
 
+        # STAGE 1 (RF_CACHESHARD_STAGE1): KV-parallel, the design floor. Each rank does ONE
+        # flash over its OWN 1/world KV shard (k_own, all nblocks*ws tokens) -> partial; then
+        # all_gather the PARTIALS (not KV) over world and online-softmax-merge in rank order
+        # (proven ORDER-INVARIANT + bit-exact, verify_kvparallel_oneflash.py). This is 1 flash
+        # per rank (NOT N -> 0.32fps, NOT full reassembly -> 5.29fps) with KV 1/world. Torch
+        # all_gather = barrier (no overlap yet) -> this measures the NON-OVERLAPPED FLOOR before
+        # the fused kernel moves the collective inside to overlap the matmul (stages 2-3).
+        if _os_ik.environ.get("RF_CACHESHARD_STAGE1", "0") == "1":
+            buf_w = ((k_len_int + ATTN_SEQLEN_MULTIPLE - 1) // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
+            k_pad = k_own.new_zeros((bs, d_dim, buf_w)); k_pad[:, :, :k_len_int] = k_own
+            v_pad = v_own.new_zeros((bs, buf_w, d_dim)); v_pad[:, :k_len_int, :] = v_own
+            O_own, max_own, sum_own = wan_flash_self_attn(
+                q_kern, k_pad.contiguous(), v_pad.contiguous(),
+                softmax_scale=self.softmax_scale, actual_seqlen_k=k_len_int,
+                use_dynamic_loop=False, return_partials=True)
+            # gather partials over world. O_own [Sq,bs,d], max/sum [Sq,bs,1].
+            Sq = O_own.shape[0]
+            O_g = torch.empty((N, Sq, bs, d_dim), dtype=O_own.dtype, device=O_own.device)
+            mx_g = torch.empty((N, Sq, bs, 1), dtype=max_own.dtype, device=max_own.device)
+            sm_g = torch.empty((N, Sq, bs, 1), dtype=sum_own.dtype, device=sum_own.device)
+            ps.all_gather_into_tensor(O_g.view(N * Sq, bs, d_dim), O_own.contiguous(), "world")
+            ps.all_gather_into_tensor(mx_g.view(N * Sq, bs, 1), max_own.contiguous(), "world")
+            ps.all_gather_into_tensor(sm_g.view(N * Sq, bs, 1), sum_own.contiguous(), "world")
+            m = l = acc = None
+            for r in range(N):                       # rank order (order-invariant per proof)
+                O_s, max_s, sum_s = O_g[r], mx_g[r], sm_g[r]
+                if m is None:
+                    m, l, acc = max_s, sum_s, O_s
+                else:
+                    m_new = torch.maximum(m, max_s)
+                    cp, cc = torch.exp(m - m_new), torch.exp(max_s - m_new)
+                    l = l * cp + sum_s * cc
+                    acc = acc * cp + O_s * cc
+                    m = m_new
+            out = (acc / l).to(q_kern.dtype)          # [Sq,bs,d]
+            return out.unsqueeze(0).flatten(2)
+
         # all_gather over world: dim-0 concat into a [N, bs, ...] view (k on last/seqlen axis,
         # v on middle/seqlen axis).
         k_g = torch.empty((N, bs, d_dim, k_len_int), dtype=k_own.dtype, device=k_own.device)
