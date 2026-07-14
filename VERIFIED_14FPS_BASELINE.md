@@ -144,3 +144,17 @@ BUILD SEQUENCE (each stage device-validated before next; ACC gate max|Δ|=0 bf16
 3. Move the collective INTO the kernel (ncc.all_gather of partials) — the overlap play.
    Profile: does the collective hide behind the flash matmul? THIS is the fps test.
 Stage 1 first. Do NOT write all 3 at once (that produced 3 broken deploys).
+
+## STAGE 1 RESULT (RF_CACHESHARD_STAGE1, run 72gj5) — 3.49 fps, floor is DAMNING
+KV-parallel non-overlapped floor = 3.49 fps (DiT ~3200ms), WORSE than reassembly (5.29) and
+torch-shard (12.25). Ran clean (correct). Cause: gathers 3 fp32 PARTIALS (O[4500,3,128] fp32
+> the bf16 KV shard) as barriers, AND each rank still flashes the full Sq=4500 query (query is
+L/sp, not shrunk further) so flash cost didn't drop. Full-query flash + 3 fat partial barriers.
+
+ALL SHARDING VARIANTS NOW MEASURED, ALL BELOW 14.18 BASELINE:
+  torch-shard+reassembly 12.25 | in-kernel reassembly 5.29 | KV-parallel Stage1 3.49 | N-flash 0.32
+Baseline = 1 full-window flash after 1 KV all_gather = 14.18. Every decomposition adds collective
++ per-call overhead that does not overlap enough to pay for itself on this hardware (collective/
+launch-bound, MFU ~3-4%). Stage 3 overlap would have to hide the ENTIRE partial-exchange+merge
+behind the flash JUST to reach 5-12, let alone beat 14 — implausible given the 3.49 floor.
+VERDICT: KV-window sharding for FPS is exhausted. 14.18 (main, shipped) stands.
