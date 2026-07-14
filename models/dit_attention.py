@@ -205,31 +205,40 @@ class CausalWanSelfAttention(nn.Module):
             head_start = 0
             head_end = n
 
-        cache_key = None
-        combined = None
-        if rope_grid_cache is not None:
-            assert start_frame_int is not None, (
-                "start_frame_int must be provided with rope_grid_cache")
-            cache_key = (grid_sizes, int(start_frame_int))
-            combined = rope_grid_cache.get(cache_key)
-
-        if combined is None:
-            sf = start_frame.to(torch.int32).reshape(1, 1)
-            combined = build_rope_grids(
-                freqs_cos, freqs_sin, self.sign_pattern, sf,
-                F=f, H=h, W=w, head_dim=d)[:seq_len]
-            if cache_key is not None:
-                rope_grid_cache[cache_key] = combined
-
-        # slice the grid to the requested token sub-range (CP query shard)
-        combined = combined[tok_offset:tok_offset + tok_len]
-
         n_local = head_end - head_start
         P = 128
         pad = (P - tok_len % P) % P
+
+        # Win2: cache the SLICED+PADDED grid, not just the raw grid. The raw-grid cache still
+        # avoided rebuild, but the slice [tok_offset:] + F.pad ran on EVERY RoPE call (q/k x 32
+        # layers/forward). combined_padded depends only on (grid_sizes, start_frame_int,
+        # tok_offset, tok_len) — cache it so the slice+pad happens once per geometry, not per
+        # call. Bit-identical (same slice+pad ops, memoized).
+        cache_key = None
+        combined_padded = None
+        if rope_grid_cache is not None:
+            assert start_frame_int is not None, (
+                "start_frame_int must be provided with rope_grid_cache")
+            cache_key = (grid_sizes, int(start_frame_int), tok_offset, tok_len)
+            combined_padded = rope_grid_cache.get(cache_key)
+
+        if combined_padded is None:
+            raw_key = (grid_sizes, int(start_frame_int)) if rope_grid_cache is not None else None
+            combined = rope_grid_cache.get(raw_key) if raw_key is not None else None
+            if combined is None:
+                sf = start_frame.to(torch.int32).reshape(1, 1)
+                combined = build_rope_grids(
+                    freqs_cos, freqs_sin, self.sign_pattern, sf,
+                    F=f, H=h, W=w, head_dim=d)[:seq_len]
+                if raw_key is not None:
+                    rope_grid_cache[raw_key] = combined
+            combined = combined[tok_offset:tok_offset + tok_len]
+            combined_padded = torch.nn.functional.pad(combined, (0, 0, 0, pad))
+            if cache_key is not None:
+                rope_grid_cache[cache_key] = combined_padded
+
         x_local = x[0, :tok_len, head_start:head_end, :]
         x_padded = torch.nn.functional.pad(x_local, (0, 0, 0, 0, 0, pad))
-        combined_padded = torch.nn.functional.pad(combined, (0, 0, 0, pad))
 
         out = causal_rope_rotation(
             x_padded, combined_padded,
