@@ -40,16 +40,19 @@ def _causal_rope_rotation_nki(x, cos_sin, num_heads=12, head_dim=128):
         sin_tile = cs_sb[:, nl.ds(D, D)]
         x_sb = nl.load(x[nl.ds(ts, P), :, :])
 
+        # Batch the even/odd swap over ALL heads in ONE strided op pair (was 12 per-head
+        # strided writes/tile — the gpsimd hotspot). x_swap_all[:, :, 0::2] = x[:, :, 1::2]
+        # etc. is bit-identical to the per-head swap (verified max|Δ|=0), but 12x fewer
+        # strided ops. Keep multiply/add per-head where the [P,D] cos/sin broadcast is
+        # known-good.
+        x_swap_all = nl.ndarray((P, N, D), dtype=x_sb.dtype, buffer=nl.sbuf)
+        x_swap_all[:, :, 0::2] = x_sb[:, :, 1::2]
+        x_swap_all[:, :, 1::2] = x_sb[:, :, 0::2]
+
         out_sb = nl.ndarray((P, N, D), dtype=x.dtype, buffer=nl.sbuf)
         for n in nl.affine_range(N):
-            xh = x_sb[:, n, :]
-            x_cos = nl.multiply(xh, cos_tile)
-
-            x_swap = nl.ndarray((P, D), dtype=xh.dtype, buffer=nl.sbuf)
-            x_swap[:, 0::2] = xh[:, 1::2]
-            x_swap[:, 1::2] = xh[:, 0::2]
-
-            x_sin = nl.multiply(x_swap, sin_tile)
+            x_cos = nl.multiply(x_sb[:, n, :], cos_tile)
+            x_sin = nl.multiply(x_swap_all[:, n, :], sin_tile)
             out_sb[:, n, :] = nl.add(x_cos, x_sin)
 
         nl.store(out[nl.ds(ts, P), :, :], out_sb)

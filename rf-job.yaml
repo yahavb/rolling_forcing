@@ -9,7 +9,7 @@
 # shard, NEVER materialize the full Q) — that is the 14fps win, NOT ring (ring is free at 1200).
 # 480x640 (latent_w=80, frame_seqlen=1200); F*frame_seqlen must be %16==0.
 # Key differences from sd-job:
-#   - Topology : TP=4 x CP=4 = 16 ranks -> torchrun --nproc_per_node 16 on m-lnc1-trn2.
+#   - Topology : TP=4 x CP=4 = 16 ranks -> torchrun --nproc_per_node 16 on l-trn2.
 #   - Entry    : e2e_pipeline.py (T5 -> DiT -> VAE fused). NO --warmup/--iters flags;
 #                it emits per-stage "T5: <N> ms" + DiT/VAE logs and tflops_report.json,
 #                NOT sd's median=/built= markers.
@@ -49,8 +49,8 @@ spec:
         node-type: trn2
       resourceClaims:
         # 16 NeuronCores (2 chips x 8, LNC=1) for the TP4xCP4 16-rank run.
-        - name: m-lnc1-trn2
-          resourceClaimTemplateName: m-lnc1-trn2
+        - name: l-trn2
+          resourceClaimTemplateName: l-trn2
       containers:
         - name: bench
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -332,75 +332,12 @@ spec:
 
               echo "════════════ NEURON 3-RUN BENCHMARK (Rolling Forcing) ════════════"
               echo "  model    : Wan2.1-T2V-1.3B + RollingForcing DMD ckpt, TP4xCP4 (16 cores), bf16, 21 frames"
-              echo "  topology : TP=4 x CP=4 = 16 ranks (m-lnc1-trn2 claim), RING NSEG=1; sweep 1200(480x640)+1440(480x768)"
+              echo "  topology : TP=4 x CP=4 = 16 ranks (l-trn2 claim LNC2 24GB), RING NSEG=1, 480x640/fs1200, PROFILED"
               echo "=================================================================="
 
               echo "=== [1/3] WARMUP (compile-if-cold / load NEFFs; not timed) ==="
               $BENCH_CMD --output_folder /tmp/warmup_out \
                 2>&1 | tee "$LOCAL_RESULTS/warmup.txt" | grep -iE "Building|compil|loaded|profiler|FAILED|Error" || echo "WARMUP done (no matching lines)"
-
-              # CLEAN = the REAL latency number. PROFILE_E2E_PIPELINE=1 turns on RF's
-              # cheap perf_counter per-stage timing (the "block N: DiT.. VAE.. N fps" + "T5:" lines)
-              # — this is NOT the device profiler (that's run [3/3]). MEASURE_TFLOPS=1 also
-              # writes tflops_report.json. We unset any NEURON_RT_INSPECT_* so no device-profile
-              # overhead leaks into this timing.
-              echo "=== [2/3] CLEAN RUN (NO device profiler) — RING NSEG=1, per-block fps + per-stage ms + TFLOPS = REAL LATENCY ==="
-              echo "    (RF_RING=1 RF_RING_NSEG=1 = ring fast path = 14.18 fps reference @ 1200)"
-              env -u NEURON_RT_INSPECT_ENABLE -u NEURON_RT_INSPECT_OUTPUT_DIR -u NEURON_RT_INSPECT_DEVICE_PROFILE \
-                RF_RING=1 RF_RING_NSEG=1 \
-                PROFILE_E2E_PIPELINE=1 MEASURE_TFLOPS=1 \
-                $BENCH_CMD --output_folder "$LOCAL_RESULTS/clean_out" \
-                2>&1 | tee "$LOCAL_RESULTS/clean.txt" | grep -iE "T5:|block +[0-9]|fps|TFLOPS|MFU|SUMMARY|FAILED|Error" || echo "CLEAN RUN FAILED"
-              cp "$LOCAL_RESULTS/clean_out/tflops_report.json" "$LOCAL_RESULTS/" 2>/dev/null || true
-              # ── headline: steady-state fps (RF analog of sd's throughput=frame/s) ──
-              # NOTE on the math: each block line ends "... <fps> fps", so the number is
-              # field (NF-1), NOT $NF (which is the literal word "fps"). And block 0 of
-              # EACH prompt — plus the entire FIRST prompt — carry NEFF (re)compilation
-              # that leaks into this timed run (block times of 50-150s vs ~1.5s steady).
-              # So we report the MEDIAN over per-prompt block>0 lines (rejects compile
-              # outliers, matches sd's median= methodology) rather than a mean.
-              echo "--- CLEAN steady-state fps (per-block, RF analog of sd's throughput=frame/s) ---"
-              grep -oE "block +[0-9]+: .*[0-9.]+ fps" "$LOCAL_RESULTS/clean.txt" || true
-              awk '
-                /block +[0-9]+:/ {
-                  bidx=$2; gsub(":","",bidx); fps=$(NF-1)
-                  if (bidx+0 > 0) v[n++]=fps
-                }
-                END {
-                  if (n==0) { print "  no per-block fps lines captured"; exit }
-                  # sort
-                  for(i=0;i<n;i++) for(j=i+1;j<n;j++) if(v[j]<v[i]){t=v[i];v[i]=v[j];v[j]=t}
-                  med = (n%2) ? v[int(n/2)] : (v[n/2-1]+v[n/2])/2
-                  printf "  steady-state MEDIAN = %.2f fps over %d blocks (block 0 of each prompt excluded)\n", med, n
-                  printf "  (min %.2f / max %.2f fps — wide spread = compile contamination in early prompts)\n", v[0], v[n-1]
-                }' "$LOCAL_RESULTS/clean.txt"
-
-              # ══ SWEEP POINT 2: 1440 (480x768) with ring — the seq-len-sensitivity run ══
-              # gsd24 measured 1200=14.18 -> 1440=13.77 (+20% tokens = -2.9% fps, near-flat).
-              # 1440 needs BOTH --latent_w 96 AND frame_seq_length: 1440 (dit_pipeline asserts
-              # config == runtime h*w). Patch a COPY of the config so the 1200 reference above
-              # and the profiled run below stay on 1200.
-              echo "════════════ SWEEP: TP4xCP4 (16 ranks) @ 480x768 / frame_seqlen 1440, RING NSEG=1 ════════════"
-              sed 's/^frame_seq_length: 1200/frame_seq_length: 1440/' \
-                configs/rolling_forcing_dmd.yaml > /tmp/rf_dmd_1440.yaml
-              BENCH_CMD_1440="torchrun --nproc_per_node 16 e2e_pipeline.py \
-                --prompt_file prompts/example_prompts.txt \
-                --config_path /tmp/rf_dmd_1440.yaml \
-                --checkpoint_path checkpoints/rolling_forcing_dmd.pt \
-                --tp_degree 4 --latent_w 96 --num_output_frames 21 \
-                --chunk-size 3 --fps 16 --use_ema"
-              echo "--- [1440 warmup] ---"
-              RF_RING=1 RF_RING_NSEG=1 $BENCH_CMD_1440 --output_folder /tmp/warmup_1440 2>&1 \
-                | grep -iE "Building|compil|loaded|FAILED|Error" || echo "1440 warmup done"
-              echo "--- [1440 clean fps, ring NSEG=1] ---"
-              env -u NEURON_RT_INSPECT_ENABLE -u NEURON_RT_INSPECT_OUTPUT_DIR -u NEURON_RT_INSPECT_DEVICE_PROFILE \
-                RF_RING=1 RF_RING_NSEG=1 \
-                PROFILE_E2E_PIPELINE=1 MEASURE_TFLOPS=1 \
-                $BENCH_CMD_1440 --output_folder "$LOCAL_RESULTS/clean_1440_out" 2>&1 \
-                | tee "$LOCAL_RESULTS/clean_1440.txt" \
-                | grep -iE "T5:|block +[0-9]|fps|TFLOPS|MFU|FAILED|Error" || echo "1440 CLEAN FAILED"
-              echo "--- 1440 (480x768, ring NSEG=1) steady-state ---"
-              median_fps "$LOCAL_RESULTS/clean_1440.txt" | tee "$LOCAL_RESULTS/fps_1440.txt"
 
               # PROFILED RUN: the native torch_neuronx profiler (NEURON_PROFILE_ENABLE) writes
               # the harmony-format artifacts per rank into $PROFILE_DIR — trace_info.pb (system
@@ -408,7 +345,7 @@ spec:
               # executed neff_*.neff. NEURON_RT_INSPECT_* adds the system device-profile session.
               # ONE profiled pass = full trace; [4] assembles the upload bundle and [5] then
               # profiles each executed NEFF for engine util + MFU.
-              echo "=== [3/3] PROFILED RUN (system + native Neuron profilers -> harmony trace bundle) ==="
+              echo "=== PROFILED RUN @ 1200 (system + native Neuron profilers -> harmony trace bundle) ==="
               rm -rf "$PROFILE_DIR"; mkdir -p "$PROFILE_DIR"
               NEURON_RT_INSPECT_ENABLE=1 \
                 NEURON_RT_INSPECT_OUTPUT_DIR="$PROFILE_DIR" \
@@ -424,12 +361,10 @@ spec:
               echo "=== [5] per-NEFF engine utilization + MFU + optimization priority ==="
               per_neff_mfu
 
-              echo "=== HEADLINE: TP4xCP4 (16 ranks) RING NSEG=1 — 1200 (+ 1440 sweep). NO SP. ==="
-              echo "  --- TP4xCP4 (16 ranks) @ 480x640 / fs1200, RING NSEG=1 [expect ~14 fps] ---"
-              median_fps "$LOCAL_RESULTS/clean.txt" | tee "$LOCAL_RESULTS/main_fps.txt"
-              echo "  --- SWEEP TP4xCP4 (16 ranks) @ 480x768 / fs1440, RING NSEG=1 [expect ~13.8] ---"
-              cat "$LOCAL_RESULTS/fps_1440.txt" 2>/dev/null || echo "  (1440 fps unavailable)"
-              grep -iE "Average:.*TFLOPS|MFU" "$LOCAL_RESULTS/clean.txt" | tail -3 || true
+              echo "=== HEADLINE: TP4xCP4 (16 ranks) @ 480x640 / fs1200, RING NSEG=1, PROFILED (l-trn2 LNC2) ==="
+              echo "  per-block fps from the profiled run:"
+              median_fps "$LOCAL_RESULTS/profiled.txt" | tee "$LOCAL_RESULTS/main_fps.txt"
+              grep -iE "Average:.*TFLOPS|MFU" "$LOCAL_RESULTS/profiled.txt" | tail -3 || true
 
               # ─── persist EVERYTHING to one timestamped run dir on /var/mdl (S3) ───
               # /var/mdl/rolling-forcing/runs/<ddmmyyHHMMSS>/
@@ -442,16 +377,21 @@ spec:
               #   rf_results.tar.gz         <- everything, one tarball
               RUN_TS=$(date +%d%m%y%H%M%S)
               OUT="/var/mdl/rolling-forcing/runs/${RUN_TS}"
-              # frames: CP4 only (this branch runs no SP2). 1200 and 1440 kept separate.
-              #   frames/cp4_16rank/       <- TP4xCP4 @ 1200 videos (clean + profiled runs)
-              #   frames/cp4_16rank_1440/  <- TP4xCP4 @ 1440 sweep videos
-              mkdir -p "$OUT/frames/cp4_16rank" "$OUT/frames/cp4_16rank_1440"
-              # 1) FRAMES — every mp4 (this is the model output)
-              find "$LOCAL_RESULTS/clean_out" "$LOCAL_RESULTS/profiled_out" /tmp/warmup_out \
+              # frames: TP4xCP4 @ 1200 (profiled run only). Copy the mp4 VIDEOS, and also
+              # extract per-frame PIXEL PNGs from each mp4 so both are on /var/mdl.
+              mkdir -p "$OUT/frames/cp4_16rank" "$OUT/pixels/cp4_16rank"
+              find "$LOCAL_RESULTS/profiled_out" /tmp/warmup_out \
                 -name '*.mp4' -exec cp {} "$OUT/frames/cp4_16rank/" \; 2>/dev/null || true
-              find "$LOCAL_RESULTS/clean_1440_out" /tmp/warmup_1440 \
-                -name '*.mp4' -exec cp {} "$OUT/frames/cp4_16rank_1440/" \; 2>/dev/null || true
-              echo "frames saved: cp4_16rank=$(find "$OUT/frames/cp4_16rank" -name '*.mp4' 2>/dev/null | wc -l) mp4(s), cp4_16rank_1440=$(find "$OUT/frames/cp4_16rank_1440" -name '*.mp4' 2>/dev/null | wc -l) mp4(s)"
+              for mp4 in "$OUT/frames/cp4_16rank"/*.mp4; do
+                [ -f "$mp4" ] || continue
+                base=$(basename "$mp4" .mp4)
+                mkdir -p "$OUT/pixels/cp4_16rank/$base"
+                ffmpeg -nostdin -loglevel error -i "$mp4" \
+                  "$OUT/pixels/cp4_16rank/$base/frame_%04d.png" 2>/dev/null \
+                  || python3 -c "import av,sys,os; c=av.open('$mp4'); d='$OUT/pixels/cp4_16rank/$base'; os.makedirs(d,exist_ok=True); [f.to_image().save(os.path.join(d,'frame_%04d.png'%i)) for i,f in enumerate(c.decode(video=0))]" 2>/dev/null \
+                  || echo "  pixel extract skipped for $base (no ffmpeg/av)"
+              done
+              echo "frames saved: cp4_16rank=$(find "$OUT/frames/cp4_16rank" -name '*.mp4' 2>/dev/null | wc -l) mp4(s), pixels=$(find "$OUT/pixels/cp4_16rank" -name '*.png' 2>/dev/null | wc -l) png(s)"
               # 2) harmony upload bundle as a DIRECTORY (no untar needed before upload)
               if [[ -d "$LOCAL_RESULTS/harmony_bundle" ]]; then
                 cp -r "$LOCAL_RESULTS/harmony_bundle" "$OUT/" 2>/dev/null || echo "harmony dir persist skipped"
@@ -459,11 +399,8 @@ spec:
               # 3) the analysis text/json a human reads to decide what to optimize
               cp "$LOCAL_RESULTS/per_neff_mfu.txt"   "$OUT/" 2>/dev/null || true
               cp "$LOCAL_RESULTS/tflops_report.json" "$OUT/" 2>/dev/null || true
-              cp "$LOCAL_RESULTS/clean.txt"          "$OUT/" 2>/dev/null || true
               cp "$LOCAL_RESULTS/profiled.txt"       "$OUT/" 2>/dev/null || true
-              # CP4 fps summaries (1200 + 1440 sweep)
               cp "$LOCAL_RESULTS/main_fps.txt"       "$OUT/" 2>/dev/null || true
-              cp "$LOCAL_RESULTS/fps_1440.txt"       "$OUT/" 2>/dev/null || true
               # 3b) Neuron HBM breakdown tables (only exist if a run OOM'd) — the
               # per-category tensor/scratchpad/constant split that tells us the exact
               # culprit instead of inferring from overshoot deltas. Harmless if absent.
@@ -490,7 +427,7 @@ spec:
               echo "═══════════════════════════════════════════"
           resources:
             claims:
-              - name: m-lnc1-trn2
+              - name: l-trn2
             # Sized to fit the tighter node (ip-...-107-10: ~82Gi mem / ~48 vCPU free).
             # RF's host-memory footprint is small — weights live in Neuron HBM, not host
             # RAM — so the old 256Gi request only ever fit the roomier node. 64Gi limit
@@ -510,7 +447,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "main"
+              value: "rope-swap-batch"
             - name: NEURON_RT_LOG_LEVEL
               value: "ERROR"
             - name: NEURON_CC_LOG_LEVEL
