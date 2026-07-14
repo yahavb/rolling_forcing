@@ -1,19 +1,19 @@
 # Launch (rope-qk-fuse: fuse q/k RoPE launches 4->2 per layer in forward_merged):
-#   kubectl delete job job-rope-qk-fuse --ignore-not-found
+#   kubectl delete job rf-rope-qk-fuse --ignore-not-found
 #   kubectl apply -f rf-rope-qk-fuse-job.yaml
-#   kubectl logs -f job/job-rope-qk-fuse
+#   kubectl logs -f job/rf-rope-qk-fuse
 #   -> read steady-state MEDIAN vs main 14.20
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: job-rope-qk-fuse
+  name: rf-rope-qk-fuse
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: job-rope-qk-fuse
+        app: rf-rope-qk-fuse
     spec:
       restartPolicy: Never
       nodeSelector:
