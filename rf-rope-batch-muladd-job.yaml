@@ -35,14 +35,14 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: rolling-forcing
+  name: rf-rope-batch-muladd
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: rf-job
+        app: rf-rope-batch-muladd
     spec:
       restartPolicy: Never
       nodeSelector:
