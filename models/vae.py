@@ -386,35 +386,36 @@ class AttentionBlock(nn.Module):
 
     def forward(self, x):
         world = ps.get_world_size(_GROUP)
-        rank = ps.get_rank(_GROUP)
-        W_local = x.shape[-1]
+
+        # DE-DUP: attention is global over (h,w), but the OLD path gathered full x then ran
+        # norm+qkv+attention+proj on the FULL map on EVERY rank and kept only its 1/world slice
+        # = world-x duplicated compute + a full-tensor all_gather + a full output. Instead:
+        # each rank computes Q on its OWN width-slice; only K,V need the full map (attention
+        # reads all keys). q_local @ k_full,v_full -> exactly this rank's output slice, no
+        # duplicated q/proj/norm, no full-output. norm (per-position RMS over channels) and
+        # to_qkv/proj (conv1x1, per-position) are slice-local, so local==full-slice. K,V come
+        # from the SAME normed full map. Bit-identical (verify: max|Δ|=0).
+        b, c, t, h, w_local = x.size()
+
+        def _qkv(x_bcthw):
+            xw = x_bcthw.transpose(1, 2).reshape(-1, c, x_bcthw.shape[-2], x_bcthw.shape[-1])
+            xw = self.norm(xw)
+            return _split_qkv(self.to_qkv(xw))
 
         if world > 1:
-            w_start = rank * W_local
-            w_end = w_start + W_local
-            x_full = _all_gather_w(x)
+            x_full = _all_gather_w(x)                 # [b,c,t,h,W] full width
+            _, k, v = _qkv(x_full)                    # K,V full  [b*t,1,h*W,c]
+            q, _, _ = _qkv(x)                         # Q on THIS rank's slice [b*t,1,h*w_local,c]
         else:
-            x_full = x
+            q, k, v = _qkv(x)
 
-        identity = x_full
-        b, c, t, h, w = x_full.size()
-        x_work = x_full.transpose(1, 2).reshape(b * t, c, h, w)
-
-        x_work = self.norm(x_work)
-        qkv = self.to_qkv(x_work)
-        q, k, v = _split_qkv(qkv)
-
-        x_work = vae_scaled_dot_product_attention(q, k, v)
+        x_work = vae_scaled_dot_product_attention(q, k, v)   # -> this rank's tokens
         x_work = x_work.squeeze(1).permute(0, 2, 1)
-        x_work = x_work.reshape(b * t, c, h, w)
+        x_work = x_work.reshape(b * t, c, h, w_local)
 
         x_work = self.proj(x_work)
-        x_work = x_work.reshape(b, t, c, h, w).transpose(1, 2)
-        y_full = x_work + identity
-
-        if world > 1:
-            return y_full[..., w_start:w_end].contiguous()
-        return y_full
+        x_work = x_work.reshape(b, t, c, h, w_local).transpose(1, 2)
+        return x_work + x                              # residual on this rank's slice
 
 
 
