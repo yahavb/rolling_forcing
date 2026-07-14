@@ -49,11 +49,19 @@ def _causal_rope_rotation_nki(x, cos_sin, num_heads=12, head_dim=128):
         x_swap_all[:, :, 0::2] = x_sb[:, :, 1::2]
         x_swap_all[:, :, 1::2] = x_sb[:, :, 0::2]
 
+        # Win5: batch the multiply/add over ALL heads too (was 3 ops x N heads/tile = the
+        # remaining 94%-gpsimd cost). cos/sin are [P,D]; N is a FREE axis, so reshape to
+        # [P,1,D] and broadcast_to([P,N,D]) = a STRIDE-0 view that folds into the multiply at
+        # no cost (no per-head loop, no data copy — per NKI free-dim broadcast rules). Then
+        # ONE multiply/multiply/add over the full [P,N,D] tile. out = x*cos + swap(x)*sin.
+        # Bit-identical to the per-head loop (verify max|Δ|=0): 3 ops/tile vs 3*N.
+        cos_b = cos_tile.reshape(P, 1, D).broadcast_to((P, N, D))
+        sin_b = sin_tile.reshape(P, 1, D).broadcast_to((P, N, D))
+
         out_sb = nl.ndarray((P, N, D), dtype=x.dtype, buffer=nl.sbuf)
-        for n in nl.affine_range(N):
-            x_cos = nl.multiply(x_sb[:, n, :], cos_tile)
-            x_sin = nl.multiply(x_swap_all[:, n, :], sin_tile)
-            out_sb[:, n, :] = nl.add(x_cos, x_sin)
+        x_cos = nl.multiply(x_sb, cos_b)
+        x_sin = nl.multiply(x_swap_all, sin_b)
+        out_sb[:, :, :] = nl.add(x_cos, x_sin)
 
         nl.store(out[nl.ds(ts, P), :, :], out_sb)
 
