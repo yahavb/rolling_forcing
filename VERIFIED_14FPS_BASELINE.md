@@ -115,3 +115,32 @@ over the full (world-gathered) window is HARD TO BEAT at the torch/kernel-call g
 The ONLY way sharding wins = a SINGLE fused kernel that does gather+attend internally with the
 KV transfer overlapping the matmul pipeline (true CORE-style), NOT N separate wan_flash calls.
 That is a large kernel rewrite. Torch-level and wrapper-level sharding are both DEAD (measured).
+
+## FUSED KV-PARALLEL KERNEL — DESIGN LOCKED, BUILD PLAN (2026-07-13)
+CPU proof (verify_kvparallel_oneflash.py) settles CORRECTNESS: 1-flash-per-rank over own KV
+shard -> partial (O,max,sum) -> online merge (ORDER-INVARIANT, ~7e-16 vs full). This is the
+ONLY structure that keeps flash-call-count = 1 (not N -> 0.32fps, not reassembly -> 5.29fps).
+
+RF PER-RANK GEOMETRY (confirmed, differs from CORE which gathers full Q):
+- query per rank = L/sp (sp=4)  [sp-sharded over attn-tp, gather_q_tp]
+- KV per rank    = 1/world (=1/16) [world-sharded, per-block-interleaved]
+- nblocks VARIABLE 1..7 (dn window fills to _cs_max_attention_size=1575=21*1200/16)
+- from run d8q77: q[3,128,4500] k_shard[3,128,225] v_shard[3,225,128]
+
+CORE (attention_kv_parallel_segmented_cte, 473 lines) is PAGED (block_tables/APC/sliding/
+round-robin) — do NOT graft whole. REUSE only: (1) dma->named shared_hbm->ncc idiom (proven,
+compiles), (2) the _merge_partial_attention_outputs online-softmax merge structure.
+
+WHERE THE WIN MUST COME FROM (measure, don't assume): baseline gathers full KV (barrier) then
+1 flash. This design: each rank flashes its OWN shard (no pre-gather) -> exchange PARTIALS
+(~same volume as KV) -> merge. Partials are NOT smaller, so the ONLY win = the partial
+all_to_all/all_gather OVERLAPPING the flash matmul. If it doesn't overlap, this ties or loses.
+
+BUILD SEQUENCE (each stage device-validated before next; ACC gate max|Δ|=0 bf16 pixel):
+1. Kernel does local flash(q_sp_shard, own_kv_shard) -> return partial. NO collective yet;
+   torch does the partial all_gather + merge. Confirms local-flash-partial correctness + fps
+   floor (should ~= current 5-12 range, non-overlapped).
+2. Move the merge into the kernel (recv partials as input). Still torch collective.
+3. Move the collective INTO the kernel (ncc.all_gather of partials) — the overlap play.
+   Profile: does the collective hide behind the flash matmul? THIS is the fps test.
+Stage 1 first. Do NOT write all 3 at once (that produced 3 broken deploys).
