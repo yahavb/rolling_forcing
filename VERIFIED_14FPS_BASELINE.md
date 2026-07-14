@@ -100,3 +100,18 @@ NEXT (Option A, the right small step): sharded local flash (return_partials) on 
 all_gather the small PARTIALS + ordered global combine. Reuses proven combine math; tests whether
 sharded-partial (NOT full-reassembly) recovers fps. Option B = full in-kernel all_to_all ring
 (harder, ordered-merge baked into schedule). Do A first, ACC-gate, then profile overlap.
+
+## KV-OVERLAP DIAGNOSTIC RESULT (RF_CACHESHARD_COMBINE, run dfdbr) — DECISIVE
+gather + ordered partial-combine, NO reassembly = **0.32 fps, DiT 37,600ms/block** (55x SLOWER).
+Not a crash — runs, but catastrophic. CAUSE: the combine splits ONE flash call into N=16
+per-shard flash calls (nblocks=1 here), each on the FULL Sq query (4500) with its own padded
+buffer + partial. 16x the flash LAUNCHES. This is the "padded-segment scaffold" failure
+(benchmark log: RF_RING_SHARD nseg=sp = ~3-5fps) x16.
+
+CONCLUSION (rules out a whole family): on this hardware, splitting the single full-window flash
+into per-shard flash calls is ruinous — per-call launch+padding overhead dominates, regardless
+of whether you reassemble (5.29) or combine partials (0.32). The 14fps baseline's ONE flash call
+over the full (world-gathered) window is HARD TO BEAT at the torch/kernel-call granularity.
+The ONLY way sharding wins = a SINGLE fused kernel that does gather+attend internally with the
+KV transfer overlapping the matmul pipeline (true CORE-style), NOT N separate wan_flash calls.
+That is a large kernel rewrite. Torch-level and wrapper-level sharding are both DEAD (measured).
