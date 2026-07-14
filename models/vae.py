@@ -165,16 +165,28 @@ def _halo_exchange_w(x, radius, group_name=_GROUP):
     if world == 1:
         return None, None
 
+    # edges_local[0]=left edge, edges_local[1]=right edge.
     edges_local = _extract_edges(x, radius)
-    edges_all = torch.empty(
-        (world * edges_local.shape[0],) + edges_local.shape[1:],
-        dtype=x.dtype, device=x.device,
-    )
-    ps.all_gather_into_tensor(edges_all, edges_local, group_name)
-    edges_all = edges_all.reshape((world,) + edges_local.shape)
 
-    halo_left = edges_all[rank - 1, 1] if rank > 0 else None
-    halo_right = edges_all[rank + 1, 0] if rank < world - 1 else None
+    # all_to_all NEIGHBOR SHIFT (replaces the world all_gather that broadcast every rank's
+    # edges to all 16 and discarded 14/16). Each rank SENDS its right edge to rank+1 (becomes
+    # its halo_left) and left edge to rank-1 (its halo_right); zeros elsewhere. After a2a, rank
+    # receives from rank-1 -> halo_left, from rank+1 -> halo_right. Bit-identical to the
+    # all_gather (verify: a2a shift == all_gather, max|Δ|=0). Same collective COUNT but each
+    # moves only 2 neighbor edges, not a 16-way broadcast.
+    right = edges_local[1]
+    left = edges_local[0]
+    zero = torch.zeros_like(left)
+    send_list = [zero] * world
+    if rank + 1 < world:
+        send_list[rank + 1] = right.contiguous()
+    if rank - 1 >= 0:
+        send_list[rank - 1] = left.contiguous()
+    recv_list = [torch.empty_like(left) for _ in range(world)]
+    ps.all_to_all(recv_list, send_list, group_name)
+
+    halo_left = recv_list[rank - 1] if rank > 0 else None
+    halo_right = recv_list[rank + 1] if rank < world - 1 else None
     return halo_left, halo_right
 
 

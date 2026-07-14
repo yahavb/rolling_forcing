@@ -62,3 +62,7 @@ def reduce_scatter_tensor(output, input, group_name):
 
 def all_reduce(tensor, group_name, op=dist.ReduceOp.SUM):
     dist.all_reduce(tensor, op=op, group=_get(group_name))
+
+
+def all_to_all(output_list, input_list, group_name):
+    dist.all_to_all(output_list, input_list, group=_get(group_name))

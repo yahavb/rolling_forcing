@@ -1,0 +1,489 @@
+# Rolling Forcing — Neuron 3-run benchmark — VERIFIED 14fps BASELINE (TP4xCP4 ONLY)
+#
+# THIS VERSION RUNS TP4xCP4 (16 ranks) WITH RING ATTENTION, AND NOTHING ELSE.
+# The TP4xSP2 8-rank baseline pass was DELETED on purpose (it produced the ~9fps number
+# that kept getting mistaken for the baseline). There is NO SP path here. See
+# VERIFIED_14FPS_BASELINE.md for the full recipe + measured runs.
+# tp_degree pinned at 4 (12 heads only divide by 4); the other axis is CP (context-parallel):
+# CP keeps the query sequence-sharded (gather Q only over attn-tp=4, RoPE only this rank's
+# shard, NEVER materialize the full Q) — that is the 14fps win, NOT ring (ring is free at 1200).
+# 480x640 (latent_w=80, frame_seqlen=1200); F*frame_seqlen must be %16==0.
+# Key differences from sd-job:
+#   - Topology : TP=4 x CP=4 = 16 ranks -> torchrun --nproc_per_node 16 on l-trn2.
+#   - Entry    : e2e_pipeline.py (T5 -> DiT -> VAE fused). NO --warmup/--iters flags;
+#                it emits per-stage "T5: <N> ms" + DiT/VAE logs and tflops_report.json,
+#                NOT sd's median=/built= markers.
+#   - Profiler : native torch_neuronx NeuronProfiler (PROFILE_E2E_PIPELINE=1) +
+#                per-NEFF neuron-profile CLI. RF has no scripts/neuron/*.py aggregator,
+#                so we enumerate the NEFF cache and summary-text the largest NEFF directly.
+#
+# Model under test (current Neuron implementation):
+#   - DiT base : Wan-AI/Wan2.1-T2V-1.3B  (T5 encoder + VAE decoder)
+#   - DiT ckpt : TencentARC/RollingForcing -> checkpoints/rolling_forcing_dmd.pt (DMD-distilled)
+#   - Runtime  : TP-4 x SP-{2,4} (8 or 16 NeuronCores, LNC=1), bf16, eager + NKI kernels
+#   - Shape    : num_output_frames=21, chunk-size=3, fps=16, latent 60x80 (480x640)
+#
+# Mandatory 3-run methodology (ONE pod):
+#   [1/3] WARMUP  : compile-if-cold / load NEFFs (not timed)
+#   [2/3] CLEAN   : NO profiler -> per-stage T5/DiT/VAE ms + tflops_report.json (REAL latency)
+#   [3/3] PROFILED: native Neuron profiler on -> NEFF+NTFF pairs -> per-NEFF engine shares
+#
+# Launch:
+#   kubectl delete job rf --ignore-not-found
+#   kubectl apply -f rf-job.yaml
+#   kubectl logs -f job/rf
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rf-vae-halo-a2a
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: rf-vae-halo-a2a
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn2
+      resourceClaims:
+        # 16 NeuronCores (2 chips x 8, LNC=1) for the TP4xCP4 16-rank run.
+        - name: l-trn2
+          resourceClaimTemplateName: l-trn2
+      containers:
+        - name: bench
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              BRANCH="${BRANCH:-main}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git REPO
+              cd REPO
+
+              # ── PROVENANCE part 1: which code (no deps needed; right after clone) ──
+              GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+              echo "┌── PROVENANCE ──"
+              echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
+              echo "│ commit : $GIT_SHA"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+
+              # ─── Install deps ─────────────────────────────────────────────
+              uv pip install \
+                "diffusers==0.37.1" \
+                "transformers==5.8.1" \
+                "huggingface-hub==1.16.4" \
+                "click" \
+                "einops==0.8.2" \
+                "omegaconf==2.3.0" \
+                "ftfy==6.3.1" \
+                "regex==2026.5.9" \
+                "av==17.0.1"
+
+              # ─── Model weights: Wan2.1-T2V-1.3B (T5 + VAE) ─────────────
+              # /var/mdl is S3-backed; single tar avoids per-file S3 overhead.
+              WAN_TAR="/var/mdl/rolling_forcing/Wan2.1-T2V-1.3B.tar"
+              WAN_LOCAL="/tmp/REPO/wan_models/Wan2.1-T2V-1.3B"
+
+              if [[ -f "$WAN_TAR" ]]; then
+                echo "Extracting Wan2.1-T2V-1.3B from S3 cache..."
+                mkdir -p wan_models
+                tar xf "$WAN_TAR" -C wan_models/
+              else
+                echo "Downloading Wan2.1-T2V-1.3B from HuggingFace..."
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
+                echo "Creating tar for S3 cache..."
+                tar cf /tmp/Wan2.1-T2V-1.3B.tar -C wan_models Wan2.1-T2V-1.3B
+                mkdir -p "$(dirname $WAN_TAR)"
+                cp /tmp/Wan2.1-T2V-1.3B.tar "$WAN_TAR"
+                rm -f /tmp/Wan2.1-T2V-1.3B.tar
+                echo "Cached Wan2.1-T2V-1.3B to S3!"
+              fi
+
+              # ─── Model weights: Rolling-forcing DMD checkpoint ──────────
+              DMD_TAR="/var/mdl/rolling_forcing/rolling_forcing_dmd.tar"
+
+              if [[ -f "$DMD_TAR" ]]; then
+                echo "Extracting DMD checkpoint from S3 cache..."
+                mkdir -p checkpoints
+                tar xf "$DMD_TAR" -C checkpoints/
+              else
+                echo "Downloading DMD checkpoint from HuggingFace..."
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('TencentARC/RollingForcing', allow_patterns='checkpoints/rolling_forcing_dmd.pt', local_dir='.', local_dir_use_symlinks=False)"
+                echo "Creating tar for S3 cache..."
+                tar cf /tmp/rolling_forcing_dmd.tar -C checkpoints rolling_forcing_dmd.pt
+                mkdir -p "$(dirname $DMD_TAR)"
+                cp /tmp/rolling_forcing_dmd.tar "$DMD_TAR"
+                rm -f /tmp/rolling_forcing_dmd.tar
+                echo "Cached DMD checkpoint to S3!"
+              fi
+              echo "Model weights ready!"
+
+              LOCAL_RESULTS="/tmp/results"; mkdir -p "$LOCAL_RESULTS"
+
+              # ── TOPOLOGY: TP4 x CP4 = 16 ranks ONLY (no SP, no 8-rank pass) ──
+              # tp_degree fixed at 4 (Wan2.1-1.3B has 12 heads; only 4 divides them and is a
+              # legal collective group). cp_degree = nproc/4 = 4, derived by e2e_pipeline.py.
+              # --latent_w 80 (480x640, frame_seqlen=1200) because F*frame_seqlen must be
+              # %16==0 (1560 / 832-wide is not) and 1200 fits HBM.
+              NPROC="${NPROC:-16}"          # 16 = TP4xCP4
+              LATENT_W="${LATENT_W:-80}"
+              # e2e_pipeline.py has no --warmup/--iters; it logs per-stage "T5: <N> ms" +
+              # DiT/VAE and (with MEASURE_TFLOPS=1) writes <output_folder>/tflops_report.json.
+              BENCH_CMD="torchrun --nproc_per_node ${NPROC} e2e_pipeline.py \
+                --prompt_file prompts/example_prompts.txt \
+                --config_path configs/rolling_forcing_dmd.yaml \
+                --checkpoint_path checkpoints/rolling_forcing_dmd.pt \
+                --tp_degree 4 \
+                --latent_w ${LATENT_W} \
+                --num_output_frames 21 \
+                --chunk-size 3 \
+                --fps 16 \
+                --use_ema"
+
+              PROFILE_DIR="/tmp/neuron_profile"
+
+              # ─── build_harmony_bundle: a dir matching neuron-explorer.harmony.a2z.com's spec ───
+              # "Directory Upload For System Profile" expects EXACTLY:
+              #   trace_info.pb  — REQUIRED (system-level trace events)
+              #   *.pb           — optional (additional trace data: ntrace.pb, cpu_util.pb, host_mem.pb)
+              #   *.ntff         — optional (device execution trace)
+              #   *.neff         — optional (compiled model for instruction analysis)
+              # NOTE: trace.json is NOT in the spec and was 700MB — we keep it separately
+              # (see persist) but DO NOT put it in the upload dir, so the upload stays lean.
+              #
+              # On-disk layout from the native torch_neuronx profiler — per rank
+              # ($PROFILE_DIR/i-*_pid_*) there are TWO sibling timestamp subdirs:
+              #   <ts_A>/neff_*.neff                              (compiled models)
+              #   <ts_B>/trace_info.pb ntrace.pb cpu_util.pb ...  (traces)
+              # We take trace_info.pb + *.pb from ONE rank (system trace is per-process,
+              # one rank's is what harmony ingests) and ALL ranks' .neff (instruction
+              # analysis wants every distinct compiled model). Sets HARMONY_DIR.
+              HARMONY_DIR=""
+              build_harmony_bundle() {
+                local BUNDLE="$LOCAL_RESULTS/harmony_bundle"
+                rm -rf "$BUNDLE"; mkdir -p "$BUNDLE"
+                local TI PIDDIR
+                TI=$(find "$PROFILE_DIR" -name 'trace_info.pb' 2>/dev/null | sort | head -1 || true)
+                if [[ -z "$TI" ]]; then
+                  echo "  trace_info.pb : MISSING ✗ — no system trace anywhere under $PROFILE_DIR"
+                  find "$PROFILE_DIR" -maxdepth 3 -type f 2>/dev/null | head -40 || true
+                  return
+                fi
+                PIDDIR=$(dirname "$(dirname "$TI")")
+                # system trace + extra .pb from this one rank (NOT *.json — too big, not in spec)
+                find "$PIDDIR" -type f -name '*.pb' -exec cp -n {} "$BUNDLE/" \; 2>/dev/null || true
+                # device traces (if this profiler ever emits .ntff) + ALL ranks' unique .neff
+                find "$PROFILE_DIR" -type f -name '*.ntff' -exec cp -n {} "$BUNDLE/" \; 2>/dev/null || true
+                local seen="$BUNDLE/.neffseen"; : > "$seen"
+                while IFS= read -r nf; do
+                  local b; b=$(basename "$nf")
+                  grep -qxF "$b" "$seen" 2>/dev/null && continue
+                  echo "$b" >> "$seen"; cp -n "$nf" "$BUNDLE/" 2>/dev/null || true
+                done < <(find "$PROFILE_DIR" -type f -name '*.neff' 2>/dev/null | sort)
+                rm -f "$seen"
+                HARMONY_DIR="$BUNDLE"
+                echo "=== harmony upload bundle: $BUNDLE (system trace from $PIDDIR) ==="
+                if [[ -f "$BUNDLE/trace_info.pb" ]]; then
+                  echo "  trace_info.pb : PRESENT ✓ (REQUIRED — harmony will accept)"
+                else
+                  echo "  trace_info.pb : MISSING ✗ — harmony will reject this upload"
+                fi
+                echo "  *.pb   total : $(find "$BUNDLE" -name '*.pb'   2>/dev/null | wc -l)  (trace_info.pb + ntrace/cpu_util/host_mem)"
+                echo "  *.ntff total : $(find "$BUNDLE" -name '*.ntff' 2>/dev/null | wc -l)  (device execution trace)"
+                echo "  *.neff total : $(find "$BUNDLE" -name '*.neff' 2>/dev/null | wc -l)  (compiled models, all ranks — instruction analysis)"
+                ls -la "$BUNDLE" 2>/dev/null || true
+                du -sh "$BUNDLE" 2>/dev/null || true
+              }
+
+              # ─── per_neff_mfu: profile EVERY executed NEFF -> engine util + MFU + priority ───
+              # For each unique .neff that actually ran: neuron-profile capture --single-io
+              # (fresh ntff) -> view --output-format summary-json. Then a Python aggregator
+              # prints a per-NEFF engine table (tensor/gpsimd/vector/dma %), the model-level
+              # MFU (from tflops_report.json), and a PRIORITY-RANKED optimization list that
+              # flags OVERHEAD-BOUND NEFFs (matmul-light, dma/stall-heavy — the real targets)
+              # vs COMPUTE-BOUND (already-hot matmul). neuron-profile CLI only — no SQL/parquet.
+              write_aggregator() {
+                cat > /tmp/profile_neffs.py <<'PYEOF'
+              import sys, os, json, glob
+              # peak per NeuronCore (bf16) — mirrors utils/flops.py NEURONCORE_PEAK_TFLOPS_BF16
+              PEAK_TFLOPS_PER_CORE = 190.0
+              jdir = sys.argv[1]
+              tflops_report = sys.argv[2] if len(sys.argv) > 2 else ""
+
+              def pick(d):
+                  nodes = [v for v in d.values() if isinstance(v, dict)] if isinstance(d, dict) else d
+                  return max(nodes or [d], key=lambda x: (x.get("total_time", 0) or 0))
+
+              rows = []
+              for f in sorted(glob.glob(os.path.join(jdir, "*.json"))):
+                  try:
+                      n = pick(json.load(open(f)))
+                  except Exception:
+                      continue
+                  g = lambda k: float(n.get(k, 0) or 0)
+                  pct = lambda k: g(k + "_percent") * 100.0
+                  rows.append({
+                      "hash": os.path.basename(f)[:-5][:14],
+                      "tot_us": g("total_time") * 1e6,
+                      "tensor": pct("tensor_engine_active_time"),
+                      "gpsimd": pct("gpsimd_engine_active_time"),
+                      "vector": pct("vector_engine_active_time"),
+                      "dma":    pct("dma_active_time"),
+                  })
+              if not rows:
+                  print("NO valid per-NEFF json — capture failed."); sys.exit(0)
+
+              rows.sort(key=lambda r: r["tot_us"], reverse=True)
+              tot_all = sum(r["tot_us"] for r in rows) or 1.0
+
+              def classify(r):
+                  # OVERHEAD-BOUND: little/no tensor-engine work, time goes to DMA/stall.
+                  # These are the SD concat/pad-style targets — biggest, safest wins.
+                  if r["tensor"] < 15 and r["dma"] >= 40:
+                      return "OVERHEAD-BOUND (dma/stall) <- OPTIMIZE"
+                  if r["tensor"] >= 40:
+                      return "COMPUTE-BOUND (matmul-hot)"
+                  return "MIXED"
+
+              print(f"=== PER-NEFF ENGINE UTILIZATION ({len(rows)} NEFFs, by wall time) ===")
+              print(f"{'neff':14} {'tot_us':>9} {'%oftot':>7} {'tensor%':>8} {'gpsimd%':>8} {'vector%':>8} {'dma%':>7}  class")
+              for r in rows:
+                  print(f"{r['hash']:14} {r['tot_us']:>9.1f} {100*r['tot_us']/tot_all:>6.1f}% "
+                        f"{r['tensor']:>8.1f} {r['gpsimd']:>8.1f} {r['vector']:>8.1f} {r['dma']:>7.1f}  {classify(r)}")
+
+              # model-level MFU from the analytic TFLOPS report (real achieved/peak)
+              print("\n=== MODEL-LEVEL MFU (from tflops_report.json) ===")
+              try:
+                  d = json.load(open(tflops_report))
+                  print(f"  peak {d.get('peak_tflops',0):.0f} TFLOPS @ {d.get('num_cores','?')} cores | "
+                        f"avg {d.get('avg_tflops',0):.1f} TFLOPS | MFU {d.get('avg_mfu',0)*100:.2f}%")
+                  for s in d.get("per_stage", []):
+                      print(f"    {s['stage']:24} {s['elapsed_s']*1000:8.1f} ms  "
+                            f"{s['tflops_achieved']:6.1f} TFLOPS  MFU {s['mfu']*100:5.2f}%")
+              except Exception as e:
+                  print(f"  (tflops_report unavailable: {e})")
+
+              print("\n=== OPTIMIZATION PRIORITY (highest wall-time first) ===")
+              print("  Fix top-of-list first; OVERHEAD-BOUND = layout/kernel fix (no quality risk),")
+              print("  COMPUTE-BOUND = already-hot matmul (lower ceiling, needs algo/precision change).")
+              cum = 0.0
+              for i, r in enumerate(rows[:10], 1):
+                  share = 100*r["tot_us"]/tot_all; cum += share
+                  print(f"  P{i:<2} {r['hash']:14} {r['tot_us']:>8.1f}us  {share:4.1f}% (cum {cum:4.1f}%)  {classify(r)}")
+              PYEOF
+              }
+
+              per_neff_mfu() {
+                local POUT=/tmp/perneff_json; rm -rf "$POUT"; mkdir -p "$POUT"
+                # unique .neff files that actually executed (RF runs a small stable set)
+                mapfile -t NEFFS < <(find "$PROFILE_DIR" -name '*.neff' -exec basename {} \; 2>/dev/null \
+                  | sort -u | while read -r b; do find "$PROFILE_DIR" -name "$b" | head -1; done)
+                echo "unique executed NEFFs: ${#NEFFS[@]}"
+                local OK=0
+                for neff in "${NEFFS[@]}"; do
+                  [ -f "$neff" ] || continue
+                  local h; h=$(basename "$neff" .neff)
+                  local ntff="$POUT/${h}.ntff" json="$POUT/${h}.json"
+                  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 300 \
+                    neuron-profile capture --single-io -n "$neff" -s "$ntff" >/dev/null 2>&1 || continue
+                  [ -f "$ntff" ] || continue
+                  timeout 180 neuron-profile view -n "$neff" -s "$ntff" \
+                    --output-format summary-json > "$json" 2>/dev/null || true
+                  [ -s "$json" ] && OK=$((OK+1))
+                done
+                echo "captured+viewed OK: $OK / ${#NEFFS[@]}"
+                write_aggregator
+                python3 /tmp/profile_neffs.py "$POUT" "$LOCAL_RESULTS/tflops_report.json" \
+                  2>&1 | tee "$LOCAL_RESULTS/per_neff_mfu.txt" || echo "aggregation failed"
+                # keep the raw per-NEFF summary-json alongside results
+                cp -r "$POUT" "$LOCAL_RESULTS/perneff_json" 2>/dev/null || true
+              }
+
+              # From here on, best-effort: a failing analysis/profiler command must NOT
+              # kill the pod before results are archived. (The 8h-Error run died here on a
+              # SIGPIPE from `head` under pipefail.) Setup above stays strict so a bad
+              # clone / dep / weight download still fails loud.
+              set +e +o pipefail
+              trap 'echo "(trap) benchmark section exited rc=$? — proceeding to archive"' ERR
+
+              # reusable steady-state median extractor (block>0 per prompt; rejects compile outliers)
+              median_fps() {  # $1 = clean.txt path ; prints "MEDIAN fps (min/max over N)"
+                awk '
+                  /block +[0-9]+:/ { bidx=$2; gsub(":","",bidx); if(bidx+0>0) v[n++]=$(NF-1) }
+                  END {
+                    if(n==0){ print "  no per-block fps lines"; exit }
+                    for(i=0;i<n;i++) for(j=i+1;j<n;j++) if(v[j]<v[i]){t=v[i];v[i]=v[j];v[j]=t}
+                    med=(n%2)?v[int(n/2)]:(v[n/2-1]+v[n/2])/2
+                    printf "  MEDIAN = %.2f fps over %d blocks (min %.2f / max %.2f)\n", med, n, v[0], v[n-1]
+                  }' "$1"
+              }
+
+              # NOTE: this branch (verified-14fps-baseline) runs TP4xCP4 ONLY — the 14fps path.
+              # The TP4xSP2 8-rank baseline pass was REMOVED on purpose: it produced the ~9fps
+              # number that repeatedly got mistaken for the baseline. This job does CP4 and
+              # nothing else. Any SP is gone.
+
+              echo "════════════ NEURON 3-RUN BENCHMARK (Rolling Forcing) ════════════"
+              echo "  model    : Wan2.1-T2V-1.3B + RollingForcing DMD ckpt, TP4xCP4 (16 cores), bf16, 21 frames"
+              echo "  topology : TP=4 x CP=4 = 16 ranks (l-trn2 claim LNC2 24GB), RING NSEG=1, 480x640/fs1200, PROFILED"
+              echo "=================================================================="
+
+              echo "=== [1/3] WARMUP (compile-if-cold / load NEFFs; not timed) ==="
+              $BENCH_CMD --output_folder /tmp/warmup_out \
+                2>&1 | tee "$LOCAL_RESULTS/warmup.txt" | grep -iE "Building|compil|loaded|profiler|FAILED|Error" || echo "WARMUP done (no matching lines)"
+
+              # PROFILED RUN: the native torch_neuronx profiler (NEURON_PROFILE_ENABLE) writes
+              # the harmony-format artifacts per rank into $PROFILE_DIR — trace_info.pb (system
+              # trace, REQUIRED), ntrace.pb/cpu_util.pb/host_mem.pb (*.pb), trace.json, and the
+              # executed neff_*.neff. NEURON_RT_INSPECT_* adds the system device-profile session.
+              # ONE profiled pass = full trace; [4] assembles the upload bundle and [5] then
+              # profiles each executed NEFF for engine util + MFU.
+              echo "=== PROFILED RUN @ 1200 (system + native Neuron profilers -> harmony trace bundle) ==="
+              rm -rf "$PROFILE_DIR"; mkdir -p "$PROFILE_DIR"
+              NEURON_RT_INSPECT_ENABLE=1 \
+                NEURON_RT_INSPECT_OUTPUT_DIR="$PROFILE_DIR" \
+                NEURON_RT_INSPECT_DEVICE_PROFILE=session \
+                NEURON_PROFILE_ENABLE=1 NEURON_PROFILE_DIR="$PROFILE_DIR" \
+                RF_RING=1 RF_RING_NSEG=1 \
+                PROFILE_E2E_PIPELINE=1 MEASURE_TFLOPS=1 \
+                $BENCH_CMD --output_folder "$LOCAL_RESULTS/profiled_out" \
+                2>&1 | tee "$LOCAL_RESULTS/profiled.txt" | grep -iE "T5:|block +[0-9]|fps|TFLOPS|MFU|profiler|FAILED" || echo "PROFILED RUN FAILED"
+
+              echo "=== [4] assemble harmony upload bundle ==="
+              build_harmony_bundle
+              echo "=== [5] per-NEFF engine utilization + MFU + optimization priority ==="
+              per_neff_mfu
+
+              echo "=== HEADLINE: TP4xCP4 (16 ranks) @ 480x640 / fs1200, RING NSEG=1, PROFILED (l-trn2 LNC2) ==="
+              echo "  per-block fps from the profiled run:"
+              median_fps "$LOCAL_RESULTS/profiled.txt" | tee "$LOCAL_RESULTS/main_fps.txt"
+              grep -iE "Average:.*TFLOPS|MFU" "$LOCAL_RESULTS/profiled.txt" | tail -3 || true
+
+              # ─── persist EVERYTHING to one timestamped run dir on /var/mdl (S3) ───
+              # /var/mdl/rolling-forcing/runs/<ddmmyyHHMMSS>/
+              #   frames/                  <- ALL generated mp4s (clean + profiled runs)
+              #   harmony_bundle/          <- upload THIS dir to neuron-explorer.harmony.a2z.com
+              #   per_neff_mfu.txt         <- per-NEFF engine util + MFU + optimization priority
+              #   tflops_report.json       <- model-level achieved TFLOPS / MFU
+              #   clean.txt profiled.txt    <- per-block fps + per-stage timing
+              #   trace.json.gz             <- general JSON trace (large; not in harmony spec)
+              #   rf_results.tar.gz         <- everything, one tarball
+              RUN_TS=$(date +%d%m%y%H%M%S)
+              OUT="/var/mdl/rolling-forcing/runs/${RUN_TS}"
+              # frames: TP4xCP4 @ 1200 (profiled run only). Copy the mp4 VIDEOS, and also
+              # extract per-frame PIXEL PNGs from each mp4 so both are on /var/mdl.
+              mkdir -p "$OUT/frames/cp4_16rank" "$OUT/pixels/cp4_16rank"
+              find "$LOCAL_RESULTS/profiled_out" /tmp/warmup_out \
+                -name '*.mp4' -exec cp {} "$OUT/frames/cp4_16rank/" \; 2>/dev/null || true
+              for mp4 in "$OUT/frames/cp4_16rank"/*.mp4; do
+                [ -f "$mp4" ] || continue
+                base=$(basename "$mp4" .mp4)
+                mkdir -p "$OUT/pixels/cp4_16rank/$base"
+                ffmpeg -nostdin -loglevel error -i "$mp4" \
+                  "$OUT/pixels/cp4_16rank/$base/frame_%04d.png" 2>/dev/null \
+                  || python3 -c "import av,sys,os; c=av.open('$mp4'); d='$OUT/pixels/cp4_16rank/$base'; os.makedirs(d,exist_ok=True); [f.to_image().save(os.path.join(d,'frame_%04d.png'%i)) for i,f in enumerate(c.decode(video=0))]" 2>/dev/null \
+                  || echo "  pixel extract skipped for $base (no ffmpeg/av)"
+              done
+              echo "frames saved: cp4_16rank=$(find "$OUT/frames/cp4_16rank" -name '*.mp4' 2>/dev/null | wc -l) mp4(s), pixels=$(find "$OUT/pixels/cp4_16rank" -name '*.png' 2>/dev/null | wc -l) png(s)"
+              # 2) harmony upload bundle as a DIRECTORY (no untar needed before upload)
+              if [[ -d "$LOCAL_RESULTS/harmony_bundle" ]]; then
+                cp -r "$LOCAL_RESULTS/harmony_bundle" "$OUT/" 2>/dev/null || echo "harmony dir persist skipped"
+              fi
+              # 3) the analysis text/json a human reads to decide what to optimize
+              cp "$LOCAL_RESULTS/per_neff_mfu.txt"   "$OUT/" 2>/dev/null || true
+              cp "$LOCAL_RESULTS/tflops_report.json" "$OUT/" 2>/dev/null || true
+              cp "$LOCAL_RESULTS/profiled.txt"       "$OUT/" 2>/dev/null || true
+              cp "$LOCAL_RESULTS/main_fps.txt"       "$OUT/" 2>/dev/null || true
+              # 3b) Neuron HBM breakdown tables (only exist if a run OOM'd) — the
+              # per-category tensor/scratchpad/constant split that tells us the exact
+              # culprit instead of inferring from overshoot deltas. Harmless if absent.
+              mkdir -p "$OUT/hbm_debug"
+              cp /tmp/neuron_mem_table_device_*_nc_*.log "$OUT/hbm_debug/" 2>/dev/null || true
+              cp /tmp/nrt_mem_log_device_*.csv           "$OUT/hbm_debug/" 2>/dev/null || true
+              cp /tmp/neuron_mem_log_device_*_hbm_*.csv  "$OUT/hbm_debug/" 2>/dev/null || true
+              rmdir "$OUT/hbm_debug" 2>/dev/null || true  # remove if empty (no OOM = good)
+              # 4) general JSON trace, gzipped (700MB+, not part of harmony spec)
+              TJSON=$(find "$PROFILE_DIR" -name 'trace.json' 2>/dev/null | head -1 || true)
+              [[ -n "$TJSON" ]] && gzip -c "$TJSON" > "$OUT/trace.json.gz" 2>/dev/null || true
+              # 5) one tarball with the lot
+              ARCHIVE="/tmp/rf_results.tar.gz"
+              tar -czf "$ARCHIVE" -C "$(dirname "$LOCAL_RESULTS")" "$(basename "$LOCAL_RESULTS")" 2>/dev/null || true
+              cp "$ARCHIVE" "$OUT/" 2>/dev/null || true
+
+              echo "═══════════════════════════════════════════"
+              echo "  Done! Rolling Forcing 3-run benchmark complete"
+              echo "  Run dir: $OUT"
+              ls -la "$OUT" 2>/dev/null || true
+              echo "  -> frames/            generated videos"
+              echo "  -> per_neff_mfu.txt   optimization priority"
+              echo "  -> harmony_bundle/    upload to neuron-explorer.harmony.a2z.com"
+              echo "═══════════════════════════════════════════"
+          resources:
+            claims:
+              - name: l-trn2
+            # Sized to fit the tighter node (ip-...-107-10: ~82Gi mem / ~48 vCPU free).
+            # RF's host-memory footprint is small — weights live in Neuron HBM, not host
+            # RAM — so the old 256Gi request only ever fit the roomier node. 64Gi limit
+            # minus the 24Gi memory-backed /dev/shm leaves ~40Gi for the process.
+            requests:
+              cpu: 70
+              memory: 640Gi
+            limits:
+              cpu: 70
+              memory: 640Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "rf-vae-halo-a2a"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: NEURON_CC_FLAGS
+              value: "--model-type=transformer"
+            - name: NEURON_FALLBACK_ENABLED
+              value: "0"
+            - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
+              value: "0"
+            # NEFF cache dir — compiled/loaded here, then enumerated by run_explorer.
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: MASTER_ADDR
+              value: "127.0.0.1"
+            - name: MASTER_PORT
+              value: "29500"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 24Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
