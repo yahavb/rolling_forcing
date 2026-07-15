@@ -320,16 +320,12 @@ spec:
               # executed neff_*.neff. NEURON_RT_INSPECT_* adds the system device-profile session.
               # ONE profiled pass = full trace; [4] assembles the upload bundle and [5] then
               # profiles each executed NEFF for engine util + MFU.
-              echo "=== PROFILED RUN @ 1440 (system + native Neuron profilers -> harmony trace bundle) ==="
+              echo "=== TIMED RUN @ 1440 (profiler DISABLED — per-block fps only, no NEFF/NTFF capture) ==="
               rm -rf "$PROFILE_DIR"; mkdir -p "$PROFILE_DIR"
-              NEURON_RT_INSPECT_ENABLE=1 \
-                NEURON_RT_INSPECT_OUTPUT_DIR="$PROFILE_DIR" \
-                NEURON_RT_INSPECT_DEVICE_PROFILE=session \
-                NEURON_PROFILE_ENABLE=1 NEURON_PROFILE_DIR="$PROFILE_DIR" \
-                RF_RING=1 RF_RING_NSEG=1 \
+              RF_RING=1 RF_RING_NSEG=1 \
                 PROFILE_E2E_PIPELINE=1 MEASURE_TFLOPS=1 \
                 $BENCH_CMD --output_folder "$LOCAL_RESULTS/profiled_out" \
-                2>&1 | tee "$LOCAL_RESULTS/profiled.txt" | grep -iE "T5:|block +[0-9]|fps|TFLOPS|MFU|profiler|FAILED" || echo "PROFILED RUN FAILED"
+                2>&1 | tee "$LOCAL_RESULTS/profiled.txt" | grep -iE "T5:|block +[0-9]|fps|TFLOPS|MFU|profiler|FAILED" || echo "TIMED RUN FAILED"
 
               echo "=== [4] assemble harmony upload bundle ==="
               build_harmony_bundle
