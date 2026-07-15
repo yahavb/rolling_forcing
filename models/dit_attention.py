@@ -22,7 +22,7 @@ import torch.nn as nn
 
 from kernels.kv_cache_copy import cache_copy, kv_cache_copy
 from kernels.restore_layout import restore_layout
-from kernels.rope import causal_rope_rotation, build_rope_grids
+from kernels.rope import causal_rope_rotation, causal_rope_rotation_qk, build_rope_grids
 from kernels.self_attention_nst import wan_flash_self_attn
 from utils import _compile
 from utils import parallel_state as ps
@@ -245,6 +245,60 @@ class CausalWanSelfAttention(nn.Module):
             num_heads=n_local, head_dim=d)
 
         return out[:tok_len].unsqueeze(0)
+
+    def _nki_rope_apply_qk(self, xq, xk, grid_sizes, freqs_cos, freqs_sin, start_frame,
+                           rope_grid_cache=None, start_frame_int=None,
+                           head_start=None, head_end=None):
+        """RoPE q and k against the SAME grid in ONE kernel launch (two-in/two-out).
+
+        xq/xk are [1, seq_len, n, d] with the same seq_len/heads and the same position
+        grid. Builds+slices+pads the grid ONCE (shared), pads both tensors, runs the fused
+        kernel, and returns (rq, rk) each [1, tok_len, n_local, d]. Bit-identical to two
+        separate _nki_rope_apply calls (same grid, same per-tensor math) but half the
+        launches and NO cat/split — see _causal_rope_rotation_qk_nki."""
+        assert (head_start is None) == (head_end is None)
+        b, s, n, d = xq.shape
+        assert xk.shape == xq.shape, f"q {xq.shape} != k {xk.shape}"
+        f, h, w = grid_sizes
+        seq_len = f * h * w
+        assert seq_len == s
+        if head_start is None:
+            head_start = 0
+            head_end = n
+        n_local = head_end - head_start
+        P = 128
+        pad = (P - seq_len % P) % P
+
+        cache_key = None
+        combined_padded = None
+        if rope_grid_cache is not None:
+            assert start_frame_int is not None
+            cache_key = (grid_sizes, int(start_frame_int), 0, seq_len)
+            combined_padded = rope_grid_cache.get(cache_key)
+        if combined_padded is None:
+            raw_key = (grid_sizes, int(start_frame_int)) if rope_grid_cache is not None else None
+            combined = rope_grid_cache.get(raw_key) if raw_key is not None else None
+            if combined is None:
+                sf = start_frame.to(torch.int32).reshape(1, 1)
+                combined = build_rope_grids(
+                    freqs_cos, freqs_sin, self.sign_pattern, sf,
+                    F=f, H=h, W=w, head_dim=d)[:seq_len]
+                if raw_key is not None:
+                    rope_grid_cache[raw_key] = combined
+            combined_padded = torch.nn.functional.pad(combined, (0, 0, 0, pad))
+            if cache_key is not None:
+                rope_grid_cache[cache_key] = combined_padded
+
+        xq_local = xq[0, :, head_start:head_end, :]
+        xk_local = xk[0, :, head_start:head_end, :]
+        xq_padded = torch.nn.functional.pad(xq_local, (0, 0, 0, 0, 0, pad))
+        xk_padded = torch.nn.functional.pad(xk_local, (0, 0, 0, 0, 0, pad))
+
+        rq, rk = causal_rope_rotation_qk(
+            xq_padded, xk_padded, combined_padded,
+            num_heads=n_local, head_dim=d)
+
+        return rq[:seq_len].unsqueeze(0), rk[:seq_len].unsqueeze(0)
 
     def _qkv_rope(self, x, grid_sizes, freqs_cos, freqs_sin, current_start,
                   rope_grid_cache=None, kv_cache=None):
@@ -656,32 +710,21 @@ class CausalWanSelfAttention(nn.Module):
         cu_sf_t = torch.tensor(cu_sf_int, device=q_cu.device)
         dn_sf_t = torch.tensor(dn_sf_int, device=q_dn.device)
 
-        # RoPE q/k FUSE: q and k in a region share the SAME position grid, and the RoPE
-        # kernel treats heads as a pure broadcast/free axis (cos/sin are [P,D], broadcast
-        # over N). So stacking this rank's q-heads and k-heads along the head axis and
-        # running ONE launch is bit-identical to two separate launches — halves the RoPE
-        # launch count (4->2 per layer) in a launch-bound path. Pre-slice heads here and
-        # pass head_start=0/head_end=2*nlh (already sliced); split back after.
-        nlh = h_end - h_start
-        qk_cu = torch.cat(
-            [q_cu[:, :, h_start:h_end, :], k_cu_full[:, :, h_start:h_end, :]], dim=2)
-        rqk_cu = self._nki_rope_apply(
-            qk_cu, grid_cu, freqs_cos, freqs_sin,
+        # RoPE q/k FUSE (zero-copy): q and k in a region share the SAME position grid.
+        # Rope BOTH in ONE kernel launch (two-in/two-out) — NO torch.cat on inputs, NO
+        # strided split on outputs (the Python-cat version added copies/launches to save
+        # launches and net-regressed). Shares the per-tile cos/sin load+broadcast between
+        # q and k. Bit-identical to two separate _nki_rope_apply calls.
+        rq_cu_full, rk_cu = self._nki_rope_apply_qk(
+            q_cu, k_cu_full, grid_cu, freqs_cos, freqs_sin,
             start_frame=cu_sf_t, rope_grid_cache=rope_grid_cache,
             start_frame_int=cu_sf_int,
-            head_start=0, head_end=2 * nlh)
-        rq_cu_full = rqk_cu[:, :, :nlh, :].contiguous()
-        rk_cu = rqk_cu[:, :, nlh:, :].contiguous()
-
-        qk_dn = torch.cat(
-            [q_dn[:, :, h_start:h_end, :], k_dn_full[:, :, h_start:h_end, :]], dim=2)
-        rqk_dn = self._nki_rope_apply(
-            qk_dn, grid_dn, freqs_cos, freqs_sin,
+            head_start=h_start, head_end=h_end)
+        rq_dn_full, rk_dn = self._nki_rope_apply_qk(
+            q_dn, k_dn_full, grid_dn, freqs_cos, freqs_sin,
             start_frame=dn_sf_t, rope_grid_cache=rope_grid_cache,
             start_frame_int=dn_sf_int,
-            head_start=0, head_end=2 * nlh)
-        rq_dn_full = rqk_dn[:, :, :nlh, :].contiguous()
-        rk_dn = rqk_dn[:, :, nlh:, :].contiguous()
+            head_start=h_start, head_end=h_end)
 
         if self._will_anchor_write(kv_cache, cache_update_start):
             k_cu = self._slice_heads_2d(k_full[:L_cu]).contiguous().unsqueeze(0)

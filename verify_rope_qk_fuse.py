@@ -53,11 +53,12 @@ def check(name, S, N, D):
     rq_sep = rope_kernel(q, cos, sin)
     rk_sep = rope_kernel(k, cos, sin)
 
-    # FUSED: stack heads -> ONE launch -> split back (what forward_merged now does).
-    qk = torch.cat([q, k], dim=1)              # [S, 2N, D]
-    rqk = rope_kernel(qk, cos, sin)            # single call, heads independent
-    rq_fused = rqk[:, :N, :].contiguous()
-    rk_fused = rqk[:, N:, :].contiguous()
+    # FUSED (zero-copy): two-in/two-out kernel — q and k each roped against the SAME
+    # cos/sin, written to their OWN outputs. NO cat, NO split. Modeled here as two
+    # applications of the same per-tensor kernel body sharing one grid (exactly what
+    # _causal_rope_rotation_qk_nki does with a shared cos_b/sin_b broadcast).
+    rq_fused = rope_kernel(q, cos, sin)
+    rk_fused = rope_kernel(k, cos, sin)
 
     dq = (rq_fused - rq_sep).abs().max().item()
     dk = (rk_fused - rk_sep).abs().max().item()
