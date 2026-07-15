@@ -116,16 +116,25 @@ def _causal_rope_rotation_qk_nki(q, k, cos_sin, num_heads=12, head_dim=128):
         cos_b = nl.broadcast_to(cos_1, (P, N, D))
         sin_b = nl.broadcast_to(sin_1, (P, N, D))
 
-        for x_in, x_out in ((q, out_q), (k, out_k)):
-            x_sb = nl.load(x_in[nl.ds(ts, P), :, :])
-            x_swap_all = nl.ndarray((P, N, D), dtype=x_sb.dtype, buffer=nl.sbuf)
-            x_swap_all[:, :, 0::2] = x_sb[:, :, 1::2]
-            x_swap_all[:, :, 1::2] = x_sb[:, :, 0::2]
-            out_sb = nl.ndarray((P, N, D), dtype=x_out.dtype, buffer=nl.sbuf)
-            x_cos = nl.multiply(x_sb, cos_b)
-            x_sin = nl.multiply(x_swap_all, sin_b)
-            out_sb[:, :, :] = nl.add(x_cos, x_sin)
-            nl.store(x_out[nl.ds(ts, P), :, :], out_sb)
+        # q and k unrolled explicitly (NKI cannot iterate a Python tuple of device
+        # tensors — "expecting simple variable"). Both reuse cos_b/sin_b built above.
+        q_sb = nl.load(q[nl.ds(ts, P), :, :])
+        q_swap = nl.ndarray((P, N, D), dtype=q_sb.dtype, buffer=nl.sbuf)
+        q_swap[:, :, 0::2] = q_sb[:, :, 1::2]
+        q_swap[:, :, 1::2] = q_sb[:, :, 0::2]
+        q_out_sb = nl.ndarray((P, N, D), dtype=q.dtype, buffer=nl.sbuf)
+        q_out_sb[:, :, :] = nl.add(nl.multiply(q_sb, cos_b),
+                                   nl.multiply(q_swap, sin_b))
+        nl.store(out_q[nl.ds(ts, P), :, :], q_out_sb)
+
+        k_sb = nl.load(k[nl.ds(ts, P), :, :])
+        k_swap = nl.ndarray((P, N, D), dtype=k_sb.dtype, buffer=nl.sbuf)
+        k_swap[:, :, 0::2] = k_sb[:, :, 1::2]
+        k_swap[:, :, 1::2] = k_sb[:, :, 0::2]
+        k_out_sb = nl.ndarray((P, N, D), dtype=k.dtype, buffer=nl.sbuf)
+        k_out_sb[:, :, :] = nl.add(nl.multiply(k_sb, cos_b),
+                                   nl.multiply(k_swap, sin_b))
+        nl.store(out_k[nl.ds(ts, P), :, :], k_out_sb)
 
     return out_q, out_k
 
