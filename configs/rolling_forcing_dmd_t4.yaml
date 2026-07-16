@@ -1,21 +1,20 @@
-# T=4 DMD distillation config for Rolling Forcing (faster inference student).
+# T=5 DMD distillation config for Rolling Forcing (matches the shipped step schedule).
 #
-# This is a TRAINING config (mirrors upstream ~/RollingForcing/configs/rolling_forcing_dmd.yaml)
-# with ONE substantive change vs the shipped T=5 recipe: a 4-entry denoising_step_list.
+# This is a TRAINING config (mirrors upstream ~/RollingForcing/configs/rolling_forcing_dmd.yaml).
 #
-# WHY: inference cost per rolling window scales with (T+1) merged frames
-# (dit_pipeline.py: full_frames = (T+1)*num_frame_per_block). Dropping T 5->4 cuts the
-# DiT work per block ~18->15 frames (~0.83x) -> projects ~14 fps -> ~16-17 fps.
-# You CANNOT just truncate the shipped T=5 checkpoint at inference: the student only
-# predicts accurate x0 at the noise levels it was distilled on. Fewer steps => re-distill.
-#
-# denoising_step_list: 4 evenly-spaced levels. warp_denoising_step: true => NO trailing 0
-# (the config comment upstream: "need to remove - 0 ... if warp_denoising_step is true").
+# STEP COUNT = 5 (2026-07-15): reverted from the T=4 experiment [1000,750,500,250] back to
+# the shipped 5-step schedule. WHY: the T=4 serving study (docs/DISTILL_T4_RUNBOOK.md) showed
+# a hard fps CLIFF — T<=4 serves at ~5 fps, T>=5 at ~14 fps (device idle at full_frames=15,
+# a neuronx-cc shape/tiling artifact). So 4 steps has NO speed payoff on this stack; T=5 is
+# the proven-fast serving point. Distill for T=5 so training aligns with a config that runs
+# at 14 fps. num_training_frames stays 6 (the trainer rolls out a FIXED 6-frame lat_shape
+# regardless of T; step count only adds 1 rolling-window iteration -> no OOM impact).
 denoising_step_list:
 - 1000
-- 750
-- 500
-- 250
+- 800
+- 600
+- 400
+- 200
 warp_denoising_step: true
 
 # ── everything below is IDENTICAL to the proven T=5 upstream training recipe ──
