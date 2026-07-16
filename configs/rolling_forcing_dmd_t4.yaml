@@ -51,7 +51,13 @@ beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
 # ── three-group flat trainer (distillation_3group.py) knobs ──
-tp_degree: 4                                       # ranks per group: teacher 0-3, student 4-7, critic 8-11
+tp_degree: 4                                       # legacy default; per-group tp below overrides
+# 64-core LNC2 (whole trn2.48xl). 14B STUDENT is the memory-dominant net (trainable:
+# weights+grads+Adam+rollout activations), so it gets the most ranks to shard thinnest.
+# teacher(frozen 14B)=16, student(trainable 14B)=32, fake(1.3B critic)=16 -> sums to 64.
+teacher_tp: 16
+student_tp: 32
+fake_tp: 16
 iters: 10000                                       # SD long-run recipe (gentle lr + grad-accum)
 save_every: 200
 warmup: 10                                         # critic-only iters before G updates (critic leads)
@@ -129,3 +135,5 @@ num_training_frames: 6
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
+  model_name: Wan2.1-T2V-14B                        # STUDENT = 14B causal (was default 1.3B).
+                                                    # loads wan_models/Wan2.1-T2V-14B/ with is_causal=True

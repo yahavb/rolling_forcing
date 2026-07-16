@@ -158,7 +158,7 @@ spec:
               # shipped T=5 run is the 4-entry denoising_step_list.
               export PRECOMPUTED_EMBEDS="$EMB"
               torchrun \
-                --nproc_per_node="${NPROC:-16}" \
+                --nproc_per_node="${NPROC:-64}" \
                 --rdzv_backend=c10d \
                 --rdzv_endpoint "${MASTER_ADDR:-127.0.0.1}:${MASTER_PORT:-29500}" \
                 train.py \
@@ -191,11 +191,12 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "rf-distill-t4"
-            # THREE-GROUP placement (SD's proven co-residency fix): teacher on ranks 0-3,
-            # student 4-7, critic 8-11 (tp_degree=4), ranks 12-15 idle-but-lockstep. Each
-            # core holds ONE model instead of all three (11.2GB) -> the rollout's ~1.5GB
-            # NEFF fits. Selects trainer/distillation_3group.py. Needs tp_degree in config.
+              value: "rf-distill-14b"
+            # THREE-GROUP placement (SD's proven co-residency fix): each core holds ONE
+            # model instead of all three. 64-core LNC2 layout (config teacher_tp/student_tp/
+            # fake_tp = 16/32/16): teacher ranks 0-15, student 16-47, critic 48-63. Student
+            # (trainable 14B) gets the most ranks to shard its weights+grads+Adam+activations
+            # thinnest. Selects trainer/distillation_3group.py.
             - name: DISTILL_THREE_GROUP
               value: "1"
             # Functional (out-of-place, single-block) self-attn on the STUDENT grad rollout
@@ -206,7 +207,7 @@ spec:
               value: "1"
             # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
             - name: NPROC
-              value: "16"            # all 16 NeuronCores (2 chips x 8, LNC=1)
+              value: "64"            # whole trn2.48xl: 64 NeuronCores @ LNC2 (14B student needs it)
             # denoising_step_list (T=4) lives in configs/rolling_forcing_dmd_t4.yaml.
             # Everything else (lr 1.5e-6 / lr_critic 4e-7 / dfake_gen_update_ratio 5 /
             # guidance_scale 3.0 / ema 0.99 from step 200 / batch 1-per-rank) is in that config.
