@@ -167,3 +167,62 @@ Render the SHIPPED ckpt at T=4 (not T=5): isolates "4 steps too few" from "our w
   4e7e1d6 so T=4 geometry doesn't crash), RF_RING=1, TP4xCP4, latent_w 80 (1200), --use_ema.
 - Frames land in-pod at /tmp/results/clean_out/prompt_NNN.mp4 (kubectl cp) and on the PVC at
   /var/mdl/rolling-forcing/runs/<TS>/frames/cp4_16rank/ (aws s3 cp) after the job's persist step.
+
+---
+
+## Denoise-steps vs fps study (2026-07-15) — MEASURED
+
+Swept denoise steps on the GOLDEN main rf-job.yaml (shipped ckpt, TP4xCP4, 16 ranks,
+fs1200/480x640, RF_RING=1, --use_ema). ONLY `denoising_step_list` changed per run;
+everything else byte-identical (diffed vs main:rf-job.yaml = job name + 1 patch line).
+NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=0 in ALL runs (constant, not a variable).
+
+| T (steps) | denoising_step_list             | max_frames (nds*3) | full_frames (nfpb+max) | DiT/block | fps  | regime |
+|-----------|---------------------------------|--------------------|------------------------|-----------|------|--------|
+| 3         | [1000,667,333]                  | 9                  | 12                     | ~1700 ms  | 6.5  | SLOW   |
+| 4         | [1000,750,500,250]              | 12                 | 15                     | ~2150 ms  | 5.2  | SLOW (worst) |
+| 5         | [1000,800,600,400,200] (shipped)| 15                 | 18                     | ~700 ms   | 14.3 | FAST   |
+| 6         | [1000,833,667,500,333,167]      | 18                 | 21                     | ~700 ms   | 14.3 | FAST   |
+| 7         | [1000,857,714,571,429,286,143]  | 21                 | 24                     | ~750 ms   | 13.5 | FAST   |
+
+**Finding: a hard fps CLIFF between T=4 and T=5.** T<=4 slow (5-6.5 fps), T>=5 fast
+(13.5-14.3 fps). ~3x jump at the max_frames 12->15 (full_frames 15->18) boundary.
+NOT a smooth "more steps = faster" gradient (T5/T6/T7 are a flat plateau; T3 is slow
+but less slow than T4). T=5 is the shipped design point (num_training_frames=21).
+
+**Ruled OUT as the cause (with data):**
+- More work at T=4: NO. Code path proven (upstream + our port): T=4 dispatches a SMALLER
+  full_frames tensor (15 vs 18), T-scaled max_frames, fixed 21-frame attention cap
+  (max_attention_size=21*frame_length, identical upstream & ours). Every shape <= T=5.
+- Compilation / recompile: NO. NEFFs are per-shape, recompiled every run regardless of T;
+  fps numbers are warm/steady blocks (post-compile).
+- async setting: NO. NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=0 in BOTH the 14fps (T5)
+  and 5fps (T4) runs — constant, so not the differentiator.
+- checkpoint / ring / /var/mdl I/O: NO. ckpt read once into HBM; ring & FS identical across T.
+- per-NEFF single-io cost: IDENTICAL T4 vs T5 (same hashes, same us/NEFF in per_neff_mfu.txt).
+- invocation count: T4 executes FEWER compiled-region launches than T5 (146,752 vs 158,560).
+
+**What the trace shows (host CPU trace, runs 150726020531=T5, 160726000211=T4):**
+- T4 total device compute is LESS than T5 (busy 142.6s vs 151.0s) yet wall-clock is MORE
+  (574s vs 399s). Device utilization: T4=24.9% vs T5=37.9%. The extra ~175s is IDLE, not work.
+- i.e. same-or-less work, far more idle => the device sits waiting between ops at T<=4.
+
+**Leading (UNPROVEN) hypothesis: device/compiler execution artifact of the small shape.**
+full_frames=18/21 (T5/6/7) likely hit an efficient tiling; full_frames=15 (T4) / 12 (T3)
+fall to a slower kernel variant / worse overlap. This is a neuronx-cc shape->tiling effect,
+NOT a Python-source bug (both codebases dispatch LESS for T=4). Could also be a collective/DMA
+that pipelines only above a size threshold. NOT distinguishable from the CPU trace.
+
+**To CONFIRM + localize (next step, NOT done):** device profile — `neuron-profile` per-NEFF
+DEVICE timing on one T=4 vs one T=5 NEFF (names the slow NEFF + whether tile factor differs).
+Cheap diagnostic+fix to try FIRST: pad T=4's full_frames 15->16 or ->18 (shape hint). If speed
+recovers, it confirms shape/tiling AND fixes it without a hand-written kernel. Do NOT author an
+NKI kernel blind — the slow NEFF is likely compiler-generated (no kernel to edit); the lever is
+a compiler flag / shape pad, decided AFTER the device profile.
+
+**Implication for distillation goal (fewer steps + quality + fps):** fewer denoise steps does
+NOT automatically get faster on this stack — T<=4 lands in the slow regime by SHAPE, below the
+T=5 (21-frame) design point. A T=4 distilled model needs the shape/tiling fix above to serve at
+full fps; otherwise T=4 serves at ~5 fps despite doing less compute than the 14 fps T=5.
+Separately: our distilled T=4 checkpoints render BLURRY (undertrained) vs shipped-ckpt@T=4 which
+renders SHARP — so quality is a TRAINING problem, independent of this fps/shape issue.
