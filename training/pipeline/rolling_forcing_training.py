@@ -25,11 +25,16 @@ class RollingForcingTrainingPipeline:
             self.denoising_step_list = self.denoising_step_list[:-1]  # remove the zero timestep for inference
 
         # Wan specific hyperparameters — derive from the model, NOT hardcoded (1.3B=30
-        # blocks/16 heads, 14B=40 blocks/40 heads). Hardcoding 30 broke the 14B student.
+        # blocks/16 heads, 14B=40 blocks/40 heads). Hardcoding 30/12 broke the 14B student.
+        # NOTE: the student model is ALREADY FSDP2-wrapped by the time this runs, so
+        # diffusers' ModelMixin.__getattr__ intercepts and .head_dim raises AttributeError.
+        # num_heads/dim are config-registered (proxy through fine); derive head_dim from them.
         _m = self.generator.model
-        self.num_transformer_blocks = len(_m.blocks)
+        # use ONLY config-registered attrs (dim/num_heads/num_layers) — they proxy through
+        # the FSDP/diffusers __getattr__; head_dim/len(blocks) may not post-wrap.
+        self.num_transformer_blocks = _m.num_layers
         self.model_num_heads = _m.num_heads
-        self.model_head_dim = _m.head_dim
+        self.model_head_dim = _m.dim // _m.num_heads
         # frame_seq_length is DERIVED from the actual latent resolution at rollout
         # time (see _sync_frame_seq_length), NOT hardcoded. Hardcoding 1560 (480x832)
         # while training at 480x640 (1200) over-allocated the KV cache
