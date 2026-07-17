@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: rf-distill
+  name: rf-distill-p003
   namespace: default
 spec:
   backoffLimit: 0
@@ -126,8 +126,8 @@ spec:
               # node ephemeral-storage eviction (Exit 137) after ~24h. Sync guarantees only ONE
               # 11GB ckpt on local disk at a time (write -> cp -> rm -> return).
               TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
-              RUN=/tmp/rf-distill/$TS; mkdir -p "$RUN"
-              FINAL=/var/mdl/rolling_forcing/distill/$TS; mkdir -p "$FINAL"
+              RUN=/tmp/rf-distill/prompt003_$TS; mkdir -p "$RUN"
+              FINAL=/var/mdl/rolling_forcing/distill/prompt003_$TS; mkdir -p "$FINAL"
               export CKPT_MIRROR_DIR="$FINAL"    # trainer sync-copies each ckpt here, frees local
               exec > >(tee "$RUN/train.log") 2>&1
               echo "RUN=$RUN  (local; each ckpt sync-copied to $FINAL then local freed)"
@@ -191,7 +191,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "rf-distill-t4"
+              value: "rf-distill-prompt003"
             # THREE-GROUP placement (SD's proven co-residency fix): teacher on ranks 0-3,
             # student 4-7, critic 8-11 (tp_degree=4), ranks 12-15 idle-but-lockstep. Each
             # core holds ONE model instead of all three (11.2GB) -> the rollout's ~1.5GB
