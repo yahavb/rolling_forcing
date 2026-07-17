@@ -24,8 +24,12 @@ class RollingForcingTrainingPipeline:
         if self.denoising_step_list[-1] == 0:
             self.denoising_step_list = self.denoising_step_list[:-1]  # remove the zero timestep for inference
 
-        # Wan specific hyperparameters
-        self.num_transformer_blocks = 30
+        # Wan specific hyperparameters — derive from the model, NOT hardcoded (1.3B=30
+        # blocks/16 heads, 14B=40 blocks/40 heads). Hardcoding 30 broke the 14B student.
+        _m = self.generator.model
+        self.num_transformer_blocks = len(_m.blocks)
+        self.model_num_heads = _m.num_heads
+        self.model_head_dim = _m.head_dim
         # frame_seq_length is DERIVED from the actual latent resolution at rollout
         # time (see _sync_frame_seq_length), NOT hardcoded. Hardcoding 1560 (480x832)
         # while training at 480x640 (1200) over-allocated the KV cache
@@ -495,8 +499,8 @@ class RollingForcingTrainingPipeline:
 
         for _ in range(self.num_transformer_blocks):
             kv_cache_clean.append({
-                "k": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, self.kv_cache_size, self.model_num_heads, self.model_head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, self.kv_cache_size, self.model_num_heads, self.model_head_dim], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
             })
@@ -511,8 +515,8 @@ class RollingForcingTrainingPipeline:
 
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, 512, self.model_num_heads, self.model_head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, 512, self.model_num_heads, self.model_head_dim], dtype=dtype, device=device),
                 "is_init": False
             })
         self.crossattn_cache = crossattn_cache
