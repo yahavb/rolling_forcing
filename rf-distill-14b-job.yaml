@@ -126,8 +126,8 @@ spec:
               # node ephemeral-storage eviction (Exit 137) after ~24h. Sync guarantees only ONE
               # 11GB ckpt on local disk at a time (write -> cp -> rm -> return).
               TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
-              RUN=/tmp/rf-distill/$TS; mkdir -p "$RUN"
-              FINAL=/var/mdl/rolling_forcing/distill/$TS; mkdir -p "$FINAL"
+              RUN=/tmp/rf-distill/14b_prompt003_$TS; mkdir -p "$RUN"
+              FINAL=/var/mdl/rolling_forcing/distill/14b_prompt003_$TS; mkdir -p "$FINAL"
               export CKPT_MIRROR_DIR="$FINAL"    # trainer sync-copies each ckpt here, frees local
               exec > >(tee "$RUN/train.log") 2>&1
               echo "RUN=$RUN  (local; each ckpt sync-copied to $FINAL then local freed)"

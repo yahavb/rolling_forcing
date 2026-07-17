@@ -76,13 +76,11 @@ grad_accum: 1                                      # step+zero_grad EVERY G-step
                                                    # accum=1 frees the grads each G-step so they can't
                                                    # stack. (Effective batch drops 4->1; revisit for
                                                    # final quality, but PoC needs it to survive first.)
-data_path: prompts/distill_poc_single.txt         # PROOF-OF-CONCEPT: single prompt (example 000,
-                                                  # the western/horse shot). Data-free DMD; a student
-                                                  # specialized to ONE prompt tolerates fewer steps
-                                                  # best. Compare its T=4 render against the existing
-                                                  # T=5 baseline rf_sp4_videos/prompt_000.mp4.
-                                                  # Swap to prompts/example_prompts.txt (15) or
-                                                  # vidprom_filtered_extended.txt for a broader model.
+data_path: prompts/distill_poc_prompt003.txt      # 14B on prompt_003 (boxing-kangaroo gym).
+                                                  # Chosen over prompt_000: 003 has the smaller DMD
+                                                  # distribution gap (dmdnorm_avg50 ~0.30 vs ~0.50 at
+                                                  # iter10-45) -> converges faster -> cheapest 14B demo.
+                                                  # See docs/PROMPT_DIFFICULTY_PROBE.md.
 batch_size: 1
 # EMA DISABLED to match StreamDiffusionV2's proven-stable Neuron distill (branch
 # EMA of the generator weights — RE-ENABLED (2026-07). DMD is adversarial-like: the raw
