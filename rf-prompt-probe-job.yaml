@@ -157,25 +157,29 @@ spec:
                 echo "──────── PROBE prompt_${PIDX} ────────"
                 echo "  ${PROMPT:0:70}..."
                 # 1-line prompt file + a PROBE config (60 iters, never save) for THIS prompt
-                PF="prompts/probe_${PIDX}.txt"; printf '%s\n' "$PROMPT" > "$PF"
+                # data_path is repo-root-relative (trainer/precompute resolve it from root):
+                # write the 1-line prompt file to ../prompts and the probe config to ../configs,
+                # exactly like the shipped single-run. cwd here is training/, so base configs
+                # load via ../configs/ (they live at repo root, NOT training/configs).
+                PF="prompts/probe_${PIDX}.txt"; printf '%s\n' "$PROMPT" > "../$PF"
                 python3 -c "
               from omegaconf import OmegaConf
-              b=OmegaConf.load('configs/default_config.yaml')
-              c=OmegaConf.merge(b, OmegaConf.load('configs/rolling_forcing_dmd_t4.yaml'))
+              b=OmegaConf.load('../configs/default_config.yaml')
+              c=OmegaConf.merge(b, OmegaConf.load('../configs/rolling_forcing_dmd_t4.yaml'))
               c.data_path='${PF}'
               c.iters=${PROBE_ITERS}
               c.save_every=10**9          # never checkpoint (probe only)
               c.ema_start_step=10**9      # no EMA state either
-              OmegaConf.save(c,'configs/probe_${PIDX}.yaml')
+              OmegaConf.save(c,'../configs/probe_${PIDX}.yaml')
               "
                 EMB=/tmp/embeds_${PIDX}.pt
-                python3 precompute_embeds.py --config_path configs/probe_${PIDX}.yaml --out "$EMB" \
+                python3 precompute_embeds.py --config_path ../configs/probe_${PIDX}.yaml --out "$EMB" \
                   || { echo "  EMBED FAIL prompt_${PIDX}"; i=$((i+1)); continue; }
                 export PRECOMPUTED_EMBEDS="$EMB"
                 LOG="$RUN/probe_${PIDX}.log"
                 torchrun --nproc_per_node="${NPROC:-16}" --rdzv_backend=c10d \
                   --rdzv_endpoint "127.0.0.1:29500" \
-                  train.py --config_path configs/probe_${PIDX}.yaml --logdir "$RUN/p${PIDX}" \
+                  train.py --config_path ../configs/probe_${PIDX}.yaml --logdir "$RUN/p${PIDX}" \
                   --disable-wandb --no_visualize > "$LOG" 2>&1 || echo "  TRAIN FAIL prompt_${PIDX} (continuing)"
                 rm -f "$EMB"
                 # final dmdnorm_avg50 + the min it reached (lower avg / lower min = faster convergence)
