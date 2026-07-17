@@ -35,7 +35,7 @@ metadata:
   #   kubectl create job rf-render-1200 --from-cronjob=... NO — use:
   #   sed 's/RENDER_ITER/1200/' then apply, OR set ITER env + a unique name per run.
   # Simplest: edit ITER (env below) + this name, apply, wait, repeat for the other.
-  name: rf-render-distill
+  name: rf-render-iter1000
   namespace: default
 spec:
   backoffLimit: 0
@@ -512,7 +512,7 @@ spec:
             # ITER selects the T=5 distilled checkpoint to render (run 202607152026).
             # A/B: apply once with 1200, once with 1000 (change this + metadata.name).
             - name: ITER
-              value: "1200"
+              value: "1000"
             - name: BRANCH
               value: "main"
             # main runs TP4xCP4 WITH ring attention (RF_RING=1) — the validated 14fps path.
