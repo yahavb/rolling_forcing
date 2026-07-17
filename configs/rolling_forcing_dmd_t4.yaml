@@ -18,7 +18,12 @@ denoising_step_list:
 warp_denoising_step: true
 
 # ── everything below is IDENTICAL to the proven T=5 upstream training recipe ──
-generator_ckpt: checkpoints/ode_init.pt          # Self-Forcing ODE-init (gdhe17/Self-Forcing)
+# generator_ckpt: DISABLED for 14B student. ode_init.pt is a 1.3B (dim 1536, 30-block)
+# Self-Forcing ODE-init and does NOT fit the 14B student (dim 5120, 40 blocks) — strict
+# load_state_dict fails. No 14B ODE-init exists yet, so the 14B student distills directly
+# from its from_pretrained(Wan2.1-T2V-14B) CAUSAL weights (a valid, arguably better warm
+# start than ODE-init). Re-enable only with a real 14B ODE-init checkpoint.
+# generator_ckpt: checkpoints/ode_init.pt
 # PER-BLOCK FSDP wrap (SD's fix for the 5.287GB whole-model all-gather OOM). "size"
 # wrap (min 5e7 params) leaves each Wan block < threshold -> FSDP wraps the whole 1.3B
 # net as ONE unit and all-gathers all 5.287GB fp32 in a single spike to run forward.
