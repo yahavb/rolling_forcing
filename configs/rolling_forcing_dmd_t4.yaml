@@ -136,7 +136,10 @@ num_frame_per_block: 3                             # independent of T; keep at 3
 # is a multiple of num_frame_per_block(3); the flat 3group trainer rolls out exactly N
 # frames (no [21,N] sampling), so N just needs %3==0. SD lever 02fa0bf (fewer frames = less
 # activation). Tradeoff: 15-frame rollout vs deploy's up-to-24; fine for the T=4 PoC.
-num_training_frames: 6
+num_training_frames: 3    # 14B: 6 OOM'd by ~136MB in the FIRST G-step backward (rank16/
+                          # student, dev_MB 126095->132798 then fail). The rollout backward
+                          # graph scales with frames; 6->3 (one nfpb block, %3==0) ~halves it.
+                          # SD lever 02fa0bf. Restore to 6 if HBM allows after this fits.
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
