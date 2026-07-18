@@ -67,6 +67,15 @@ def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls, student_pg=N
         checkpoint_wrapper_fn=lambda mod: checkpoint_wrapper(mod, checkpoint_impl=CheckpointImpl.NO_REENTRANT),
         check_fn=lambda mod: any(isinstance(mod, c) for c in transformer_layer_cls),
     )
+    # DEADLOCK FIX (trn3-dev1): shard-init on CPU, not the neuron device.
+    # py-spy showed a subset of student ranks wedged in a C call at
+    # _fsdp_param.py:394 `.copy_(sharded_param)` — FSDP2's per-parameter shard init
+    # (new_zeros + copy_) runs ON THE NEURON DEVICE because the generator was built on
+    # device("neuron"). 32 ranks issuing per-block device allocations/copies at once
+    # wedges the Neuron runtime on a random ~6 ranks (not a collective — no dist.* in
+    # the frame). Move params to CPU so new_zeros/copy_ happen in host memory during
+    # wrap; FSDP2 places the sharded params on the neuron device via `mesh`.
+    m.to("cpu")
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
     for blk in m.blocks:
         fully_shard(blk, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
