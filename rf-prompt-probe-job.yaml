@@ -204,9 +204,16 @@ spec:
             requests:
               cpu: 80
               memory: 800Gi
+              # ephemeral-storage: the pod extracts ~40GB locally (1.3B ~5G + 14B teacher
+              # ~28G + ode_init 11G) + /tmp/neff_cache. Declaring a REQUEST stops the
+              # scheduler from packing this pod onto a node already full of other distill
+              # pods' extracts (which is what got it EVICTED — "request is 0"). The LIMIT
+              # bounds it so it can't itself blow the node.
+              ephemeral-storage: 120Gi
             limits:
               cpu: 80
               memory: 800Gi
+              ephemeral-storage: 150Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
