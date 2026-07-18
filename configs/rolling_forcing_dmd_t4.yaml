@@ -60,8 +60,11 @@ tp_degree: 4                                       # legacy default; per-group t
 # 64-core LNC2 (whole trn2.48xl). 14B STUDENT is the memory-dominant net (trainable:
 # weights+grads+Adam+rollout activations), so it gets the most ranks to shard thinnest.
 # teacher(frozen 14B)=16, student(trainable 14B)=32, fake(1.3B critic)=16 -> sums to 64.
-teacher_tp: 16
-student_tp: 32
+# Student FSDP2 group shrunk 32->16 to test the trn3 fully_shard wedge (32-rank
+# per-block shard-init hung 2/32 ranks on the neuron backend). 14B teacher (frozen,
+# bf16, no optimizer state) absorbs the freed ranks. Sums to 64.
+teacher_tp: 32
+student_tp: 16
 fake_tp: 16
 iters: 10000                                       # SD long-run recipe (gentle lr + grad-accum)
 save_every: 200
