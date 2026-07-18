@@ -583,20 +583,34 @@ class Trainer:
         full = get_model_state_dict(
             self.generator, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
         if len(full) == 0:
+            # fallback path: same 14B host-OOM guard as the EMA loop below — every rank
+            # must enter full_tensor() (collective) but only ssrc retains the result.
+            keep_gen = (self.my_rank == self.ssrc)
             raw = self.generator.state_dict()
             full = {}
             for k, v in raw.items():
                 if isinstance(v, DTensor):
                     v = v.full_tensor()
-                full[k] = v.detach().to("cpu")
+                if keep_gen:
+                    full[k] = v.detach().to("cpu")
+                del v
         # Materialize the EMA to FULL tensors the same way (each EMA entry mirrors a
         # generator param's sharding, so full_tensor() gathers it). All student ranks must
-        # participate in full_tensor() collectives; only ssrc keeps the result.
+        # participate in full_tensor() collectives; ONLY ssrc keeps the result.
+        # 14B HOST-OOM FIX (was OOMKilled at the first save, iter200): the old loop kept the
+        # full fp32 EMA dict on EVERY student rank (32) -> 32 x ~56GB transient host RAM. A
+        # 14B full_tensor is ~11x the 1.3B one, so what was fine at 1.3B kills the host at
+        # 14B. Non-ssrc ranks must still ENTER full_tensor() (it's a collective) but must
+        # NOT retain the gathered tensor. get_model_state_dict(cpu_offload=True) already
+        # does this for `generator`; mirror it for the hand-rolled EMA path here.
+        keep_ema = (self.my_rank == self.ssrc)
         ema_full = {}
         if self._ema_state is not None:
             for name, e in self._ema_state.items():
                 v = e.full_tensor() if isinstance(e, DTensor) else e
-                ema_full[name] = v.detach().to("cpu")
+                if keep_ema:
+                    ema_full[name] = v.detach().to("cpu")
+                del v  # free the gathered full tensor immediately (esp. non-ssrc ranks)
         if dist.is_initialized():
             dist.barrier()
         if self.my_rank == self.ssrc:
