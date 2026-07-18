@@ -77,9 +77,21 @@ def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls, student_pg=N
     # wrap; FSDP2 places the sharded params on the neuron device via `mesh`.
     m.to("cpu")
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    # DEADLOCK FIX (trn3-dev1, residual): serialize the per-block wrap with a barrier on
+    # the student group. CPU-shard-init cut the wedge from 6 -> 2 stuck ranks, but a
+    # residual 2/32 still hang: fully_shard issues per-module collectives on local_mesh,
+    # and without a sync between blocks the ranks desync (some start block N+1's collective
+    # while stragglers are still on block N), which the neuron backend deadlocks on. A
+    # barrier after each block forces all 32 student ranks to complete block N before any
+    # starts N+1 — identical collective order on every rank.
+    import torch.distributed as _dist
     for blk in m.blocks:
         fully_shard(blk, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
+        if student_pg is not None:
+            _dist.barrier(group=student_pg)
     fully_shard(m, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
+    if student_pg is not None:
+        _dist.barrier(group=student_pg)
     return model
 
 
