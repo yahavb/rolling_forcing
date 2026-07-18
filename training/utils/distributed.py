@@ -20,7 +20,7 @@ def fsdp_state_dict(model):
     return checkpoint
 
 
-def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls):
+def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls, student_pg=None):
     """FSDP2 fully_shard for the STUDENT generator (SD 5d90c6b path). FSDP1's backward
     unshard buffers were NOT resharded/freed after the DMD G-step backward -> the rollout
     activation graph accumulated +~10GB per G-step (proven by memprobe across del+gc+sync).
@@ -38,12 +38,23 @@ def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls):
         checkpoint_wrapper, CheckpointImpl, apply_activation_checkpointing)
     from torch.distributed.device_mesh import DeviceMesh
 
-    # Build the mesh from the EXPLICIT student rank list — NOT init_device_mesh over the
-    # world. init_device_mesh(world//n, n) is collective across ALL ranks, but only the
-    # student ranks call this function (teacher/critic never enter) -> a world-collective
-    # here would DEADLOCK. DeviceMesh(mesh=<student ranks>) constructs over exactly those
-    # ranks (reuses the already-created student process group), no world collective.
-    local_mesh = DeviceMesh("neuron", torch.tensor(student_ranks, dtype=torch.int))
+    # Build the student mesh WITHOUT any new collective. Only the student ranks enter this
+    # function (teacher/critic never call it), so any world-level collective here deadlocks.
+    #
+    # DEADLOCK FIX (trn3-dev1 / torch-neuronx 1417): the old form
+    #   DeviceMesh("neuron", torch.tensor(student_ranks))
+    # does NOT reuse student_pg despite the prior comment — the DeviceMesh(device_type, mesh)
+    # constructor CREATES ITS OWN process group internally (_init_process_groups). On the
+    # newer torch-neuronx stack that internal PG creation is world-order-sensitive and hangs a
+    # subset of the student ranks (observed: 26/32 ranks passed fully_shard, 6 stuck here).
+    # Instead wrap the ALREADY-created student_pg (built in lockstep by ALL ranks in
+    # make_distill_groups via dist.new_group) with DeviceMesh.from_group() — no new collective.
+    if student_pg is not None:
+        local_mesh = DeviceMesh.from_group(
+            student_pg, "neuron", mesh=torch.tensor(student_ranks, dtype=torch.int))
+    else:
+        # Fallback (pre-fix behavior) if the caller didn't pass the pre-created group.
+        local_mesh = DeviceMesh("neuron", torch.tensor(student_ranks, dtype=torch.int))
 
     # per-block NO_REENTRANT activation checkpointing (SD: mandatory — OOMs without it)
     m = model.model  # WanDiffusionWrapper.model = the CausalWanModel (has .blocks)
