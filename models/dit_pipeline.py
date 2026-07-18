@@ -152,9 +152,16 @@ def build_dit_pipeline(config_path, checkpoint_path, tp_degree, use_ema):
                     break
             else:
                 remapped[k] = v
-        pipe.generator.load_state_dict(remapped, strict=True)
+        # assign=True: the newer torch stack builds the model on the meta device via
+        # from_config, so a default (copy-based) load is a silent no-op and .to("neuron")
+        # then fails with "Cannot copy out of meta tensor". assign=True swaps in the real
+        # checkpoint tensors instead of copying into empty meta slots.
+        pipe.generator.load_state_dict(remapped, strict=True, assign=True)
 
-    pipe.generator.model = pipe.generator.model.to("neuron")
+    # Cast to bf16 to match the pipeline's bf16 activations. assign=True loads weights in
+    # the checkpoint dtype, which otherwise mismatches the activations and fails the Neuron
+    # matmul compile ("matmul: input datatypes mismatched").
+    pipe.generator.model = pipe.generator.model.to(device="neuron", dtype=torch.bfloat16)
     return pipe
 
 
