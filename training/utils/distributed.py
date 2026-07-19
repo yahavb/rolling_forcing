@@ -77,9 +77,43 @@ def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls, student_pg=N
     # wrap; FSDP2 places the sharded params on the neuron device via `mesh`.
     m.to("cpu")
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-    for blk in m.blocks:
+    # DEADLOCK FIX (trn3-dev1, residual) — LOCAL device drain, NOT a cross-rank sync.
+    #
+    # cpushard (m.to("cpu") above) got 30/32 ranks through all blocks; 2 stayed wedged in
+    # the on-device .copy_(sharded_param) (_fsdp_param.py:394) — FSDP2 placing each param's
+    # shard onto the neuron device. That is LOCAL device-runtime contention (per-block
+    # shard-copies piling up on one rank), NOT a collective desync (no dist.* in the frame).
+    #
+    # A cross-rank barrier is the WRONG lever and makes it worse: an all_reduce(student_pg)
+    # per block (branch rf-distill-14b-fsdp2-allreduce) deadlocked ALL 32 at block 2 —
+    # fully_shard itself issues per-module collectives on local_mesh, and interleaving a
+    # foreign collective on the same group corrupts the neuron collective ordering.
+    #
+    # Instead force THIS rank to finish its shard-copy before issuing the next block's, with
+    # a host read of one just-sharded param. Purely per-rank (no dist call), so it cannot
+    # desync or corrupt fully_shard's collectives — it only stops the concurrent per-block
+    # device copies that wedged the 2 ranks.
+    import time as _t
+    _r = dist.get_rank() if dist.is_initialized() else -1
+
+    def _dbg(msg):
+        print(f"[dbg r{_r} {_t.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    def _drain(mod):
+        # read one sharded param to host -> its device copy must complete first. Per-rank.
+        for p in mod.parameters():
+            t = p.to_local() if hasattr(p, "to_local") else p
+            t.detach().float().sum().cpu().item()
+            return
+
+    nblk = len(m.blocks)
+    for i, blk in enumerate(m.blocks):
         fully_shard(blk, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
+        _drain(blk)
+        _dbg(f"student: fully_shard block {i+1}/{nblk} + drain DONE")
     fully_shard(m, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
+    _drain(m)
+    _dbg("student: fully_shard root + drain DONE")
     return model
 
 
