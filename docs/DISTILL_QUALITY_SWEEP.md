@@ -15,7 +15,8 @@ the quality question.**
 checkpoints, in one pod, and compare sharpness by eye.
 
 - Default: prompt_000 (the trained prompt for the wnlfl run `202607152026`) at iters
-  `1200 2000 3000 4000`.
+  `200 1000 2000 4000` — spans the trajectory (200/1000 = known-blurry anchors from prior
+  eyeballing; 2000 = untested middle; 4000 = latest/most-trained endpoint).
 - Knobs: `ITERS` (space-separated checkpoints, must exist on the PVC), `RUN_DIR` (which
   distill run), `PROMPT_IDX` (which prompt line to render).
 - Output: `/var/mdl/rolling-forcing/runs/quality_sweep_<TS>/iter<IT>_prompt<IDX>.mp4`, one
@@ -49,6 +50,21 @@ aws s3 cp --recursive s3://621547421844-ap-southeast-4/rolling-forcing/runs/qual
 ## Method note (why a sweep, not one render)
 
 One render at one iter can't distinguish "undertrained" from "at ceiling" — you need the
-*trajectory*. Rendering 1200→4000 in one pass shows whether the curve is still moving. If it's
+*trajectory*. Rendering 200→4000 in one pass shows whether the curve is still moving. If it's
 flat, no single later checkpoint will surprise you; if it's rising, you know to keep going.
 This is the cheap decisive test before committing more training compute.
+
+## Results (fill in after the sweep — observed, by eye)
+
+Job: `rf-render-sweep`, run `quality_sweep_<TS>`. Copy:
+`aws s3 cp --recursive s3://621547421844-ap-southeast-4/rolling-forcing/runs/quality_sweep_<TS>/ ./sweep/`
+
+| iter | render quality (by eye) |
+|------|-------------------------|
+| 200  | (blurry — prior anchor) |
+| 1000 | |
+| 2000 | |
+| 4000 | |
+
+Verdict: _____ (later-sharper = training length is the lever, keep training / all-blurry =
+ceiling elsewhere → test EMA-off render, then 14B student for capacity).
