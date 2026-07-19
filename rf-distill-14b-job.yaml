@@ -12,13 +12,14 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        node-type: trn2
+        node-type: trn3
       resourceClaims:
-        - name: xxl-trn2
-          resourceClaimTemplateName: xxl-trn2
+        - name: xxl-lnc2-trn3
+          resourceClaimTemplateName: xxl-lnc2-trn3
       containers:
         - name: rf-distill
-          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          #image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash
@@ -40,9 +41,15 @@ spec:
               echo "│ subject: $(git log -1 --pretty=%s)"
               echo "└────────────────"
 
+              # The new DLC image does not auto-activate a venv, so `uv pip install` errors
+              # with "No virtual environment found". Target the SAME interpreter python3
+              # uses (where torch-neuronx already lives) via --python.
+              UVPY="$(command -v python3)"
+              echo "uv target interpreter: $UVPY"
+
               # ─── Install TRAINING deps (upstream RF pins; kept separate from inference pins) ───
               # flash-attn / flex_attention are NOT installed — training/ uses the SDPA fallback.
-              uv pip install \
+              uv pip install --python "$UVPY" \
                 "diffusers==0.31.0" \
                 "transformers>=4.49.0" \
                 "tokenizers>=0.20.3" \
@@ -175,7 +182,7 @@ spec:
               ls -lhR "$FINAL" | head -60
           resources:
             claims:
-              - name: xxl-trn2
+              - name: xxl-lnc2-trn3
             requests:
               cpu: 190
               memory: 1900Gi
@@ -191,7 +198,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "rf-distill-14b"
+              value: "rf-distill-14b-fsdp2-drain"
             # THREE-GROUP placement (SD's proven co-residency fix): each core holds ONE
             # model instead of all three. 64-core LNC2 layout (config teacher_tp/student_tp/
             # fake_tp = 16/32/16): teacher ranks 0-15, student 16-47, critic 48-63. Student

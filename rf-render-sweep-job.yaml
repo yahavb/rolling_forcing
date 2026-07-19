@@ -1,0 +1,202 @@
+# QUALITY-vs-ITERATION SWEEP — empirical test of "does more distillation training
+# sharpen the render?" (proves/disproves it with FRAMES, not dmdnorm).
+#
+# Renders prompt_000 from the wnlfl (prompt_000) distill run at several checkpoints
+# (ITERS env, default "1200 2000 3000 4000") in ONE pod, saving each mp4 to a distinct
+# PVC dir tagged by iter. Then you eyeball sharpness vs iter:
+#   - if all equally blurry  -> training LENGTH is not the lever (capacity/recipe/EMA is)
+#   - if later = sharper     -> keep training
+# dmdnorm at these iters is a flat ~0.44-0.58 equilibrium and does NOT answer this;
+# only the video does. See docs/DISTILL_QUALITY_SWEEP.md.
+#
+# Launch:
+#   kubectl delete job rf-render-sweep --ignore-not-found
+#   kubectl apply -f rf-render-sweep-job.yaml
+#   kubectl logs -f job/rf-render-sweep
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rf-render-sweep
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: rf-job
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3
+      resourceClaims:
+        # m-lnc1-trn3 = 2 devices @ logicalNeuronCore:1 -> 16 NeuronCores -> NPROC=16
+        # (TP4xCP4). 1:1 swap from m-lnc1-trn2; same claim rf-job uses on trn3.
+        - name: m-lnc1-trn3
+          resourceClaimTemplateName: m-lnc1-trn3
+      containers:
+        - name: bench
+          #image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          imagePullPolicy: Always
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              BRANCH="${BRANCH:-main}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git REPO
+              cd REPO
+              GIT_SHA=$(git rev-parse HEAD)
+              echo "┌── PROVENANCE ──"
+              echo "│ branch : $(git rev-parse --abbrev-ref HEAD) (requested: $BRANCH)"
+              echo "│ commit : $GIT_SHA"
+              echo "└────────────────"
+
+              # New SDK 2.31 DLC image does NOT auto-activate a venv -> `uv pip install`
+              # errors with "No virtual environment found". Target the SAME interpreter
+              # python3 uses (where torch-neuronx already lives) via --python.
+              UVPY="$(command -v python3)"
+              echo "uv target interpreter: $UVPY"
+
+              uv pip install --python "$UVPY" \
+                "diffusers==0.37.1" "transformers==5.8.1" "huggingface-hub==1.16.4" \
+                "click" "einops==0.8.2" "omegaconf==2.3.0" "ftfy==6.3.1" \
+                "regex==2026.5.9" "av==17.0.1"
+              uv pip install --python "$UVPY" "setuptools<81"
+              uv pip install --python "$UVPY" git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
+
+              # ─── Wan2.1-T2V-1.3B (T5 + VAE) ───
+              WAN_TAR="/var/mdl/rolling_forcing/Wan2.1-T2V-1.3B.tar"
+              if [[ -f "$WAN_TAR" ]]; then
+                echo "Extracting Wan2.1-T2V-1.3B from S3 cache..."
+                mkdir -p wan_models && tar xf "$WAN_TAR" -C wan_models/
+              else
+                echo "Downloading Wan2.1-T2V-1.3B..."
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
+                tar cf /tmp/w.tar -C wan_models Wan2.1-T2V-1.3B
+                mkdir -p "$(dirname $WAN_TAR)" && cp /tmp/w.tar "$WAN_TAR" && rm -f /tmp/w.tar
+              fi
+              echo "Model weights ready!"
+
+              # ─── SWEEP: render prompt_000 at each checkpoint of the wnlfl prompt_000 run ───
+              # RUN_DIR: which distill run to sweep. ITERS: space-separated checkpoints (must
+              # exist on the PVC — wnlfl saved every 200). PROMPT_IDX: which prompt to render
+              # (0 = prompt_000, the TRAINED prompt for the wnlfl run).
+              RUN_DIR="${RUN_DIR:-/var/mdl/rolling_forcing/distill/202607152026}"
+              ITERS="${ITERS:-1200 2000 3000 4000}"
+              PROMPT_IDX="${PROMPT_IDX:-0}"
+              NPROC="${NPROC:-16}"; LATENT_W="${LATENT_W:-80}"
+              RUN_TS=$(date +%d%m%y%H%M%S)
+              OUT="/var/mdl/rolling-forcing/runs/quality_sweep_${RUN_TS}"
+              mkdir -p "$OUT"
+              echo "=== QUALITY SWEEP: RUN_DIR=$RUN_DIR  ITERS=[$ITERS]  prompt_${PROMPT_IDX}  -> $OUT ==="
+
+              for IT in $ITERS; do
+                CK="$RUN_DIR/model.iter${IT}.pt"
+                if [[ ! -f "$CK" ]]; then
+                  echo "  SKIP iter${IT}: not found ($CK)"; continue
+                fi
+                echo "──────── RENDER iter${IT} ────────"
+                mkdir -p /tmp/mdl; cp "$CK" /tmp/mdl/m.pt
+                OUTF="/tmp/results/iter${IT}"; mkdir -p "$OUTF"
+                # STOCK T=5 config, EMA weights (--use_ema). Render ONLY prompt_${PROMPT_IDX}:
+                # e2e_pipeline renders every line in --prompt_file, so slice that one line out.
+                sed -n "$((PROMPT_IDX+1))p" prompts/example_prompts.txt > /tmp/one_prompt.txt
+                torchrun --nproc_per_node ${NPROC} e2e_pipeline.py \
+                  --prompt_file /tmp/one_prompt.txt \
+                  --config_path configs/rolling_forcing_dmd.yaml \
+                  --checkpoint_path /tmp/mdl/m.pt \
+                  --tp_degree 4 --latent_w ${LATENT_W} \
+                  --num_output_frames 21 --chunk-size 3 --fps 16 --use_ema \
+                  --output_folder "$OUTF" 2>&1 | grep -iE "block  [0-9]|fps|FATAL|Error" || echo "  (render iter${IT} produced no matching lines)"
+                rm -f /tmp/mdl/m.pt
+                # persist the mp4 tagged by iter
+                MP4=$(find "$OUTF" -name '*.mp4' | head -1)
+                if [[ -n "$MP4" ]]; then
+                  cp "$MP4" "$OUT/iter${IT}_prompt${PROMPT_IDX}.mp4"
+                  echo "  saved -> $OUT/iter${IT}_prompt${PROMPT_IDX}.mp4"
+                else
+                  echo "  NO mp4 for iter${IT}"
+                fi
+              done
+
+              echo "════════════ SWEEP DONE ════════════"
+              ls -lh "$OUT"/*.mp4 2>/dev/null || echo "no mp4s"
+              echo "Run dir: $OUT"
+              echo "Compare: aws s3 cp --recursive s3://621547421844-ap-southeast-4/rolling-forcing/runs/quality_sweep_${RUN_TS}/ ./sweep/"
+          resources:
+            claims:
+              - name: m-lnc1-trn3
+            # m-lnc1-trn3 = 2 devices/pod (16 NeuronCores) -> 2 pods/node. Node allocatable
+            # ~191 cpu, ~1957Gi mem, ~1.84Ti ephemeral. Requests kept under node/2; limits
+            # allow bursting. ephemeral-storage set explicitly to avoid disk-pressure eviction
+            # (Exit 137) — /tmp holds model tar, checkpoints, NEFF cache, and rendered mp4s.
+            requests:
+              cpu: 70
+              memory: 640Gi
+              ephemeral-storage: 120Gi
+            limits:
+              cpu: 90
+              memory: 900Gi
+              ephemeral-storage: 200Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # ITERS: which checkpoints to sweep (space-separated; must exist on the PVC).
+            - name: ITERS
+              value: "200 1000 2000 4000"
+            - name: RUN_DIR
+              value: "/var/mdl/rolling_forcing/distill/202607152026"
+            - name: PROMPT_IDX
+              value: "0"
+            - name: BRANCH
+              value: "main"
+            - name: RF_RING
+              value: "1"
+            - name: RF_RING_NSEG
+              value: "1"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: NEURON_CC_FLAGS
+              value: "--model-type=transformer"
+            - name: NEURON_FALLBACK_ENABLED
+              value: "0"
+            - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
+              value: "0"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: MASTER_ADDR
+              value: "127.0.0.1"
+            - name: MASTER_PORT
+              value: "29500"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 24Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

@@ -12,14 +12,17 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        node-type: trn2
+        node-type: trn3
       resourceClaims:
-        - name: l-trn2
-          resourceClaimTemplateName: l-trn2
+        # l-trn2 (count:4 @ LNC2 = 16 logical cores, TP-16) -> l-lnc2-trn3 (count:4 @ LNC2),
+        # preserving LNC2 and the proven world=16 layout (teacher 0-7/student 8-11/critic 12-15).
+        - name: l-lnc2-trn3
+          resourceClaimTemplateName: l-lnc2-trn3
       containers:
         - name: rf-distill
-          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
-          imagePullPolicy: IfNotPresent
+          #image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          imagePullPolicy: Always
           command:
             - /bin/bash
             - "-ec"
@@ -42,7 +45,14 @@ spec:
 
               # ─── Install TRAINING deps (upstream RF pins; kept separate from inference pins) ───
               # flash-attn / flex_attention are NOT installed — training/ uses the SDPA fallback.
-              uv pip install \
+              # New SDK 2.31 DLC image does NOT auto-activate a venv (the old concourse
+              # image auto-activated /opt/torch-neuronx/.venv) -> bare `uv pip install`
+              # errors "No virtual environment found". Target the SAME interpreter python3
+              # uses (where torch-neuronx already lives) via --python.
+              UVPY="$(command -v python3)"
+              echo "uv target interpreter: $UVPY"
+
+              uv pip install --python "$UVPY" \
                 "diffusers==0.31.0" \
                 "transformers>=4.49.0" \
                 "tokenizers>=0.20.3" \
@@ -175,13 +185,18 @@ spec:
               ls -lhR "$FINAL" | head -60
           resources:
             claims:
-              - name: l-trn2
+              - name: l-lnc2-trn3
+            # l-lnc2-trn3 = 4 devices/pod (16 NeuronCores). ephemeral-storage set explicitly
+            # to avoid disk-pressure eviction (Exit 137) — /tmp holds the Wan tars, ode_init,
+            # NEFF cache, and (transiently) one 11GB ckpt at a time (sync cp -> PVC -> rm).
             requests:
               cpu: 80
               memory: 800Gi
+              ephemeral-storage: 150Gi
             limits:
-              cpu: 80
-              memory: 800Gi
+              cpu: 90
+              memory: 900Gi
+              ephemeral-storage: 250Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -193,10 +208,10 @@ spec:
             - name: BRANCH
               value: "rf-distill-14b"
             # THREE-GROUP placement (SD's proven co-residency fix): each core holds ONE
-            # model instead of all three. 64-core LNC2 layout (config teacher_tp/student_tp/
-            # fake_tp = 16/32/16): teacher ranks 0-15, student 16-47, critic 48-63. Student
-            # (trainable 14B) gets the most ranks to shard its weights+grads+Adam+activations
-            # thinnest. Selects trainer/distillation_3group.py.
+            # model instead of all three. 16-core LNC2 layout (config teacher_tp/student_tp/
+            # fake_tp = 8/4/4): teacher ranks 0-7, student 8-11, critic 12-15 — the proven
+            # world=16 layout for the 1.3B student on the l-lnc2-trn3 claim (4 devices/pod).
+            # Selects trainer/distillation_3group.py.
             - name: DISTILL_THREE_GROUP
               value: "1"
             # Functional (out-of-place, single-block) self-attn on the STUDENT grad rollout
@@ -207,7 +222,7 @@ spec:
               value: "1"
             # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
             - name: NPROC
-              value: "64"            # whole trn2.48xl: 64 NeuronCores @ LNC2 (14B student needs it)
+              value: "16"            # l-lnc2-trn3 = 4 devices/pod = 16 NeuronCores @ LNC2 (proven 1.3B world=16)
             # denoising_step_list (T=4) lives in configs/rolling_forcing_dmd_t4.yaml.
             # Everything else (lr 1.5e-6 / lr_critic 4e-7 / dfake_gen_update_ratio 5 /
             # guidance_scale 3.0 / ema 0.99 from step 200 / batch 1-per-rank) is in that config.
