@@ -6,6 +6,28 @@ the open question is **convergence**.
 
 ---
 
+## RUN LOG (2026-07-19) — prompt003, 14B teacher, fsdp2-allreduce branch
+
+Pod `rf-distill-p003-nrsbx`, branch `rf-distill-prompt003` (commit `427c28b`), single
+prompt (`prompts/distill_poc_prompt003.txt`), 14B teacher (bf16) → 1.3B causal student.
+Checkpoints → `/var/mdl/rolling_forcing/distill/prompt003_202607171017`.
+
+- **Status at capture: RUNNING, healthy, it 1718/10000 (~17%).** No crash, no OOM, no
+  nrt_init failure (only the usual harmless NET/OFI RDMA warnings).
+- **`dmdnorm=nan` on critic-only steps is BENIGN — do not chase it.** Verified from the log:
+  nan appears on **all 1367 critic-only steps** and **never** on G-steps (G-steps show real
+  values 1.0–1.5). `dmdnorm_avg50` stays finite (~0.467). The DMD norm is simply *not
+  computed* on critic-only iterations (only G-steps produce it) — a logging artifact of the
+  alternating critic/generator schedule, not a numerical blowup.
+- **Convergence read (weak so far):** `loss_fake` is NOT trending down — early ~0.05–0.08,
+  latest ~0.30–0.37 (noisy, no clear descent by it 1718). grad_norm well-behaved (0.5–4.7,
+  no spikes). Consistent with the standing "undertrained / blurry" verdict below — 1718 iters
+  is early and the generator signal isn't clearly improving yet.
+- **Metric-reading reminder:** judge convergence from **G-step `dmdnorm`** and rendered
+  quality, not critic-only lines. See "What each metric means" below.
+
+---
+
 ## LATEST (2026-07-13) — render/quality findings, read FIRST
 
 - **Quality verdict: our T=4 distilled model is BLURRY, undertrained. NOT usable yet.**
