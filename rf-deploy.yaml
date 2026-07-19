@@ -27,15 +27,16 @@ spec:
         app: rf
     spec:
       nodeSelector:
-        node-type: trn2
+        node-type: trn3
       resourceClaims:
         # 16 NeuronCores (2 chips x 8, LNC=1) for TP4xSP4. Benchmarked at 13.19 fps
         # vs 8.75 fps at TP4xSP2 (8 cores) — 1.51x. See rf-job.yaml.
-        - name: m-lnc1-trn2
-          resourceClaimTemplateName: m-lnc1-trn2
+        - name: m-lnc1-trn3
+          resourceClaimTemplateName: m-lnc1-trn3
       containers:
         - name: app
-          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          #image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash
@@ -45,11 +46,13 @@ spec:
 
               cd /tmp
               # TP4xSP4 (frame_seq_length=1200 + SP4 divisibility guard) is merged to main.
-              git clone -b "${BRANCH:-main}" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git
+              git clone -b "${BRANCH:-rf-meta-bf16-fix}" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git
               cd rolling_forcing
 
+              UVPY="$(command -v python3)"
+              echo "uv target interpreter: $UVPY"
               # ─── Install deps ─────────────────────────────────────────────
-              uv pip install \
+              uv pip install --python "$UVPY" \
                 "diffusers==0.37.1" \
                 "transformers==5.8.1" \
                 "huggingface-hub==1.16.4" \
@@ -114,13 +117,18 @@ spec:
               torchrun --nproc_per_node 16 serve.py
           resources:
             claims:
-              - name: m-lnc1-trn2
+              - name: m-lnc1-trn3
+            # Sized for 4 pods/node (64 NeuronCores / 16 per pod = 4). Requests under
+            # node/4 (~47 cpu, ~489Gi mem, ~460Gi ephemeral) so 4 stack; limits burst.
+            # ephemeral-storage set explicitly to avoid disk-pressure eviction.
             requests:
-              cpu: 36
-              memory: 366Gi
+              cpu: 40
+              memory: 400Gi
+              ephemeral-storage: 120Gi
             limits:
-              cpu: 36
-              memory: 366Gi
+              cpu: 90
+              memory: 460Gi
+              ephemeral-storage: 200Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -149,9 +157,11 @@ spec:
               value: "21"
             - name: DEFAULT_FPS
               value: "16"
-            # frame_seq_length: 1200 lives here (480x640, div-by-16 for SP4)
+            # Same config as the working rf-job / rf-sweep-fs1200: 1.3B, frame_seq 1200,
+            # image_or_video_shape 60x80. (rolling_forcing_dmd.yaml is the 14B-teacher
+            # training config — wrong for serving.)
             - name: CONFIG_PATH
-              value: "configs/rolling_forcing_dmd.yaml"
+              value: "configs/rolling_forcing_dmd_tp4sp4.yaml"
             - name: CHECKPOINT_PATH
               value: "checkpoints/rolling_forcing_dmd.pt"
             - name: WARMUP_FRAMES

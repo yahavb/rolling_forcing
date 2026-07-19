@@ -116,8 +116,8 @@ data:
         gr.Markdown("""
         # Rolling Forcing - Video Generation
 
-        Generate videos from text prompts using **Rolling Forcing** on AWS Trainium2.
-        Uses the fast e2e_pipeline path (TP=4, SP=2, width-sharded VAE).
+        Generate videos from text prompts using **Rolling Forcing** on AWS Trainium.
+        DiT TP4xCP4, TP16 VAE and T5.
         Frames stream in real-time as they are generated.
         """)
 
@@ -182,10 +182,10 @@ data:
                 ## How it works
 
                 - **Model**: WAN2.1-T2V-1.3B with Rolling Forcing DMD distillation
-                - **Hardware**: AWS Trainium2 (8 NeuronCores, LNC=1)
-                - **Parallelism**: TP=4, SP=2 (DiT), width-sharded (VAE), TP=8 (T5)
+                - **Hardware**: AWS Trainium (16 NeuronCores, LNC=1)
+                - **Parallelism**: DiT TP4xCP4, TP16 VAE and T5
                 - **Streaming**: Frames delivered via Server-Sent Events as blocks complete
-                - **Resolution**: 480x832 pixels
+                - **Resolution**: 480x640 pixels
                 - **Code path**: e2e_pipeline (proper collectives, no file-based exchange)
                 """)
 
