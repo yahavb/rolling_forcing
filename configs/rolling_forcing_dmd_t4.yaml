@@ -57,11 +57,15 @@ beta1_critic: 0.0
 beta2_critic: 0.999
 # ── three-group flat trainer (distillation_3group.py) knobs ──
 tp_degree: 4                                       # legacy default; per-group tp below overrides
-# 64-core LNC2 (whole trn2.48xl). 14B STUDENT is the memory-dominant net (trainable:
-# weights+grads+Adam+rollout activations), so it gets the most ranks to shard thinnest.
-# teacher(frozen 14B)=16, student(trainable 14B)=32, fake(1.3B critic)=16 -> sums to 64.
-teacher_tp: 16
-student_tp: 32
+# 64-core LNC2 (whole trn2.48xl). student_tp 32->16: student=32 wedged FSDP2 fully_shard
+# (nondeterministic, 19-27/32 ranks; the on-device per-param shard-copy races at 32-way).
+# student=16 is the legal neuron group size {1,2,4,8,16,mult-of-32} that still FITS: 14B
+# weights 1.8 + fp32 master 3.5 + Adam 7.0 = 12.2 GB/rank < 24 GB (student=8 would be 24.5,
+# over). Uses the SIMPLE wrap identical to the working 1.3B path (no from_group/cpushard/
+# drain). Frozen teacher (no optimizer state) absorbs the freed ranks -> thinner shard.
+# teacher(frozen 14B)=32, student(trainable 14B)=16, fake(1.3B critic)=16 -> sums to 64.
+teacher_tp: 32
+student_tp: 16
 fake_tp: 16
 iters: 10000                                       # SD long-run recipe (gentle lr + grad-accum)
 save_every: 200
