@@ -136,7 +136,7 @@ spec:
               value: "1"
             # ITERS: which checkpoints to sweep (space-separated; must exist on the PVC).
             - name: ITERS
-              value: "1200 2000 3000 4000"
+              value: "200 1000 2000 4000"
             - name: RUN_DIR
               value: "/var/mdl/rolling_forcing/distill/202607152026"
             - name: PROMPT_IDX
