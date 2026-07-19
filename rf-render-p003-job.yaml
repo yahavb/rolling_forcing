@@ -515,7 +515,7 @@ spec:
             # Bump to ~1000-1200 once the p003 distill (nrsbx) has trained that far, to match
             # the iter the 000-ckpt was rendered at for a fair 003-vs-000 A/B.
             - name: ITER
-              value: "200"
+              value: "1000"
             - name: BRANCH
               value: "main"
             # main runs TP4xCP4 WITH ring attention (RF_RING=1) — the validated 14fps path.
