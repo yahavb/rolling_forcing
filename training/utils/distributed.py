@@ -77,21 +77,44 @@ def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls, student_pg=N
     # wrap; FSDP2 places the sharded params on the neuron device via `mesh`.
     m.to("cpu")
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-    # DEADLOCK FIX (trn3-dev1, residual): serialize the per-block wrap with a barrier on
+    # DEADLOCK FIX (trn3-dev1, residual): serialize the per-block wrap with a SYNC on
     # the student group. CPU-shard-init cut the wedge from 6 -> 2 stuck ranks, but a
     # residual 2/32 still hang: fully_shard issues per-module collectives on local_mesh,
     # and without a sync between blocks the ranks desync (some start block N+1's collective
     # while stragglers are still on block N), which the neuron backend deadlocks on. A
-    # barrier after each block forces all 32 student ranks to complete block N before any
+    # sync after each block forces all student ranks to complete block N before any
     # starts N+1 — identical collective order on every rank.
+    #
+    # NOTE (trn3 / torch-neuronx sdk2.31): dist.barrier(group=student_pg) is UNSUPPORTED
+    # on the neuron backend (the barrier op has no neuron collective) -> was dropped in
+    # rf-distill-14b-student16 and the 2-rank wedge returned. Use an in-place all_reduce
+    # of a 1-elem tensor ON THE NEURON DEVICE instead: it IS a supported neuron collective
+    # and provides the same "all ranks must arrive" ordering barrier. The tensor must live
+    # on the neuron device (not CPU, even though params were just moved to CPU) — the neuron
+    # backend collectives operate on device buffers.
     import torch.distributed as _dist
-    for blk in m.blocks:
+    import time as _t
+    _r = _dist.get_rank() if _dist.is_initialized() else -1
+
+    def _dbg(msg):
+        # greppable per-rank marker, same format as trainer._rlog, so the next run
+        # shows exactly which block index a rank reaches before any wedge.
+        print(f"[dbg r{_r} {_t.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    def _student_sync():
+        if student_pg is None:
+            return
+        t = torch.ones(1, device="neuron")
+        _dist.all_reduce(t, group=student_pg)
+
+    nblk = len(m.blocks)
+    for i, blk in enumerate(m.blocks):
         fully_shard(blk, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
-        if student_pg is not None:
-            _dist.barrier(group=student_pg)
+        _student_sync()
+        _dbg(f"student: fully_shard block {i+1}/{nblk} + sync DONE")
     fully_shard(m, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
-    if student_pg is not None:
-        _dist.barrier(group=student_pg)
+    _student_sync()
+    _dbg("student: fully_shard root + sync DONE")
     return model
 
 
