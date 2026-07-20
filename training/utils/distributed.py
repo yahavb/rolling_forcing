@@ -68,9 +68,30 @@ def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls, student_pg=N
         check_fn=lambda mod: any(isinstance(mod, c) for c in transformer_layer_cls),
     )
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-    for blk in m.blocks:
+
+    # ── INSTRUMENTATION (probe branch) — locate the fully_shard wedge, no behavior change ──
+    # Run kp2wh/dvm4l: 12-13/16 student ranks finish fully_shard, 3-4 hang between
+    # START and DONE with NO error. 12 finishing while 4 hang PROVES fully_shard is not
+    # blocking on a 16-way collective (that would hang all 16) -> the stuck ranks are on
+    # LOCAL per-rank work. These markers show WHICH block each rank reaches; faulthandler
+    # prints the exact C/Python frame of whatever is still stuck after the timeout.
+    import time as _t, faulthandler as _fh, sys as _sys
+    _r = dist.get_rank() if dist.is_initialized() else -1
+
+    def _dbg(msg):
+        print(f"[dbg r{_r} {_t.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    # If this rank is still inside the shard loop 600s from now, dump ALL thread stacks
+    # (repeat every 300s) so the stuck rank's frame lands in the log. cancel() on success.
+    _fh.dump_traceback_later(600, repeat=True, file=_sys.stderr)
+
+    nblk = len(m.blocks)
+    for i, blk in enumerate(m.blocks):
         fully_shard(blk, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
+        _dbg(f"student: fully_shard block {i+1}/{nblk} DONE")
     fully_shard(m, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
+    _dbg("student: fully_shard root DONE")
+    _fh.cancel_dump_traceback_later()
     return model
 
 

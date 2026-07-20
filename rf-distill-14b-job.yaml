@@ -198,7 +198,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "rf-distill-14b-fsdp2-drain"
+              value: "rf-distill-14b-tp16-probe"
             # THREE-GROUP placement (SD's proven co-residency fix): each core holds ONE
             # model instead of all three. 64-core LNC2 layout (config teacher_tp/student_tp/
             # fake_tp = 16/32/16): teacher ranks 0-15, student 16-47, critic 48-63. Student
