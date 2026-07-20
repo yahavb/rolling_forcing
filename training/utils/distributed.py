@@ -20,7 +20,7 @@ def fsdp_state_dict(model):
     return checkpoint
 
 
-def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls):
+def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls, student_pg=None):
     """FSDP2 fully_shard for the STUDENT generator (SD 5d90c6b path). FSDP1's backward
     unshard buffers were NOT resharded/freed after the DMD G-step backward -> the rollout
     activation graph accumulated +~10GB per G-step (proven by memprobe across del+gc+sync).
@@ -38,12 +38,23 @@ def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls):
         checkpoint_wrapper, CheckpointImpl, apply_activation_checkpointing)
     from torch.distributed.device_mesh import DeviceMesh
 
-    # Build the mesh from the EXPLICIT student rank list — NOT init_device_mesh over the
-    # world. init_device_mesh(world//n, n) is collective across ALL ranks, but only the
-    # student ranks call this function (teacher/critic never enter) -> a world-collective
-    # here would DEADLOCK. DeviceMesh(mesh=<student ranks>) constructs over exactly those
-    # ranks (reuses the already-created student process group), no world collective.
-    local_mesh = DeviceMesh("neuron", torch.tensor(student_ranks, dtype=torch.int))
+    # Build the mesh over the student ranks WITHOUT creating a new communicator.
+    #
+    # DEADLOCK FIX (trn3, traced from run kp2wh): the bare `DeviceMesh("neuron", tensor)`
+    # constructor does NOT reuse student_pg — it calls _init_process_groups() and bootstraps
+    # a SECOND communicator over the 16 student ranks. That second bootstrap is order-
+    # sensitive on the neuron backend: 13/16 ranks completed it and finished fully_shard,
+    # 3 (r37/r39/r44) never reached the matching bootstrap step -> `nccl init comm … 0 out
+    # of 16` + `Timeout waiting for RX` doubling forever. The student_pg built in lockstep
+    # by ALL ranks in make_distill_groups (dist.new_group) ALREADY bootstrapped cleanly;
+    # wrap THAT with DeviceMesh.from_group() — no second bootstrap, nothing to desync on.
+    if student_pg is not None:
+        local_mesh = DeviceMesh.from_group(
+            student_pg, "neuron", mesh=torch.tensor(student_ranks, dtype=torch.int))
+    else:
+        # Fallback (only if the caller didn't pass the pre-created group): the bare
+        # constructor, which spawns the second communicator (the deadlock above).
+        local_mesh = DeviceMesh("neuron", torch.tensor(student_ranks, dtype=torch.int))
 
     # per-block NO_REENTRANT activation checkpointing (SD: mandatory — OOMs without it)
     m = model.model  # WanDiffusionWrapper.model = the CausalWanModel (has .blocks)
