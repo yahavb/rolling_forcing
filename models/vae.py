@@ -48,8 +48,10 @@ def destroy_vae_parallel_group():
 @_compile
 class SiLU(nn.Module):
     def forward(self, x):
-        ones = torch.full_like(x, 1.0)
-        return x / (ones + torch.exp(-x))
+        # F.silu = x * sigmoid(x), identical to x / (1 + exp(-x)) but one fused
+        # kernel — avoids materializing a full-tensor `ones` (a standalone ~106MB
+        # software-DMA copy NEFF, named at vae.py:52 by the fs1440 DMA trace).
+        return F.silu(x)
 
 
 @_compile
