@@ -1,0 +1,150 @@
+# Phase-2 ANALYZE job — name the op behind the DMA for the fs1440 hotspot NEFFs.
+#
+# NO Neuron device claim: neuron-explorer only PARSES trace files, so this pod
+# schedules on any trn3 node with the image (cpu-only, cheap). Mounts the SAME PVC
+# as the benchmark, so the run dir is already present (no S3 download).
+#
+# Input  : /var/mdl/rolling_forcing/runs/<RUN>/{harmony_bundle,perneff_traces}
+#          .neff lives in harmony_bundle/ ; single-io .ntff lives in perneff_traces/
+#          (Phase-1 job did NOT create an ntff_pairs/ dir; we assemble pairs here
+#           from the curated hotspot hash list below.)
+# Output : ingest each pair -> parquet -> pq_dma_report.py + pq_pad_shapes.py
+#          => per-NEFF hlo_name + bir_debug_info_source_location + DMA geometry.
+#          Written back to <RUN>/dma_analysis_full.txt.
+#
+# The HASHES are the fixable-class representatives from the per-NEFF scan:
+#   67703a718ebe3e  top wasted-time, 234K static-DMA, MFU~1% (layout copy)
+#   f6fc4299393cc0  38% busiest engine, swDMA 100%, high transpose_flops
+#   2f479ff3375329  mm=0, dma copy, swDMA 99.9%  (pure copy)
+#   dfbcb3ea22f595  mm=0, dma 98%, swDMA 100%    (pure copy)
+#   ecd1effa64160e  mm=0, vec/gpsimd copy, swDMA 67%
+#   7ecd3c969a6d18  GEMM w/ swDMA 62% + 23776 sw pkts (SWDGE inside a matmul NEFF)
+#   0778e3ba0ac6d4  swDMA 99.9%, low mm            (gather/scatter)
+#   ec64bb234d234c  7314 static-DMA pkts, mm=280   (static copy)
+#
+# Launch:
+#   kubectl delete job rf-analyze-fs1440 --ignore-not-found
+#   kubectl apply -f rf-analyze-fs1440-job.yaml
+#   kubectl logs -f job/rf-analyze-fs1440
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rf-analyze-fs1440
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: rf-analyze-fs1440
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3            # needs the image, NOT a device
+      # deliberately NO resourceClaims — parsing traces needs no Neuron core.
+      containers:
+        - name: analyze
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -uo pipefail
+              BRANCH="${BRANCH:-rf-bench-fs1440-trn3}"
+              # The run dir the Phase-1 benchmark persisted (override via env if needed).
+              RUN="${RUN:-fs1440-trn3_200726205622}"
+              SRC="/var/mdl/rolling_forcing/runs/$RUN"
+              WORK=/tmp/analyze; rm -rf "$WORK"; mkdir -p "$WORK"
+              echo "════════ ANALYZE TRACES — $RUN ════════"
+              ls -la "$SRC" || { echo "MISSING $SRC"; sleep 600; exit 1; }
+
+              # analysis scripts live in the repo (scripts/neuron/pq_*.py)
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git repo
+              SCRIPTS=/tmp/repo/scripts/neuron
+              echo "commit: $(git -C /tmp/repo rev-parse HEAD)"
+
+              # deps: duckdb (query side); neuron-explorer is in the image
+              python3 -c "import duckdb" 2>/dev/null || pip install --quiet duckdb
+              EXPLORER=$(command -v neuron-explorer || echo /opt/aws/neuron/bin/neuron-explorer)
+              "$EXPLORER" --version 2>&1 | head -1 || true
+
+              # assemble the curated hotspot pairs OFF the PVC into local /tmp.
+              # .neff from harmony_bundle/, single-io .ntff (NO _rank suffix) from perneff_traces/
+              HASHES="67703a718ebe3e2e10b89b02e2d22d10 \
+                      f6fc4299393cc07a2c136d8f494c7b70 \
+                      2f479ff33753295075e56668df8f94ef \
+                      dfbcb3ea22f5952cec16b954110e463c \
+                      ecd1effa64160ecd12ee7a22b38c25fc \
+                      7ecd3c969a6d186dfb2684e648f6c7e3 \
+                      0778e3ba0ac6d43ba32ec0d679cc6a69 \
+                      ec64bb234d234c813f33c4044e2ea80b"
+              PAIRS="$WORK/ntff_pairs"; mkdir -p "$PAIRS"
+              for h in $HASHES; do
+                cp "$SRC/harmony_bundle/$h.neff"   "$PAIRS/" 2>/dev/null || echo "  MISSING neff $h"
+                cp "$SRC/perneff_traces/$h.ntff"   "$PAIRS/" 2>/dev/null || echo "  MISSING ntff $h"
+              done
+              echo "pairs assembled: $(ls "$PAIRS"/*.ntff 2>/dev/null | wc -l)"
+              PQROOT="$WORK/dma_pq"; mkdir -p "$PQROOT"
+
+              # ingest one pair to parquet — LONG timeout + size-stabilize kill loop
+              ingest() {  # $1=neff $2=ntff $3=out
+                local neff="$1" ntff="$2" out="$3"; rm -rf "$out"; mkdir -p "$out"
+                timeout 3600 "$EXPLORER" view -n "$neff" -s "$ntff" \
+                  --output-format parquet --output-file "$out" \
+                  --ignore-instruction-hierarchy --ignore-event-trace >/dev/null 2>&1 &
+                local pid=$! prev=-1 cur stable=0
+                for _ in $(seq 1 720); do                       # up to 60 min
+                  kill -0 "$pid" 2>/dev/null || break
+                  cur=$(du -sb "$out" 2>/dev/null | cut -f1)
+                  if [ -f "$out/Summary.parquet" ] && [ "$cur" = "$prev" ]; then
+                    stable=$((stable+1)); [ "$stable" -ge 4 ] && break
+                  else stable=0; fi
+                  prev="$cur"; sleep 5
+                done
+                kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+                [ -f "$out/Summary.parquet" ] && [ "$(stat -c%s "$out/Summary.parquet" 2>/dev/null||echo 0)" -gt 1000 ]
+              }
+
+              REPORT="$WORK/dma_analysis_full.txt"; : > "$REPORT"
+              # SMALLEST first (ls -Sr) — small traces finish; one named copy confirms its class
+              for neff in $(ls -Sr "$PAIRS"/*.neff 2>/dev/null); do
+                h=$(basename "$neff" .neff); ntff="$PAIRS/$h.ntff"; out="$PQROOT/pq_$h"
+                echo "" | tee -a "$REPORT"
+                echo "##### $h ($(du -h "$neff"|cut -f1) neff / $(du -h "$ntff" 2>/dev/null|cut -f1) ntff) #####" | tee -a "$REPORT"
+                [ -f "$ntff" ] || { echo "  no NTFF, skip" | tee -a "$REPORT"; continue; }
+                if ingest "$neff" "$ntff" "$out"; then
+                  python3 "$SCRIPTS/pq_dma_report.py" "$out" "$h" 2>&1 | tee -a "$REPORT"
+                  [ -f "$SCRIPTS/pq_pad_shapes.py" ] && python3 "$SCRIPTS/pq_pad_shapes.py" "$out" "$h" 2>&1 | tee -a "$REPORT" || true
+                else
+                  echo "  ingest produced no parquet even at 60min (trace too big — see two-phase-analysis.md)" | tee -a "$REPORT"
+                fi
+              done
+              echo "" | tee -a "$REPORT"
+              echo "=== DMA ANALYSIS COMPLETE ===" | tee -a "$REPORT"
+              cp "$REPORT" "$SRC/dma_analysis_full.txt" 2>/dev/null && echo "saved -> $SRC/dma_analysis_full.txt"
+              echo "Pod stays alive for kubectl logs/cp."
+              sleep 3600
+          volumeMounts:
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          resources:
+            requests: { cpu: "8", memory: 64Gi }
+            limits:   { cpu: "8", memory: 64Gi }
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "rf-bench-fs1440-trn3"
+            - name: RUN
+              value: "fs1440-trn3_200726205622"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
