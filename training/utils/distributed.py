@@ -69,6 +69,20 @@ def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls, student_pg=N
     )
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
+    # ── WEDGE FIX (traced from run vgnr2) — stage params to HOST during the wrap only ──
+    # faulthandler dumped all 4 stuck ranks frozen at the IDENTICAL frame:
+    #   _fsdp_param.py:389  param_data.new_zeros(padded_sharded_size)   # alloc shard ON NEURON
+    #   _fsdp_param.py:394  ....narrow(...).copy_(sharded_param)        # copy ON NEURON
+    # No dist.* in the frame; 12/16 ranks finished while 4 hung at DIFFERENT blocks (3/19/
+    # 31/37) -> NOT a collective/ordering issue, it's a nondeterministic neuron-runtime race
+    # in the on-device shard alloc+copy under 16-way concurrency. param_data is on neuron
+    # because the 14B student was built there, so new_zeros/copy_ execute on-device.
+    # Move params to CPU FIRST: new_zeros/copy_ then run in HOST memory (no device race),
+    # and fully_shard places only the 1/16 shard onto neuron via `mesh`. Wrap-time staging
+    # ONLY — all training runs on neuron afterward. (cpushard variant reached 30/32 at
+    # student=32; here combined with tp16 + from_group.)
+    m.to("cpu")
+
     # ── INSTRUMENTATION (probe branch) — locate the fully_shard wedge, no behavior change ──
     # Run kp2wh/dvm4l: 12-13/16 student ranks finish fully_shard, 3-4 hang between
     # START and DONE with NO error. 12 finishing while 4 hang PROVES fully_shard is not
