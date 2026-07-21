@@ -14,8 +14,8 @@ spec:
       nodeSelector:
         node-type: trn3
       resourceClaims:
-        - name: xxl-lnc2-trn3
-          resourceClaimTemplateName: xxl-lnc2-trn3
+        - name: xl-lnc2-trn3
+          resourceClaimTemplateName: xl-lnc2-trn3
       containers:
         - name: rf-distill
           #image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -182,13 +182,13 @@ spec:
               ls -lhR "$FINAL" | head -60
           resources:
             claims:
-              - name: xxl-lnc2-trn3
+              - name: xl-lnc2-trn3
             requests:
-              cpu: 190
-              memory: 1900Gi
+              cpu: 95
+              memory: 950Gi
             limits:
-              cpu: 190
-              memory: 1900Gi
+              cpu: 95
+              memory: 950Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -198,7 +198,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "rf-distill-14b-tp16-probe"
+              value: "rf-distill-14b-tp16-xl"
             # THREE-GROUP placement (SD's proven co-residency fix): each core holds ONE
             # model instead of all three. 64-core LNC2 layout (config teacher_tp/student_tp/
             # fake_tp = 16/32/16): teacher ranks 0-15, student 16-47, critic 48-63. Student
@@ -214,7 +214,7 @@ spec:
               value: "1"
             # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
             - name: NPROC
-              value: "64"            # whole trn2.48xl: 64 NeuronCores @ LNC2 (14B student needs it)
+              value: "32"            # HALF instance: xl-lnc2-trn3 = 8 dev x 4 cores @ LNC2 = 32 cores
             # denoising_step_list (T=4) lives in configs/rolling_forcing_dmd_t4.yaml.
             # Everything else (lr 1.5e-6 / lr_critic 4e-7 / dfake_gen_update_ratio 5 /
             # guidance_scale 3.0 / ema 0.99 from step 200 / batch 1-per-rank) is in that config.
