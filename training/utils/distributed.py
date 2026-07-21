@@ -99,6 +99,19 @@ def fsdp2_wrap_student(model, student_ranks, transformer_layer_cls, student_pg=N
     # (repeat every 300s) so the stuck rank's frame lands in the log. cancel() on success.
     _fh.dump_traceback_later(600, repeat=True, file=_sys.stderr)
 
+    # ── STAGGER (traced from runs vgnr2/njq75) — spread the on-device shard placement ──
+    # faulthandler proved the wedge is _fsdp_param.py:390 _init_sharded_param (new_zeros/
+    # copy_ that place the shard ON NEURON). m.to("cpu") cut it 4->2 but the frame is
+    # unchanged: FSDP2 still does that on-device op, and 16 ranks firing it SIMULTANEOUSLY
+    # race the neuron runtime (nondeterministic: different ranks/blocks each run, no dist.*
+    # in the frame). fully_shard here is NOT a cross-rank barrier (12/16 finished while
+    # others hung), so offsetting each rank's ENTRY is safe -> the per-block device
+    # placements interleave instead of colliding. Offset by local student index.
+    _local_idx = student_ranks.index(_r) if _r in student_ranks else 0
+    _stagger_s = _local_idx * 1.5
+    _dbg(f"student: stagger {_stagger_s:.1f}s before fully_shard (local idx {_local_idx})")
+    _t.sleep(_stagger_s)
+
     nblk = len(m.blocks)
     for i, blk in enumerate(m.blocks):
         fully_shard(blk, mesh=local_mesh, mp_policy=mp, reshard_after_forward=True)
