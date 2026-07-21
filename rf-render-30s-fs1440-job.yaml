@@ -1,0 +1,212 @@
+# Rolling Forcing — 30-SECOND render on trn3 / SDK 2.31: main @ TP4xCP4, fs1440
+#
+# Generation (not benchmark): NO device profiler, NO per-NEFF capture, NO harmony
+# bundle. Just produce 30 s videos and archive them for review.
+#   duration = ((num_output_frames - 1) * 4 + 1) / fps      (Wan causal VAE = 4x temporal)
+#   num_output_frames=120 -> (119*4+1)=477 pixel frames / 16 fps = 29.8 s
+#   120 % num_frame_per_block(3) == 0  (required). Rolling window is BOUNDED
+#   (max_frames = num_denoising_steps * 3 = 15), so KV-cache HBM does NOT grow with
+#   total length — 40 blocks stream within the same window budget as the 7-block run.
+#
+#   - Topology : TP=4 x CP=4 = 16 ranks on m-lnc1-trn3 (same as the benchmark).
+#   - Shape    : latent_w=96 (latent_h=60) => frame_seq_length 1440.
+#   - Entry    : e2e_pipeline.py.  ONLY change vs baseline = --num_output_frames 120.
+#
+# VALIDATE THE OUTPUT: causal streaming can drift over long horizons — eyeball the
+# 30 s mp4 for color shift / motion collapse before trusting it.
+#
+# Launch:
+#   kubectl delete job rf-render-30s-fs1440 --ignore-not-found
+#   kubectl apply -f rf-render-30s-fs1440-job.yaml
+#   kubectl logs -f job/rf-render-30s-fs1440
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rf-render-30s-fs1440
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: rf-render-30s-fs1440
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3
+      resourceClaims:
+        - name: m-lnc1-trn3
+          resourceClaimTemplateName: m-lnc1-trn3
+      containers:
+        - name: render
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euxo pipefail
+
+              BRANCH="${BRANCH:-rf-bench-fs1440-trn3}"
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git
+              cd rolling_forcing
+
+              # ── PROVENANCE ──
+              GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+              echo "┌── PROVENANCE ──"
+              echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
+              echo "│ commit : $GIT_SHA"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+
+              export RF_DEVICE_BACKEND=neuron
+              UVPY="$(command -v python3)"
+              uv pip install --python "$UVPY" \
+                "diffusers==0.37.1" \
+                "transformers==5.8.1" \
+                "huggingface-hub==1.16.4" \
+                "click" \
+                "einops==0.8.2" \
+                "omegaconf==2.3.0" \
+                "ftfy==6.3.1" \
+                "regex==2026.5.9" \
+                "av==17.0.1"
+              uv pip install --python "$UVPY" "setuptools<81"
+              uv pip install --python "$UVPY" git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
+
+              # ─── Model weights: Wan2.1-T2V-1.3B ───
+              WAN_1_3B_TAR="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
+              mkdir -p wan_models
+              if [[ -f "$WAN_1_3B_TAR" ]]; then
+                cp "$WAN_1_3B_TAR" /tmp/Wan2.1-T2V-1.3B.tar
+                tar xf /tmp/Wan2.1-T2V-1.3B.tar -C wan_models/
+                rm -f /tmp/Wan2.1-T2V-1.3B.tar
+              else
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
+                tar cf /tmp/Wan2.1-T2V-1.3B.tar -C wan_models Wan2.1-T2V-1.3B
+                mkdir -p "$(dirname $WAN_1_3B_TAR)"; cp /tmp/Wan2.1-T2V-1.3B.tar "$WAN_1_3B_TAR"; rm -f /tmp/Wan2.1-T2V-1.3B.tar
+              fi
+
+              # ─── RollingForcing DMD checkpoint ───
+              RF_CACHE="/var/mdl/checkpoints/rolling_forcing_dmd.pt"
+              mkdir -p checkpoints
+              if [[ -f "$RF_CACHE" ]]; then
+                cp "$RF_CACHE" checkpoints/rolling_forcing_dmd.pt
+              else
+                python3 -c "from huggingface_hub import hf_hub_download; hf_hub_download('TencentARC/RollingForcing', 'checkpoints/rolling_forcing_dmd.pt', local_dir='.')"
+                mkdir -p "$(dirname $RF_CACHE)"; cp checkpoints/rolling_forcing_dmd.pt "$RF_CACHE"
+              fi
+              echo "Model weights ready!"
+
+              export REPO_DIR=$(pwd)
+              LOCAL_RESULTS="/tmp/results"; mkdir -p "$LOCAL_RESULTS"
+
+              # 30 s @ fps16 => num_output_frames 120 (=(119*4+1)/16 = 29.8 s). Everything
+              # else identical to the fs1440 baseline.
+              NPROC="${NPROC:-16}"
+              LATENT_W="${LATENT_W:-96}"
+              NUM_FRAMES="${NUM_FRAMES:-120}"
+              FPS="${FPS:-16}"
+              CONFIG_PATH="${CONFIG_PATH:-configs/rolling_forcing_dmd_tp4sp4_fs1440.yaml}"
+
+              echo "════════ RF 30 s RENDER (main, TP4xCP4, fs1440, ${NUM_FRAMES} frames) ════════"
+              echo "  expected duration ≈ $(python3 -c "print(f'{((${NUM_FRAMES}-1)*4+1)/${FPS}:.1f}')") s"
+
+              # PROFILE_E2E_PIPELINE=1 -> per-block DiT/VAE/fps lines (cheap perf_counter,
+              # NOT the device profiler). No NEURON_RT_INSPECT / NEURON_PROFILE at all.
+              PROFILE_E2E_PIPELINE=1 \
+                torchrun --nproc_per_node=${NPROC} --master_port=29500 e2e_pipeline.py \
+                  --prompt_file prompts/example_prompts.txt \
+                  --config_path "${CONFIG_PATH}" \
+                  --checkpoint_path checkpoints/rolling_forcing_dmd.pt \
+                  --tp_degree 4 \
+                  --latent_w ${LATENT_W} \
+                  --latent_h 60 \
+                  --num_output_frames ${NUM_FRAMES} \
+                  --chunk-size 3 \
+                  --fps ${FPS} \
+                  --output_folder "$LOCAL_RESULTS/render_out" \
+                  --use_ema 2>&1 | tee "$LOCAL_RESULTS/render.txt" \
+                | grep -iE "T5:|block +[0-9]|fps|FAILED|Error" || echo "RENDER FAILED"
+
+              # ─── persist videos to a timestamped run dir on /var/mdl (S3) ───
+              set +e +o pipefail
+              RUN_TS=$(date +%d%m%y%H%M%S)
+              OUT="/var/mdl/rolling_forcing/runs/render30s_${RUN_TS}"
+              mkdir -p "$OUT/frames"
+              find "$LOCAL_RESULTS/render_out" -name '*.mp4' -exec cp {} "$OUT/frames/" \; 2>/dev/null || true
+              cp "$LOCAL_RESULTS/render.txt" "$OUT/" 2>/dev/null || true
+              NMP4=$(find "$OUT/frames" -name '*.mp4' 2>/dev/null | wc -l)
+              echo "═══════════════════════════════════════════"
+              echo "  Done! 30 s render (main, ${NUM_FRAMES} frames ≈ 29.8 s each)"
+              echo "  videos: $NMP4 mp4(s) -> $OUT/frames/"
+              echo "  VALIDATE THE OUTPUT: check for long-horizon drift (color/motion)."
+              ls -la "$OUT/frames" 2>/dev/null || true
+              echo "═══════════════════════════════════════════"
+          resources:
+            claims:
+              - name: m-lnc1-trn3
+            requests:
+              cpu: 40
+              memory: 400Gi
+              ephemeral-storage: 120Gi
+            limits:
+              cpu: 90
+              memory: 460Gi
+              ephemeral-storage: 200Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "rf-bench-fs1440-trn3"  # main code + fs1440 config (no code change vs main)
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "ERROR"
+            - name: RF_DEVICE_BACKEND
+              value: "neuron"
+            - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
+              value: "0"
+            - name: NEURON_FALLBACK_ENABLED
+              value: "0"
+            - name: NEURON_CC_FLAGS
+              value: "--model-type=transformer"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: USE_NKI_KERNELS
+              value: "true"
+            - name: USE_NEFF_CACHE
+              value: "false"
+            - name: CONFIG_PATH
+              value: "configs/rolling_forcing_dmd_tp4sp4_fs1440.yaml"
+            - name: LATENT_W
+              value: "96"
+            - name: NUM_FRAMES
+              value: "120"
+            - name: FPS
+              value: "16"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
