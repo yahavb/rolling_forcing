@@ -129,13 +129,54 @@ spec:
                   --use_ema 2>&1 | tee "$LOCAL_RESULTS/render.txt" \
                 | grep -iE "T5:|block +[0-9]|fps|FAILED|Error" || echo "RENDER FAILED"
 
-              # ─── persist videos to a timestamped run dir on /var/mdl (S3) ───
               set +e +o pipefail
+
+              # ─── THROUGHPUT SUMMARY (steady-state median) + DRIFT CHECK ───
+              # block N line: "block N: DiT X ms VAE Y ms F frames Z fps". Exclude block 0
+              # of each prompt (cold compile). DiT-only + DiT+VAE median/max. Then split
+              # blocks into first-half vs second-half: if fps DECAYS over the 40-block
+              # stream, that is a red flag for long-horizon quality drift too.
+              echo "════════ THROUGHPUT + DRIFT (${NUM_FRAMES} frames ≈ 29.8 s) ════════"
+              awk '
+                BEGIN{ nd=0; ndv=0 }   # subscripts must start numeric 0, not "" (else dvc[0] is empty)
+                /block +[0-9]+: *DiT/ {
+                  for (i=1;i<=NF;i++){
+                    if ($i=="block"){ blk=$(i+1); sub(":","",blk) }
+                    if ($i=="DiT"){ dit=$(i+1) }
+                    if ($i=="VAE"){ vae=$(i+1) }
+                    if ($i=="frames"){ fr=$(i-1) }
+                  }
+                  if (blk+0>0 && dit+0>0){
+                    d[nd++]=fr*1000.0/dit
+                    if (vae+0>0){ dv[ndv]=fr*1000.0/(dit+vae); dvc[ndv]=dv[ndv]; ndv++ }
+                  }
+                }
+                # med() sorts a COPY (passed array) — do NOT pass dvc[] (drift needs
+                # chronological order). med(d,..)/med(dv,..) sort d[]/dv[] destructively,
+                # which is fine since we do not reuse them chronologically.
+                function med(a,n,  i,j,t){ for(i=0;i<n;i++)for(j=i+1;j<n;j++)if(a[j]<a[i]){t=a[i];a[i]=a[j];a[j]=t} return (n%2)?a[int(n/2)]:(a[n/2-1]+a[n/2])/2 }
+                function mx(a,n,  i,m){ m=0; for(i=0;i<n;i++)if(a[i]>m)m=a[i]; return m }
+                function mean(a,lo,hi,  i,s){ s=0; for(i=lo;i<hi;i++)s+=a[i]; return (hi>lo)?s/(hi-lo):0 }
+                END{
+                  if(nd==0){ print "  no per-block DiT lines found"; exit }
+                  printf "  DiT-only : median %6.2f fps | max %6.2f fps   (over %d blocks)\n", med(d,nd), mx(d,nd), nd
+                  if(ndv>0) printf "  DiT+VAE  : median %6.2f fps | max %6.2f fps   (over %d blocks)\n", med(dv,ndv), mx(dv,ndv), ndv
+                  # drift on dvc[] = UNSORTED chronological copy (dv[] was sorted by med())
+                  if(ndv>=4){
+                    h=int(ndv/2); f=mean(dvc,0,h); s=mean(dvc,h,ndv)
+                    printf "  DRIFT    : 1st-half %6.2f fps  vs  2nd-half %6.2f fps  (%+.1f%%)\n", f, s, (f>0?(s-f)/f*100:0)
+                    print  "             (large negative % = fps decaying over the stream -> inspect video for quality drift)"
+                  }
+                }' "$LOCAL_RESULTS/render.txt" | tee "$LOCAL_RESULTS/throughput.txt"
+              echo "═════════════════════════════════════════════════════════"
+
+              # ─── persist videos to a timestamped run dir on /var/mdl (S3) ───
               RUN_TS=$(date +%d%m%y%H%M%S)
               OUT="/var/mdl/rolling_forcing/runs/render30s_${RUN_TS}"
               mkdir -p "$OUT/frames"
               find "$LOCAL_RESULTS/render_out" -name '*.mp4' -exec cp {} "$OUT/frames/" \; 2>/dev/null || true
-              cp "$LOCAL_RESULTS/render.txt" "$OUT/" 2>/dev/null || true
+              cp "$LOCAL_RESULTS/render.txt"     "$OUT/" 2>/dev/null || true
+              cp "$LOCAL_RESULTS/throughput.txt" "$OUT/" 2>/dev/null || true
               NMP4=$(find "$OUT/frames" -name '*.mp4' 2>/dev/null | wc -l)
               echo "═══════════════════════════════════════════"
               echo "  Done! 30 s render (main, ${NUM_FRAMES} frames ≈ 29.8 s each)"
