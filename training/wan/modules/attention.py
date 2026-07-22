@@ -17,6 +17,16 @@ FLASH_ATTN_2_AVAILABLE = False
 # ─── NKI Kernel Loading ─────────────────────────────────────────────────────
 USE_NKI_KERNELS = os.environ.get("USE_NKI_KERNELS", "1") == "1"
 
+# ATTN_DTYPE: override the attention compute dtype. Default unset -> attention()'s
+# bf16 arg is used (training/inference UNCHANGED). Set to "fp32" for the CPU/gloo
+# numerical-parity harness (validate_student_cpu.py), which needs TRUE fp32 through
+# the SDPA fallback — attention() otherwise casts q/k/v to bf16 even on fp32 models,
+# and the NKI kernels are bf16-only (so the harness also sets USE_NKI_KERNELS=0).
+_ATTN_DTYPE_ENV = {"fp32": torch.float32, "float32": torch.float32,
+                   "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+                   "fp16": torch.float16}.get(
+    os.environ.get("ATTN_DTYPE", "").lower())
+
 _nki_cross_attn = None
 _nki_self_attn = None
 _NKI_CROSS_AVAILABLE = False
@@ -165,10 +175,13 @@ def attention(
             'It can have a significant impact on performance.'
         )
     
-    q = q.transpose(1, 2).to(dtype)
-    k = k.transpose(1, 2).to(dtype)
-    v = v.transpose(1, 2).to(dtype)
-    
+    # ATTN_DTYPE env overrides the compute dtype (fp32 parity harness); else use the
+    # caller's dtype arg (bf16 default -> training/inference unchanged).
+    compute_dtype = _ATTN_DTYPE_ENV if _ATTN_DTYPE_ENV is not None else dtype
+    q = q.transpose(1, 2).to(compute_dtype)
+    k = k.transpose(1, 2).to(compute_dtype)
+    v = v.transpose(1, 2).to(compute_dtype)
+
     out = F.scaled_dot_product_attention(
         q, k, v, attn_mask=None, is_causal=causal, dropout_p=dropout_p)
     

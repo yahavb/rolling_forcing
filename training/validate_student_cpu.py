@@ -5,29 +5,36 @@ DMD recipe we must rule out a HARDWARE-accuracy bug — i.e. that the on-device 
 compute (NKI flash attn, RoPE, bf16 rounding, FSDP gather) diverges from correct math.
 
 This runs ONE student rollout (noise -> x0) on a chosen device, with a FIXED seed and
-FIXED inputs, and writes x0 + per-block diagnostics to a .pt. Run it twice:
+FIXED inputs, and writes x0 + diagnostics to a .pt. BOTH runs compute in TRUE fp32
+(see below), so any diff is the compute path — NOT bf16 rounding. Run it twice, then
+diff. Outputs + embeds MUST live on the shared PVC so both runs read identical bytes:
 
-    # on the trn3 pod (on-device, bf16):
-    DEVICE=neuron DTYPE=bf16 python3 validate_student_cpu.py \
+    # 1) on the trn3 pod (Neuron eager backend, fp32, NKI OFF):
+    DEVICE=neuron python3 validate_student_cpu.py \
         --config ../configs/rolling_forcing_dmd_t4.yaml \
-        --ckpt /var/mdl/rolling_forcing/distill/<TS>/model.iter200.pt \
-        --embeds /tmp/embeds.pt --out /tmp/parity.neuron.pt
+        --ckpt   /var/mdl/rolling_forcing/distill/<TS>/model.iter200.pt \
+        --embeds /var/mdl/rolling_forcing/distill/<TS>/embeds.pt \
+        --out    /var/mdl/rolling_forcing/distill/<TS>/parity.neuron.pt
 
-    # on ANY box with the repo + weights (CPU reference, fp32 — SLOW but exact):
-    DEVICE=cpu DTYPE=fp32 python3 validate_student_cpu.py \
+    # 2) CPU reference (fp32 — SLOW but exact; NO Neuron SDK needed, any box w/ repo+weights):
+    DEVICE=cpu python3 validate_student_cpu.py \
         --config ../configs/rolling_forcing_dmd_t4.yaml \
-        --ckpt /var/mdl/rolling_forcing/distill/<TS>/model.iter200.pt \
-        --embeds /tmp/embeds.pt --out /tmp/parity.cpu.pt
+        --ckpt   /var/mdl/rolling_forcing/distill/<TS>/model.iter200.pt \
+        --embeds /var/mdl/rolling_forcing/distill/<TS>/embeds.pt \
+        --out    /var/mdl/rolling_forcing/distill/<TS>/parity.cpu.pt
 
-    # then diff the two:
-    python3 validate_student_cpu.py --diff /tmp/parity.cpu.pt /tmp/parity.neuron.pt
+    # 3) offline diff (reads both .pt from the PVC; run anywhere):
+    python3 validate_student_cpu.py --diff .../parity.cpu.pt .../parity.neuron.pt
 
 DESIGN
 - Single process, NO torch.distributed, NO FSDP. Loads the FULL (already-gathered)
   `generator` state dict from the checkpoint straight into one WanDiffusionWrapper.
-- The compute path is IDENTICAL to training: wan/modules/attention.py:attention()
-  branches on device.type=="neuron" (NKI) vs else (F.scaled_dot_product_attention),
-  so `cpu` is a faithful reference for the on-device kernels.
+- TRUE fp32 on BOTH: at module top we set ATTN_DTYPE=fp32 (attention() otherwise casts
+  q/k/v to bf16 even on an fp32 model) and USE_NKI_KERNELS=0 (the NKI attn kernels are
+  bf16-only). So the Neuron run takes the SAME fp32 SDPA path as CPU -> apples-to-apples.
+  SCOPE NOTE: this validates the Neuron EAGER backend (matmuls, RoPE, norms, scheduler),
+  NOT the NKI kernels (fp32 bypasses them). Validate the kernels separately with a bf16
+  run: DTYPE=bf16 USE_NKI_KERNELS=1 ATTN_DTYPE=bf16.
 - Scope = the 1.3B student ONLY. The 14B teacher needs its TP group and does not fit a
   single core; the student's own noise->x0 forward is what produces the blurry frames,
   so it is the right thing to validate first.
@@ -37,6 +44,14 @@ DESIGN
 import argparse
 import os
 import sys
+
+# TRUE fp32 parity: force the SDPA attention fallback to compute in fp32 (attention()
+# otherwise casts q/k/v to bf16 even on an fp32 model), and DISABLE the bf16-only NKI
+# kernels so the Neuron run takes the same fp32 SDPA path as CPU. Both must be set
+# BEFORE importing wan.modules.attention (they're read at import time). Overridable:
+# pass DTYPE=bf16 + USE_NKI_KERNELS=1 explicitly to instead validate the NKI kernels.
+os.environ.setdefault("ATTN_DTYPE", "fp32")
+os.environ.setdefault("USE_NKI_KERNELS", "0")
 
 import torch
 
@@ -173,10 +188,13 @@ def diff(a_path, b_path):
     cos = torch.nn.functional.cosine_similarity(
         xa.flatten().unsqueeze(0), xb.flatten().unsqueeze(0)).item()
     print(f"  cosine sim      : {cos:.6f}")
-    # bf16 has ~3 decimal digits; a correct kernel typically lands mean-rel < ~2e-2 and
-    # cosine > ~0.999. Much worse => the on-device compute is the accuracy culprit.
-    verdict = ("LIKELY OK (bf16-rounding-level diff)" if cos > 0.999 and rel.mean() < 2e-2
-               else "SUSPECT — on-device compute diverges beyond bf16 rounding")
+    # fp32-vs-fp32: a correct Neuron eager backend should match CPU very tightly —
+    # cosine > ~0.9999 and mean-rel < ~1e-3 (residual = fp32 op-order/accumulation
+    # differences only). Looser than that => the on-device eager compute diverges and
+    # is a real accuracy culprit. (If this was a bf16 NKI run instead, expect the
+    # looser cosine > 0.999 / mean-rel < 2e-2 band — judge accordingly.)
+    verdict = ("LIKELY OK (fp32 op-order-level diff)" if cos > 0.9999 and rel.mean() < 1e-3
+               else "SUSPECT — on-device compute diverges beyond fp32 op-order noise")
     print(f"  VERDICT         : {verdict}")
 
 
@@ -188,6 +206,9 @@ def main():
     ap.add_argument("--out", default="/tmp/parity.pt")
     ap.add_argument("--device", default=os.environ.get("DEVICE", "cpu"),
                     choices=["cpu", "neuron"])
+    # DEFAULT fp32 on BOTH devices (parity requirement). The Neuron run is genuine
+    # fp32 because ATTN_DTYPE=fp32 + USE_NKI_KERNELS=0 (set at module top) route it
+    # through the fp32 SDPA fallback instead of the bf16-only NKI kernels.
     ap.add_argument("--dtype", default=os.environ.get("DTYPE", "fp32"),
                     choices=["fp32", "bf16", "fp16"])
     ap.add_argument("--prompt", default=None, help="prompt text; default = first in embeds")
