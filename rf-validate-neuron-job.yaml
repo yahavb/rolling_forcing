@@ -1,0 +1,133 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rf-validate-neuron
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: rf-validate-neuron
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3
+      # Own SMALL core claim — does NOT touch the training pod (which holds all its
+      # cores; a 2nd Neuron process there fails with "cores busy Available:0").
+      resourceClaims:
+        - name: m-lnc1-trn3
+          resourceClaimTemplateName: m-lnc1-trn3
+      containers:
+        - name: rf-validate-neuron
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              : "${CKPT:?set CKPT to a checkpoint path on the PVC}"
+              OUTDIR="$(dirname "$CKPT")"
+              EMB="$OUTDIR/embeds.pt"                       # SAME file the CPU run used
+              OUT="$OUTDIR/parity.neuron.pt"
+
+              BRANCH="${BRANCH:-rf-distill-trn3-pin-neuronx}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git REPO
+              cd REPO
+              echo "┌── PROVENANCE ──"
+              echo "│ JOB    : rf-validate-neuron (fp32 on-device parity)  pod=$(hostname)"
+              echo "│ branch : $(git rev-parse --abbrev-ref HEAD)  commit: $(git rev-parse HEAD)"
+              echo "│ CKPT   : $CKPT"
+              echo "└────────────────"
+
+              # ─── deps (mirror the trn3-pin distill job) ───
+              UVPY="$(command -v python3)"
+              uv pip install --python "$UVPY" \
+                "diffusers==0.31.0" "transformers>=4.49.0" "tokenizers>=0.20.3" \
+                "accelerate>=1.1.1" "huggingface_hub[cli]" \
+                "omegaconf" "einops" "ftfy" "regex" "easydict" "tensorboard" \
+                "imageio" "imageio-ffmpeg" "av" "lmdb" "wandb"
+
+              # ─── FSDP2 WEDGE PIN: editable-install torch-neuronx 1278 (matches how the
+              #     checkpoint was trained; the image ships 1417). See rf-distill-trn3-pin-job.yaml. ───
+              TNX_PVC=/var/mdl/rolling_forcing/tnx-1278-src
+              test -d "$TNX_PVC" || { echo "MISSING $TNX_PVC"; exit 1; }
+              TNX_SRC=/tmp/tnx-1278-src
+              rm -rf "$TNX_SRC"; cp -r "$TNX_PVC" "$TNX_SRC"
+              uv pip install --python "$UVPY" -e "$TNX_SRC"
+              echo "torch_neuronx: $(python3 -c 'import torch_neuronx;print(torch_neuronx.__version__)')"
+
+              # ─── 1.3B weights (student base) ───
+              WAN13_TAR="/var/mdl/rolling_forcing/Wan2.1-T2V-1.3B.tar"
+              test -f "$WAN13_TAR" || { echo "MISSING $WAN13_TAR on PVC"; exit 1; }
+              mkdir -p wan_models && tar xf "$WAN13_TAR" -C wan_models/
+
+              CONFIG="${CONFIG:-../configs/rolling_forcing_dmd_t4.yaml}"
+              cd training
+              for d in prompts checkpoints wan_models; do ln -sfn ../$d ./$d; done
+
+              test -f "$EMB" || { echo "MISSING embeds $EMB — run the CPU job first (it writes them)"; exit 1; }
+              echo "Using PVC embeds: $EMB"
+
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
+
+              # ─── fp32 on-device rollout (ATTN_DTYPE=fp32 + USE_NKI_KERNELS=0 set by the
+              #     harness -> Neuron EAGER backend, same fp32 SDPA path as CPU). ───
+              echo "Running fp32 Neuron parity rollout..."
+              DEVICE=neuron python3 validate_student_cpu.py \
+                --config "$CONFIG" --ckpt "$CKPT" --embeds "$EMB" --out "$OUT" \
+                ${EMA:+--ema} --seed "${SEED:-0}"
+
+              # ─── diff right here (both .pt now on the PVC) ───
+              echo "=== DIFF (cpu reference vs neuron) ==="
+              python3 validate_student_cpu.py --diff "$OUTDIR/parity.cpu.pt" "$OUT" \
+                || echo "(diff skipped — parity.cpu.pt missing? run the CPU job)"
+          resources:
+            claims:
+              - name: m-lnc1-trn3
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: CKPT
+              value: "/var/mdl/rolling_forcing/distill/202607220649/model.iter200.pt"
+            - name: BRANCH
+              value: "rf-distill-trn3-pin-neuronx"
+            - name: CONFIG
+              value: "../configs/rolling_forcing_dmd_t4.yaml"
+            - name: SEED
+              value: "0"
+            # - name: EMA
+            #   value: "1"
+            # Neuron runtime (mirrors the distill job). NO NEURON_LOGICAL_NC_CONFIG.
+            - name: NEURON_FALLBACK_ENABLED
+              value: "0"
+            - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
+              value: "0"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
