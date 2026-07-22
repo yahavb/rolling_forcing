@@ -142,8 +142,10 @@ def run(args):
     print(f"[roll] noise {tuple(noise.shape)}  frames={n_frames}  steps={list(dsl)}")
 
     with torch.no_grad():
-        x0 = pipeline.inference_with_rolling_forcing(noise=noise, **cond)
+        out = pipeline.inference_with_rolling_forcing(noise=noise, **cond)
 
+    # inference_with_rolling_forcing returns (output, denoised_ts_from, denoised_ts_to)
+    x0 = out[0] if isinstance(out, tuple) else out
     x0c = x0.detach().to("cpu", torch.float32)
     stats = {
         "x0": x0c,
