@@ -34,7 +34,7 @@ spec:
               # ── PROVENANCE ──
               GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
               echo "┌── PROVENANCE ──"
-              echo "│ JOB    : rf-distill (T=4 DMD distillation)  pod=$(hostname)"
+              echo "│ JOB    : rf-distill (T=5 DMD distillation)  pod=$(hostname)"
               echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
               echo "│ commit : $GIT_SHA"
               echo "│ subject: $(git log -1 --pretty=%s)"
@@ -134,10 +134,10 @@ spec:
               fi
 
               # 4) training prompts (data-free distillation input)
-              # PROOF-OF-CONCEPT: the T=4 config's data_path is prompts/distill_poc_single.txt
+              # PROOF-OF-CONCEPT: the T=5 config's data_path is prompts/distill_poc_single.txt
               # (example prompt 000, the western/horse shot) — it ships in the repo clone, so no
               # download is needed. To distill a BROADER model, set PROMPTS_SRC to a file on the
-              # PVC (e.g. the full vidprom corpus) and change data_path in the T=4 config to match.
+              # PVC (e.g. the full vidprom corpus) and change data_path in the T=5 config to match.
               if [[ -n "${PROMPTS_SRC:-}" && -f "${PROMPTS_SRC}" ]]; then
                 echo "Using PROMPTS_SRC override: $PROMPTS_SRC"
                 mkdir -p prompts && cp "$PROMPTS_SRC" prompts/"$(basename "$PROMPTS_SRC")"
@@ -185,8 +185,8 @@ spec:
 
               # ─── DMD distillation train ───
               # torchrun over all 16 ranks. Training entrypoint is the vendored training/train.py.
-              # Config = T=4 (configs/rolling_forcing_dmd_t4.yaml): the ONLY recipe change vs the
-              # shipped T=5 run is the 4-entry denoising_step_list.
+              # Config = T=5 (configs/rolling_forcing_dmd_t4.yaml): 5-entry denoising_step_list
+              # [1000,800,600,400,200] — matches the shipped/proven-fast T=5 serving point.
               export PRECOMPUTED_EMBEDS="$EMB"
               torchrun \
                 --nproc_per_node="${NPROC:-16}" \
@@ -238,7 +238,7 @@ spec:
             # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
             - name: NPROC
               value: "16"            # all 16 NeuronCores (2 chips x 8, LNC=1)
-            # denoising_step_list (T=4) lives in configs/rolling_forcing_dmd_t4.yaml.
+            # denoising_step_list (T=5) lives in configs/rolling_forcing_dmd_t4.yaml.
             # Everything else (lr 1.5e-6 / lr_critic 4e-7 / dfake_gen_update_ratio 5 /
             # guidance_scale 3.0 / ema 0.99 from step 200 / batch 1-per-rank) is in that config.
             # ── Neuron runtime (mirrors this repo's inference jobs). NO NEURON_LOGICAL_NC_CONFIG. ──
