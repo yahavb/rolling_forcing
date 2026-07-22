@@ -66,15 +66,27 @@ spec:
               #   torch      2.11.0             IDENTICAL in both images
               #   torch-neuronx 1278 (WORKS) -> 1417 (WEDGES)   <- prime suspect
               #   neuronx-cc    2.25 (WORKS) -> 2.26 (WEDGES)
-              # This 2.31 image ships torch-neuronx 1417 (needed only for the trn3 DRIVER,
-              # which fixed ucode:6). Pin torch-neuronx back to 1278 — the version that
-              # trained cleanly — while KEEPING the 2.31 image's NRT driver for trn3.
-              # neuronx-cc left at 2.26 (wedge frame is an EAGER tensor op, not a NEFF, so
-              # torch-neuronx is the sharpest single-variable test). If it still wedges,
-              # add "neuronx-cc==2.25.1280" here too.
-              # RISK: torch-neuronx 1278 vs the image's NRT 2.32.19 may be incompatible ->
-              # would fail at nrt_init (clean pass/fail, not a wedge).
-              uv pip install --python "$UVPY" "torch-neuronx==2.11.3.0.1278"
+              # 1278 is NOT on PyPI or the Neuron pip index (pip resolve failed: "no version
+              # ... unsatisfiable"); it's an EDITABLE build baked into the old concourse image.
+              # We copied its FULL source tree from the old-image pod (rf-distill-trn2-t5nj7)
+              # to the shared PVC: /var/mdl/rolling_forcing/tnx-1278-src (= /workspace/
+              # torch_neuron_eager, incl torch_neuronx/_C.so). Editable-install it here to
+              # reproduce exactly how the old image had 1278, overriding this image's 1417.
+              # Keeps the 2.31 image's NRT driver (needed for trn3 / fixes ucode:6); cc left 2.26.
+              # NOTE: _C.so is compiled vs the OLD image's NRT. The old image's runtime-lib deb
+              # was ALSO 2.32.19 (same as this image) -> ABI likely compatible. If not, it fails
+              # at IMPORT (clean error, not a wedge) — which itself answers if a swap is viable.
+              TNX_PVC=/var/mdl/rolling_forcing/tnx-1278-src
+              test -d "$TNX_PVC" || { echo "MISSING $TNX_PVC — copy /workspace/torch_neuron_eager from old pod first"; exit 1; }
+              echo "before: $(python3 -c 'import torch_neuronx;print(torch_neuronx.__version__)' 2>/dev/null)"
+              # Copy the source tree to LOCAL disk before `-e`: /var/mdl is the S3-backed PVC
+              # and `setup.py egg_info` failed there with "Cannot update time stamp of directory
+              # torch_neuronx.egg-info" (S3 mount has no utime). /tmp is local -> egg_info works.
+              # The tree already ships the prebuilt torch_neuronx/_C.so, so `-e` does NOT rebuild.
+              TNX_SRC=/tmp/tnx-1278-src
+              rm -rf "$TNX_SRC"; cp -r "$TNX_PVC" "$TNX_SRC"
+              uv pip install --python "$UVPY" -e "$TNX_SRC"
+              echo "after: $(python3 -c 'import torch_neuronx;print("loaded",torch_neuronx.__version__)')"
               # lmdb + wandb: trainer/__init__.py eagerly imports ALL trainers
               # (diffusion/gan import wandb; dataset.py imports lmdb) even though we
               # only run score_distillation with --disable-wandb. Verified the full
