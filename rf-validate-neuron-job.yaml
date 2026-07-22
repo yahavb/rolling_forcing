@@ -53,10 +53,26 @@ spec:
 
               # ─── FSDP2 WEDGE PIN: editable-install torch-neuronx 1278 (matches how the
               #     checkpoint was trained; the image ships 1417). See rf-distill-trn3-pin-job.yaml. ───
+              # /var/mdl is S3-FUSE (NOT posix): `cp -r` of the 1278 tree = thousands of
+              # tiny per-file S3 GETs -> WEDGES ~indefinitely. Cache the tree as ONE tar
+              # (a single S3 object -> one streamed read) and extract LOCALLY to /tmp.
+              # First run builds+caches the tar from the dir (one-time slow); later runs
+              # just stream the single object.
               TNX_PVC=/var/mdl/rolling_forcing/tnx-1278-src
-              test -d "$TNX_PVC" || { echo "MISSING $TNX_PVC"; exit 1; }
+              TNX_TAR=/var/mdl/rolling_forcing/tnx-1278-src.tar.gz
               TNX_SRC=/tmp/tnx-1278-src
-              rm -rf "$TNX_SRC"; cp -r "$TNX_PVC" "$TNX_SRC"
+              rm -rf "$TNX_SRC"; mkdir -p "$TNX_SRC"
+              if [[ -f "$TNX_TAR" ]]; then
+                echo "Extracting torch-neuronx 1278 from single tar (fast S3 read)..."
+                tar xzf "$TNX_TAR" -C "$TNX_SRC" --strip-components=1
+              else
+                test -d "$TNX_PVC" || { echo "MISSING $TNX_PVC and $TNX_TAR"; exit 1; }
+                echo "One-time: building $TNX_TAR from the dir tree (slow), caching to PVC..."
+                cp -r "$TNX_PVC"/. "$TNX_SRC"/
+                tar czf /tmp/tnx.tgz -C "$TNX_SRC" .
+                cp /tmp/tnx.tgz "$TNX_TAR" && rm -f /tmp/tnx.tgz
+                echo "cached $TNX_TAR for future runs"
+              fi
               uv pip install --python "$UVPY" -e "$TNX_SRC"
               echo "torch_neuronx: $(python3 -c 'import torch_neuronx;print(torch_neuronx.__version__)')"
 
