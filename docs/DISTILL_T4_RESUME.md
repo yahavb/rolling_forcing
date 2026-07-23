@@ -6,6 +6,41 @@ the open question is **convergence**.
 
 ---
 
+## LATEST (2026-07-22) — HARDWARE RULED OUT: blur is the RECIPE, not Neuron compute
+
+CPU↔Neuron fp32 numerical-parity check on the 1.3B student (ckpt
+`distill/202607220649/model.iter200.pt`). Ran ONE student rollout (noise→x0), fixed
+seed 0, TRUE fp32 on BOTH paths, and diffed the x0 tensors:
+
+| metric | value |
+|---|---|
+| cosine sim | **1.000005** |
+| mean rel err | **0.000136** |
+| mean \|A−B\| | 0.000018 |
+| max \|A−B\| | 0.0012 (on a [-2.79, 3.06] range) |
+| A vs B mean/std | 0.12178/1.16651 vs 0.12179/1.16651 |
+
+**VERDICT: the on-device compute is CORRECT** — matmuls, RoPE, norms, scheduler math
+all match CPU to op-order noise. So the blur + non-convergence is the **DMD recipe /
+training dynamics**, NOT a hardware-accuracy bug. (Consistent with the training log:
+`dmdnorm_avg50` flat ~0.46, `grad_norm` oscillating — recipe-shaped, not corrupted.)
+
+- SCOPE: this validated the Neuron EAGER backend in fp32. It did NOT test the bf16 NKI
+  attention kernels (fp32 bypasses them). To also rule those out: a separate bf16 run
+  (`DTYPE=bf16 USE_NKI_KERNELS=1 ATTN_DTYPE=bf16`). Given the eager path is clean and the
+  failure is recipe-shaped, chase the recipe first.
+- HOW (reproduce): `training/validate_student_cpu.py` (single-process, no FSDP/dist;
+  forces true fp32 via `ATTN_DTYPE=fp32` + `USE_NKI_KERNELS=0`). Two k8s jobs run it
+  off the training pod so the pod stays free:
+  - `rf-validate-cpu-job.yaml` — m5 CPU node, no Neuron SDK; precomputes embeds to the
+    PVC + writes `parity.cpu.pt`.
+  - `rf-validate-neuron-job.yaml` — own `m-lnc1-trn3` claim (NOT the training pod, which
+    holds all its cores); reads the SAME PVC embeds, writes `parity.neuron.pt`, diffs.
+  - Both read/write ONE tar object on `/var/mdl` (S3-FUSE) — never `cp -r` a dir there
+    (a 2275-file tree wedged a pod 36 min). See the S3-PVC memory / skill HARD RULE.
+- NEXT on the recipe (documented drift, check in this order): grad_accum, ema decay/start,
+  the 16-bucket timestep sampling vs upstream's continuous, generator lr / critic balance.
+
 ## LATEST (2026-07-13) — render/quality findings, read FIRST
 
 - **Quality verdict: our T=4 distilled model is BLURRY, undertrained. NOT usable yet.**
