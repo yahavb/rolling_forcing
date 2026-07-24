@@ -32,7 +32,7 @@ training/
 This works because the k8s manifest launches the job as:
 
 ```
-cd training && torchrun ... train.py -- --config_path ../configs/rolling_forcing_dmd_t4.yaml --logdir $RUN --disable-wandb
+cd training && torchrun ... train.py -- --config_path ../configs/rolling_forcing_dmd_t5.yaml --logdir $RUN --disable-wandb
 ```
 
 With `cwd = training/`, Python puts `training/` on `sys.path`, so the top-level
@@ -55,7 +55,7 @@ were needed by honoring the `cd training` launch contract.
 ```bash
 cd training
 torchrun --nnodes=1 --nproc_per_node=<N_NEURONCORES> train.py \
-    --config_path ../configs/rolling_forcing_dmd_t4.yaml \
+    --config_path ../configs/rolling_forcing_dmd_t5.yaml \
     --logdir "$RUN" \
     --disable-wandb
 ```
@@ -78,12 +78,12 @@ Run it ONCE on CPU (single process), then point training at the `.pt`:
 cd training
 # 1) precompute (CPU, 1 process) — reads data_path + negative_prompt from the config
 python3 precompute_embeds.py \
-    --config_path ../configs/rolling_forcing_dmd_t4.yaml \
+    --config_path ../configs/rolling_forcing_dmd_t5.yaml \
     --out /tmp/embeds.pt
 
 # 2) train with T5 removed from device
 PRECOMPUTED_EMBEDS=/tmp/embeds.pt torchrun ... train.py \
-    --config_path ../configs/rolling_forcing_dmd_t4.yaml --logdir "$RUN" --disable-wandb
+    --config_path ../configs/rolling_forcing_dmd_t5.yaml --logdir "$RUN" --disable-wandb
 ```
 
 - **Flag names (match the manifest):** `precompute_embeds.py` takes
@@ -257,7 +257,7 @@ host). The following need validation on real hardware:
    consider `text_encoder_cpu_offload` / gradient checkpointing (already on via
    `gradient_checkpointing: true`).
 
-5. **`../configs/rolling_forcing_dmd_t4.yaml` is MISSING** from this repo's
+5. **`../configs/rolling_forcing_dmd_t5.yaml` is MISSING** from this repo's
    `configs/` at the time of this port. The manifest passes it by relative path.
    It must be created (in this repo's inference `configs/` dir — outside this
    `training/` package) before the job will run. It should mirror

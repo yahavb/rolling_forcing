@@ -391,6 +391,6 @@ and memory notes.
   FSDP1/FSDP2 (leak/flat), per-block vs whole-model wrap (5.287 GB spike), functional attn
   on/off (CheckpointError). Each row = remove-one-and-it-breaks.
 
-**Reproducibility appendix:** the config (`configs/rolling_forcing_dmd_t4.yaml`), the job
+**Reproducibility appendix:** the config (`configs/rolling_forcing_dmd_t5.yaml`), the job
 (`rf-distill-job.yaml`: `DISTILL_THREE_GROUP=1`, `DISTILL_FUNCTIONAL_ATTN=1`, `NPROC=16`,
 `l-trn2`), and the commit index (§10).

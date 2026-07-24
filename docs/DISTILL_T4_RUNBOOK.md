@@ -28,7 +28,7 @@ config change + a Neuron recompile — no inference code changes.
 
 | File | Role |
 |------|------|
-| `configs/rolling_forcing_dmd_t4.yaml` | T=4 training/inference config (4-entry `denoising_step_list`) |
+| `configs/rolling_forcing_dmd_t5.yaml` | T=4 training/inference config (4-entry `denoising_step_list`) |
 | `training/` | vendored + Neuron-adapted upstream DMD training stack (see `training/README.md`) |
 | `rf-distill-job.yaml` | Trn2 k8s Job: stage weights → precompute embeds → torchrun DMD training → mirror ckpts to S3 |
 
@@ -97,7 +97,7 @@ vidprom corpus (and set `PROMPTS_SRC` if staging from the PVC).
    `rf-deploy.yaml`:
    ```yaml
    - name: CONFIG_PATH
-     value: "configs/rolling_forcing_dmd_t4.yaml"
+     value: "configs/rolling_forcing_dmd_t5.yaml"
    - name: CHECKPOINT_PATH
      value: "checkpoints/rolling_forcing_dmd_t4.pt"
    ```

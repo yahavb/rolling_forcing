@@ -121,7 +121,7 @@ training dynamics**, NOT a hardware-accuracy bug. (Consistent with the training 
   `dist.broadcast` (Neuron has no P2P).
 - **Key env (in `rf-distill-job.yaml`):** `DISTILL_THREE_GROUP=1`, `DISTILL_FUNCTIONAL_ATTN=1`,
   `NPROC=16`, `NEURON_FALLBACK_ENABLED=1`, `NEURON_LAUNCH_BLOCKING=1`.
-- **Config `configs/rolling_forcing_dmd_t4.yaml`:** `num_training_frames: 6` (2 blocks),
+- **Config `configs/rolling_forcing_dmd_t5.yaml`:** `num_training_frames: 6` (2 blocks),
   `grad_accum: 1`, `gradient_checkpointing: true`, `dfake_gen_update_ratio: 5`, `warmup: 10`,
   `denoising_step_list: [1000,750,500,250]` (T=4), `guidance_scale: 3.0`, `lr: 1.5e-6`,
   `lr_critic: 4e-7`, `tp_degree: 4` (+ implicit teacher_tp=8/student_tp=4/fake_tp=4 in trainer).

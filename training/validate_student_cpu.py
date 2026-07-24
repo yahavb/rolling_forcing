@@ -11,14 +11,14 @@ diff. Outputs + embeds MUST live on the shared PVC so both runs read identical b
 
     # 1) on the trn3 pod (Neuron eager backend, fp32, NKI OFF):
     DEVICE=neuron python3 validate_student_cpu.py \
-        --config ../configs/rolling_forcing_dmd_t4.yaml \
+        --config ../configs/rolling_forcing_dmd_t5.yaml \
         --ckpt   /var/mdl/rolling_forcing/distill/<TS>/model.iter200.pt \
         --embeds /var/mdl/rolling_forcing/distill/<TS>/embeds.pt \
         --out    /var/mdl/rolling_forcing/distill/<TS>/parity.neuron.pt
 
     # 2) CPU reference (fp32 — SLOW but exact; NO Neuron SDK needed, any box w/ repo+weights):
     DEVICE=cpu python3 validate_student_cpu.py \
-        --config ../configs/rolling_forcing_dmd_t4.yaml \
+        --config ../configs/rolling_forcing_dmd_t5.yaml \
         --ckpt   /var/mdl/rolling_forcing/distill/<TS>/model.iter200.pt \
         --embeds /var/mdl/rolling_forcing/distill/<TS>/embeds.pt \
         --out    /var/mdl/rolling_forcing/distill/<TS>/parity.cpu.pt
@@ -202,7 +202,7 @@ def diff(a_path, b_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="../configs/rolling_forcing_dmd_t4.yaml")
+    ap.add_argument("--config", default="../configs/rolling_forcing_dmd_t5.yaml")
     ap.add_argument("--ckpt")
     ap.add_argument("--embeds", default=os.environ.get("PRECOMPUTED_EMBEDS", "/tmp/embeds.pt"))
     ap.add_argument("--out", default="/tmp/parity.pt")
