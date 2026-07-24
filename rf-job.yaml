@@ -2,7 +2,6 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: rolling-forcing
-  namespace: default
 spec:
   backoffLimit: 0
   template:
@@ -12,14 +11,14 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        node-type: trn3
+        node-type: trn3-dev1
       resourceClaims:
-        - name: m-lnc1-trn3
-          resourceClaimTemplateName: m-lnc1-trn3
+        - name: neurons
+          resourceClaimTemplateName: m-lnc1
       containers:
         - name: inference
-          #image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
-          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          #image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash
@@ -235,19 +234,15 @@ spec:
               ls -la "$ARCHIVE_DIR/" 2>/dev/null || true
           resources:
             claims:
-              - name: m-lnc1-trn3
-            # Sized for 4 pods/node (64 NeuronCores / 16 per pod = 4). Node has ~191 cpu,
-            # ~1957Gi mem, ~1.84Ti ephemeral. Requests kept under node/4 so the scheduler
-            # can pack all 4; limits allow bursting. ephemeral-storage set explicitly to
-            # avoid disk-pressure eviction (Exit 137) — /tmp holds model tar + NEFF cache.
+              - name: neurons
             requests:
-              cpu: 40
-              memory: 400Gi
-              ephemeral-storage: 120Gi
+              cpu: 30
+              memory: 250Gi
+              ephemeral-storage: 250Gi
             limits:
-              cpu: 90
-              memory: 460Gi
-              ephemeral-storage: 200Gi
+              cpu: 30
+              memory: 250Gi
+              ephemeral-storage: 250Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
