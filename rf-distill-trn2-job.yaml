@@ -1,24 +1,24 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: rf-distill
+  name: rf-distill-trn2
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: rf-distill
+        app: rf-distill-trn2
     spec:
       restartPolicy: Never
       nodeSelector:
-        node-type: trn3-dev1
+        node-type: trn2
       resourceClaims:
-        - name: neurons
-          resourceClaimTemplateName: l-lnc2
+        - name: l-trn2
+          resourceClaimTemplateName: l-trn2
       containers:
         - name: rf-distill
-          image: 048894428923.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-private:private-torch-neuronx-main-20260720-030850-88263232684
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash
@@ -178,15 +178,13 @@ spec:
               ls -lhR "$FINAL" | head -60
           resources:
             claims:
-              - name: neurons
+              - name: l-trn2
             requests:
-              cpu: 50
-              memory: 500Gi
-              ephemeral-storage: 500Gi
+              cpu: 80
+              memory: 800Gi
             limits:
-              cpu: 50
-              memory: 500Gi
-              ephemeral-storage: 500Gi
+              cpu: 80
+              memory: 800Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm

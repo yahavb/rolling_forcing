@@ -100,11 +100,11 @@ spec:
               echo "  python3 validate_student_cpu.py --diff $OUT $OUTDIR/parity.neuron.pt"
           resources:
             requests:
-              cpu: "16"
-              memory: 64Gi
+              cpu: "45"
+              memory: 131Gi
             limits:
-              cpu: "32"
-              memory: 128Gi
+              cpu: "45"
+              memory: 131Gi
           volumeMounts:
             - name: 621547421844-ap-southeast-4-pvc
               mountPath: /var/mdl
@@ -113,7 +113,7 @@ spec:
               value: "1"
             # ── REQUIRED: the checkpoint to validate (a path on the PVC). ──
             - name: CKPT
-              value: "/var/mdl/rolling_forcing/distill/REPLACE_TS/model.iter200.pt"
+              value: "/var/mdl/rolling_forcing/distill/202607220649/model.iter200.pt"
             # Branch that carries validate_student_cpu.py + the ATTN_DTYPE fp32 path.
             - name: BRANCH
               value: "rf-distill-trn3-pin-neuronx"
