@@ -1,0 +1,268 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rf-distill
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: rf-distill
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: l-lnc2
+      containers:
+        - name: rf-distill
+          image: 048894428923.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-private:private-torch-neuronx-main-20260720-030850-88263232684
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              BRANCH="${BRANCH:-main}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git REPO
+              cd REPO
+
+              # ── PROVENANCE ──
+              GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+              echo "┌── PROVENANCE ──"
+              echo "│ JOB    : rf-distill (T=4 DMD distillation)  pod=$(hostname)"
+              echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
+              echo "│ commit : $GIT_SHA"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+
+              # ─── Install TRAINING deps (upstream RF pins; kept separate from inference pins) ───
+              # flash-attn / flex_attention are NOT installed — training/ uses the SDPA fallback.
+              # SDK 2.31 image has no auto-activated venv -> bare `uv pip install` errors
+              # "No virtual environment found". Target the interpreter python3 uses via --python.
+              UVPY="$(command -v python3)"
+              uv pip install --python "$UVPY" \
+                "diffusers==0.31.0" \
+                "transformers>=4.49.0" \
+                "tokenizers>=0.20.3" \
+                "accelerate>=1.1.1" \
+                "huggingface_hub[cli]" \
+                "omegaconf" \
+                "einops" \
+                "ftfy" \
+                "regex" \
+                "easydict" \
+                "tensorboard" \
+                "imageio" "imageio-ffmpeg" "av" \
+                "lmdb" "wandb"
+              # lmdb + wandb: trainer/__init__.py eagerly imports ALL trainers
+              # (diffusion/gan import wandb; dataset.py imports lmdb) even though we
+              # only run score_distillation with --disable-wandb. Verified the full
+              # train.py import chain resolves with exactly these added (local trace).
+              # NOTE: do NOT pin numpy==1.24.4 (upstream RF pin). The image is Python 3.12,
+              # which removed distutils; numpy 1.24.4 has no 3.12 wheel and its source build
+              # needs distutils -> fails. The base torch-neuronx venv already ships a working
+              # numpy (inference rf-job.yaml pins none) — leave it as-is.
+
+              # ─── Weights (S3-backed /var/mdl cache; single tar avoids per-file S3 overhead) ───
+              # 1) Wan2.1-T2V-1.3B  — student/critic base + T5 encoder + VAE
+              WAN13_TAR="/var/mdl/rolling_forcing/Wan2.1-T2V-1.3B.tar"
+              if [[ -f "$WAN13_TAR" ]]; then
+                echo "Extracting Wan2.1-T2V-1.3B from S3 cache..."
+                mkdir -p wan_models && tar xf "$WAN13_TAR" -C wan_models/
+              else
+                echo "Downloading Wan2.1-T2V-1.3B..."
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)"
+                tar cf /tmp/w13.tar -C wan_models Wan2.1-T2V-1.3B
+                mkdir -p "$(dirname $WAN13_TAR)" && cp /tmp/w13.tar "$WAN13_TAR" && rm -f /tmp/w13.tar
+              fi
+
+              # 2) Wan2.1-T2V-14B  — FROZEN teacher (real_score). Big (~28GB) — cache as tar.
+              WAN14_TAR="/var/mdl/rolling_forcing/Wan2.1-T2V-14B.tar"
+              if [[ -f "$WAN14_TAR" ]]; then
+                echo "Extracting Wan2.1-T2V-14B from S3 cache..."
+                mkdir -p wan_models && tar xf "$WAN14_TAR" -C wan_models/
+              else
+                echo "Downloading Wan2.1-T2V-14B (teacher)..."
+                python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Wan-AI/Wan2.1-T2V-14B', local_dir='wan_models/Wan2.1-T2V-14B', local_dir_use_symlinks=False)"
+                tar cf /tmp/w14.tar -C wan_models Wan2.1-T2V-14B
+                mkdir -p "$(dirname $WAN14_TAR)" && cp /tmp/w14.tar "$WAN14_TAR" && rm -f /tmp/w14.tar
+              fi
+
+              # 3) ode_init.pt — Self-Forcing ODE-init (the REQUIRED student init)
+              ODE_INIT="/var/mdl/rolling_forcing/ode_init.pt"
+              mkdir -p checkpoints
+              if [[ -f "$ODE_INIT" ]]; then
+                echo "Using cached ode_init.pt from S3..."
+                cp "$ODE_INIT" checkpoints/ode_init.pt
+              else
+                echo "Downloading ode_init.pt from gdhe17/Self-Forcing..."
+                python3 -c "from huggingface_hub import hf_hub_download; import shutil; p=hf_hub_download('gdhe17/Self-Forcing','checkpoints/ode_init.pt'); shutil.copy(p,'checkpoints/ode_init.pt')"
+                mkdir -p "$(dirname $ODE_INIT)" && cp checkpoints/ode_init.pt "$ODE_INIT"
+              fi
+
+              # 4) training prompts (data-free distillation input)
+              # PROOF-OF-CONCEPT: the T=4 config's data_path is prompts/distill_poc_single.txt
+              # (example prompt 000, the western/horse shot) — it ships in the repo clone, so no
+              # download is needed. To distill a BROADER model, set PROMPTS_SRC to a file on the
+              # PVC (e.g. the full vidprom corpus) and change data_path in the T=4 config to match.
+              if [[ -n "${PROMPTS_SRC:-}" && -f "${PROMPTS_SRC}" ]]; then
+                echo "Using PROMPTS_SRC override: $PROMPTS_SRC"
+                mkdir -p prompts && cp "$PROMPTS_SRC" prompts/"$(basename "$PROMPTS_SRC")"
+              fi
+              PROMPT_FILE=$(python3 -c "from omegaconf import OmegaConf; import os; \
+                b=OmegaConf.load('configs/default_config.yaml'); \
+                c=OmegaConf.merge(b, OmegaConf.load('configs/rolling_forcing_dmd_t4.yaml')); \
+                print(c.data_path)")
+              test -f "$PROMPT_FILE" || { echo "PROMPT FILE MISSING: $PROMPT_FILE"; exit 1; }
+              echo "Weights + prompts ready: $(wc -l < "$PROMPT_FILE") prompt(s) from $PROMPT_FILE"
+
+              # ─── write ckpts to FAST LOCAL disk, then SYNC-copy each to the PVC/S3 ───
+              # torch.save to S3-FUSE directly is slow (S3 is not a good critical-path FS);
+              # save to local /tmp (fast) then copy to the PVC. EVICTION FIX (2026-07-13): the
+              # copy is now SYNCHRONOUS in the trainer (_save_ckpt: subprocess.run cp&&rm, was
+              # async Popen). Async raced — the slow 11GB cp let local copies STACK to 113GB ->
+              # node ephemeral-storage eviction (Exit 137) after ~24h. Sync guarantees only ONE
+              # 11GB ckpt on local disk at a time (write -> cp -> rm -> return).
+              TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
+              RUN=/tmp/rf-distill/$TS; mkdir -p "$RUN"
+              FINAL=/var/mdl/rolling_forcing/distill/$TS; mkdir -p "$FINAL"
+              export CKPT_MIRROR_DIR="$FINAL"    # trainer sync-copies each ckpt here, frees local
+              exec > >(tee "$RUN/train.log") 2>&1
+              echo "RUN=$RUN  (local; each ckpt sync-copied to $FINAL then local freed)"
+
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
+
+              # ─── PRECOMPUTE T5 prompt embeds ONCE (CPU, 1 proc) — no T5 in training ───
+              # Frees ~9.6GB HBM by removing the T5 encoder (and its FSDP wrap/collective)
+              # from the 16-rank training job, leaving room for the frozen 14B teacher.
+              # The trainer reads these via PRECOMPUTED_EMBEDS and looks up embeds by prompt.
+              cd training
+              # The trainer/precompute run from cwd=training/ (so `configs/` and the
+              # `utils`/`model`/`wan` packages resolve), but the config's data_path
+              # (prompts/...), generator_ckpt (checkpoints/...), and wan_wrapper's
+              # hardcoded wan_models/... are all relative to the REPO ROOT. Symlink
+              # those three data dirs in so every relative path resolves from here too.
+              for d in prompts checkpoints wan_models; do ln -sfn ../$d ./$d; done
+              ls -ld prompts checkpoints wan_models
+              EMB=/tmp/embeds.pt
+              python3 precompute_embeds.py \
+                --config_path ../configs/rolling_forcing_dmd_t4.yaml \
+                --out "$EMB" \
+                || { echo "EMBEDS PRECOMPUTE FAILED"; exit 1; }
+
+              # ─── DMD distillation train ───
+              # torchrun over all 16 ranks. Training entrypoint is the vendored training/train.py.
+              # Config = T=4 (configs/rolling_forcing_dmd_t4.yaml): the ONLY recipe change vs the
+              # shipped T=5 run is the 4-entry denoising_step_list.
+              export PRECOMPUTED_EMBEDS="$EMB"
+              torchrun \
+                --nproc_per_node="${NPROC:-16}" \
+                --rdzv_backend=c10d \
+                --rdzv_endpoint "${MASTER_ADDR:-127.0.0.1}:${MASTER_PORT:-29500}" \
+                train.py \
+                --config_path ../configs/rolling_forcing_dmd_t4.yaml \
+                --logdir "$RUN" \
+                --disable-wandb \
+                --no_visualize \
+                || { echo "TRAIN FAILED"; exit 1; }
+              cd ..
+
+              # ─── copy the local train.log to the PVC (ckpts are already there) ───
+              cp "/tmp/rf-distill/$TS/train.log" "$FINAL/train.log" 2>&1 || echo "train.log copy failed"
+              echo "=== DONE. checkpoints under $FINAL/ (use the EMA weights: inference --use_ema) ==="
+              ls -lhR "$FINAL" | head -60
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 50
+              memory: 500Gi
+              ephemeral-storage: 500Gi
+            limits:
+              cpu: 50
+              memory: 500Gi
+              ephemeral-storage: 500Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "rf-distill-t4"
+            # THREE-GROUP placement (SD's proven co-residency fix): teacher on ranks 0-3,
+            # student 4-7, critic 8-11 (tp_degree=4), ranks 12-15 idle-but-lockstep. Each
+            # core holds ONE model instead of all three (11.2GB) -> the rollout's ~1.5GB
+            # NEFF fits. Selects trainer/distillation_3group.py. Needs tp_degree in config.
+            - name: DISTILL_THREE_GROUP
+              value: "1"
+            # Functional (out-of-place, single-block) self-attn on the STUDENT grad rollout
+            # (SD 42cd403+1d5f752). Required with FSDP2's NO_REENTRANT checkpoint: the
+            # streaming in-place KV-cache writes are autograd-fatal under recompute. Gated
+            # on this env (constant all run) so ckpt fwd/recompute always take the same path.
+            - name: DISTILL_FUNCTIONAL_ATTN
+              value: "1"
+            # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
+            - name: NPROC
+              value: "16"            # all 16 NeuronCores (2 chips x 8, LNC=1)
+            # denoising_step_list (T=4) lives in configs/rolling_forcing_dmd_t4.yaml.
+            # Everything else (lr 1.5e-6 / lr_critic 4e-7 / dfake_gen_update_ratio 5 /
+            # guidance_scale 3.0 / ema 0.99 from step 200 / batch 1-per-rank) is in that config.
+            # ── Neuron runtime (mirrors this repo's inference jobs). NO NEURON_LOGICAL_NC_CONFIG. ──
+            - name: NEURON_FALLBACK_ENABLED
+              value: "0"
+            - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
+              value: "0"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            # DIAGNOSE the teacher SDPA compile fail: the pod log only showed a TRUNCATED
+            # "COMPILATION FAILED: input1 of shape bf16[1,18000,40,128] " with NO reason
+            # (async report + CC_LOG_LEVEL=ERROR hid the neuronx-cc diagnostic). Shape alone
+            # isn't the blocker (14B MoE compiles). Surface the real error:
+            #  - LAUNCH_BLOCKING=1: synchronous errors -> traceback + reason at the true op
+            #  - CC_LOG_LEVEL=INFO: neuronx-cc prints the actual failure cause
+            #  - keep the compiler workdir so its logs survive the pod
+            - name: NEURON_LAUNCH_BLOCKING
+              value: "1"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "INFO"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "INFO"
+            # --dump-to/--verbose are NOT valid neuronx-cc flags (NCC_EARG002) — they made
+            # the compiler itself fail before reaching the teacher attn. Keep CC_FLAGS clean.
+            - name: NEURON_CC_FLAGS
+              value: "--model-type=transformer"
+            - name: MASTER_ADDR
+              value: "127.0.0.1"
+            - name: MASTER_PORT
+              value: "29500"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            # Bumped from the inference default (24Gi): distributed collectives and
+            # the CPU state-dict gather use /dev/shm. Memory-backed, so it counts
+            # against the pod's 1400Gi limit — still leaves ample host RAM.
+            sizeLimit: 128Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

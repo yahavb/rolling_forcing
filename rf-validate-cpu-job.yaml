@@ -1,0 +1,141 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rf-validate-cpu
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: rf-validate-cpu
+    spec:
+      restartPolicy: Never
+      # CPU-only node (m5) — NO resourceClaim, NO NeuronCore. This frees the trn pod:
+      # the SLOW fp32 reference rollout runs here; the pod only needs a single quick
+      # DEVICE=neuron rollout (seconds-minutes) before you release it.
+      nodeSelector:
+        node-type: m5
+      containers:
+        - name: rf-validate-cpu
+          # Plain PyTorch/Python image (no Neuron SDK needed — harness sets
+          # USE_NKI_KERNELS=0 and never imports torch_neuronx on DEVICE=cpu).
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              # CKPT: which distilled checkpoint to validate (REQUIRED, on the PVC).
+              # e.g. /var/mdl/rolling_forcing/distill/<TS>/model.iter200.pt
+              : "${CKPT:?set CKPT to a checkpoint path on the PVC}"
+              OUTDIR="$(dirname "$CKPT")"
+              EMB="$OUTDIR/embeds.pt"                       # shared by BOTH runs (identical bytes)
+              OUT="$OUTDIR/parity.cpu.pt"
+
+              apt-get update -qq && apt-get install -y -qq git >/dev/null
+
+              BRANCH="${BRANCH:-rf-distill-trn3-pin-neuronx}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git REPO
+              cd REPO
+              echo "┌── PROVENANCE ──"
+              echo "│ JOB    : rf-validate-cpu (fp32 CPU parity reference)  pod=$(hostname)"
+              echo "│ branch : $(git rev-parse --abbrev-ref HEAD)  commit: $(git rev-parse HEAD)"
+              echo "│ CKPT   : $CKPT"
+              echo "└────────────────"
+
+              # ─── CPU-only deps (torch CPU wheel + the training deps the harness imports) ───
+              pip install --quiet --index-url https://download.pytorch.org/whl/cpu "torch==2.11.0" || \
+                pip install --quiet "torch" --index-url https://download.pytorch.org/whl/cpu
+              pip install --quiet \
+                "diffusers==0.31.0" \
+                "transformers>=4.49.0" \
+                "tokenizers>=0.20.3" \
+                "accelerate>=1.1.1" \
+                "huggingface_hub[cli]" \
+                "omegaconf" "einops" "ftfy" "regex" "easydict" \
+                "imageio" "imageio-ffmpeg" "av" "lmdb" "wandb" "tensorboard"
+
+              # ─── 1.3B weights (student base + T5 for embeds). NO 14B needed — the harness
+              #     validates the 1.3B STUDENT only. ───
+              WAN13_TAR="/var/mdl/rolling_forcing/Wan2.1-T2V-1.3B.tar"
+              test -f "$WAN13_TAR" || { echo "MISSING $WAN13_TAR on PVC"; exit 1; }
+              echo "Extracting Wan2.1-T2V-1.3B from S3 cache..."
+              mkdir -p wan_models && tar xf "$WAN13_TAR" -C wan_models/
+
+              CONFIG="${CONFIG:-../configs/rolling_forcing_dmd_t4.yaml}"
+              cd training
+              for d in prompts checkpoints wan_models; do ln -sfn ../$d ./$d; done
+
+              # ─── embeds: precompute ONCE on CPU and write to the PVC, so the Neuron
+              #     parity run reads the SAME embeds.pt (identical conditioning). Skip if
+              #     it already exists (the Neuron side may have written it first). ───
+              if [[ -f "$EMB" ]]; then
+                echo "Reusing existing PVC embeds: $EMB"
+              else
+                echo "Precomputing embeds on CPU -> $EMB"
+                python3 precompute_embeds.py --config_path "$CONFIG" --out "$EMB" \
+                  || { echo "EMBEDS PRECOMPUTE FAILED"; exit 1; }
+              fi
+
+              # ─── the fp32 CPU reference rollout (SLOW). Writes parity.cpu.pt to the PVC. ───
+              # DEVICE=cpu + the harness's ATTN_DTYPE=fp32 / USE_NKI_KERNELS=0 defaults.
+              # Add --ema to validate the shipped generator_ema instead of the raw snapshot.
+              echo "Running fp32 CPU parity rollout..."
+              DEVICE=cpu python3 validate_student_cpu.py \
+                --config "$CONFIG" \
+                --ckpt   "$CKPT" \
+                --embeds "$EMB" \
+                --out    "$OUT" \
+                ${EMA:+--ema} \
+                --seed "${SEED:-0}"
+
+              echo "=== DONE. CPU reference written to $OUT ==="
+              echo "Next: on the trn pod (quick), run once then free the pod:"
+              echo "  DEVICE=neuron python3 validate_student_cpu.py --config $CONFIG --ckpt $CKPT --embeds $EMB --out $OUTDIR/parity.neuron.pt --seed ${SEED:-0} ${EMA:+--ema}"
+              echo "Then diff (anywhere):"
+              echo "  python3 validate_student_cpu.py --diff $OUT $OUTDIR/parity.neuron.pt"
+          resources:
+            requests:
+              cpu: "45"
+              memory: 131Gi
+            limits:
+              cpu: "45"
+              memory: 131Gi
+          volumeMounts:
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # ── REQUIRED: the checkpoint to validate (a path on the PVC). ──
+            - name: CKPT
+              value: "/var/mdl/rolling_forcing/distill/202607220649/model.iter200.pt"
+            # Branch that carries validate_student_cpu.py + the ATTN_DTYPE fp32 path.
+            - name: BRANCH
+              value: "rf-distill-trn3-pin-neuronx"
+            # Config whose model_kwargs/shape/steps match how the ckpt was trained.
+            - name: CONFIG
+              value: "../configs/rolling_forcing_dmd_t4.yaml"
+            - name: SEED
+              value: "0"
+            # Set EMA=1 to load generator_ema (the shipped weights) instead of generator.
+            # - name: EMA
+            #   value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

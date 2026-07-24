@@ -1,0 +1,131 @@
+# T=5 DMD distillation config for Rolling Forcing (matches the shipped step schedule).
+#
+# This is a TRAINING config (mirrors upstream ~/RollingForcing/configs/rolling_forcing_dmd.yaml).
+#
+# STEP COUNT = 5 (2026-07-15): reverted from the T=4 experiment [1000,750,500,250] back to
+# the shipped 5-step schedule. WHY: the T=4 serving study (docs/DISTILL_T4_RUNBOOK.md) showed
+# a hard fps CLIFF — T<=4 serves at ~5 fps, T>=5 at ~14 fps (device idle at full_frames=15,
+# a neuronx-cc shape/tiling artifact). So 4 steps has NO speed payoff on this stack; T=5 is
+# the proven-fast serving point. Distill for T=5 so training aligns with a config that runs
+# at 14 fps. num_training_frames stays 6 (the trainer rolls out a FIXED 6-frame lat_shape
+# regardless of T; step count only adds 1 rolling-window iteration -> no OOM impact).
+denoising_step_list:
+- 1000
+- 800
+- 600
+- 400
+- 200
+warp_denoising_step: true
+
+# ── everything below is IDENTICAL to the proven T=5 upstream training recipe ──
+generator_ckpt: checkpoints/ode_init.pt          # Self-Forcing ODE-init (gdhe17/Self-Forcing)
+# PER-BLOCK FSDP wrap (SD's fix for the 5.287GB whole-model all-gather OOM). "size"
+# wrap (min 5e7 params) leaves each Wan block < threshold -> FSDP wraps the whole 1.3B
+# net as ONE unit and all-gathers all 5.287GB fp32 in a single spike to run forward.
+# "transformer" wrap shards PER CausalWanAttentionBlock/WanAttentionBlock, so only one
+# block is gathered at a time (SD: `for blk in m.blocks: fully_shard(blk)`). See
+# distillation.py where transformer_module is passed.
+generator_fsdp_wrap_strategy: transformer
+real_score_fsdp_wrap_strategy: transformer
+fake_score_fsdp_wrap_strategy: transformer
+real_name: Wan2.1-T2V-14B                         # teacher = BASE multi-step bidirectional 14B
+                                                  # (NOT a distilled few-step ckpt — that was SD bug B)
+text_encoder_fsdp_wrap_strategy: size
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0                               # real-score CFG
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+sharding_strategy: full   # FULL_SHARD across all 16 cores (÷16) vs hybrid_full's ÷8.
+                          # Saves ~params, but the NRT dump proved params are NOT the
+                          # bulk (full moved it only 22->20GB): the 20GB "Tensors" is
+                          # KV caches + rollout/scoring ACTIVATIONS. The real fix is the
+                          # resolution cut (frame_seq 1560->1200) below + derived KV
+                          # cache in the pipeline. Kept full since it's strictly ≤ mem.
+lr: 1.5e-06                                        # generator lr
+lr_critic: 4.0e-07                                 # critic lr (lower)
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+# ── three-group flat trainer (distillation_3group.py) knobs ──
+tp_degree: 4                                       # ranks per group: teacher 0-3, student 4-7, critic 8-11
+iters: 10000                                       # SD long-run recipe (gentle lr + grad-accum)
+save_every: 200
+warmup: 10                                         # critic-only iters before G updates (critic leads)
+grad_accum: 1                                      # step+zero_grad EVERY G-step (was 4).
+                                                   # PROVEN by the memprobe: dev_MB jumps 19GB->34GB
+                                                   # at the first G-step (it10) and STAYS at 39GB
+                                                   # through it11-14 — the G-step grad buffers are
+                                                   # NOT freed because with accum=4, zero_grad/step
+                                                   # only fire every 4th G-step (first at it25). The
+                                                   # 2nd G-step (it15) stacks another ~20GB -> OOM.
+                                                   # accum=1 frees the grads each G-step so they can't
+                                                   # stack. (Effective batch drops 4->1; revisit for
+                                                   # final quality, but PoC needs it to survive first.)
+data_path: prompts/distill_poc_single.txt         # PROOF-OF-CONCEPT: single prompt (example 000,
+                                                  # the western/horse shot). Data-free DMD; a student
+                                                  # specialized to ONE prompt tolerates fewer steps
+                                                  # best. Compare its T=4 render against the existing
+                                                  # T=5 baseline rf_sp4_videos/prompt_000.mp4.
+                                                  # Swap to prompts/example_prompts.txt (15) or
+                                                  # vidprom_filtered_extended.txt for a broader model.
+batch_size: 1
+# EMA DISABLED to match StreamDiffusionV2's proven-stable Neuron distill (branch
+# EMA of the generator weights — RE-ENABLED (2026-07). DMD is adversarial-like: the raw
+# generator loss OSCILLATES around an equilibrium (dmdnorm_avg50 bounced 0.42<->0.81 over
+# a single-prompt run) and you ship the EMA-averaged weights, not a raw snapshot — which
+# is why raw-weight iter200 rendered BLURRY. Upstream configs/rolling_forcing_dmd.yaml
+# ships ema_weight=0.99/ema_start_step=200 and the inference ckpt's `generator_ema` key.
+#
+# The OLD reason EMA was disabled (ema_weight=0.0): SD's EMA_FSDP used
+# FSDP.summon_full_params -> all-gathers the FULL fp32 model onto EVERY rank's HBM
+# (5.287GB/rank spike) every G-step. OUR trainer's _ema_update AVOIDS that: it keeps a
+# SHARDED fp32 clone of each param and updates the LOCAL shard in place (no gather); the
+# full gather happens only at save time via full_tensor() -> CPU (same as `generator`).
+# So the "full unsharded fp32 never co-resides on-device" rule still holds; cost is only
+# ~1.3GB/rank of sharded fp32 state. Watch the it<=18 memprobe for creep.
+# ema_weight=0.999: slightly longer averaging window than upstream's 0.99.
+ema_weight: 0.999
+ema_start_step: 200
+total_batch_size: 64
+log_iters: 100
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5                          # generator updated once per 5 critic steps
+# Train at the resolution we DEPLOY (480x640, latent 60x80) — NOT the upstream
+# 480x832 (60x104). This (a) distills for the res we actually serve, and (b) cuts
+# per-model KV cache 7.76GB -> 5.97GB and all rollout/scoring activations ~23%
+# (frame_seq 1560 -> 1200). SD did the same (commit 02fa0bf: lower-res training =
+# "55% less activation"). latent_w 80 matches rf-deploy.yaml LATENT_W=80.
+image_or_video_shape:
+- 1
+- 6
+- 16
+- 60
+- 80
+distribution_loss: dmd
+trainer: score_distillation
+# gradient_checkpointing ON. Tested OFF (3a378f9): the with_grad rollout stored ALL
+# activations up front -> e1 dev_MB 17754->44142 (+26GB) and OOM'd DURING the rollout
+# forward, before backward. So grad-ckpt IS helping the peak; disabling it is strictly
+# worse. The real fix for the per-G-step retention is the STRUCTURAL SD 5d90c6b two-forward,
+# not a checkpointing toggle.
+gradient_checkpointing: true
+num_frame_per_block: 3                             # independent of T; keep at 3
+# num_training_frames drives BOTH: (1) the VAE-avoidance — DMD is latent-space and the
+# VAE is only pulled on-device by base.py:156, the >21-frame re-encode branch, so any
+# value <=21 keeps it dead; and (2) max_attention_size = num_training_frames * frame_seq,
+# which SIZES the rollout self-attn working cache (causal_model.py:298,316 — NOT
+# local_attn_size, which only masks WITHIN it). With three-group placement the co-residency
+# OOM is gone (Tensors 11.2->6.6GB/core), but the rollout's last-block attention over the
+# full window still overflowed: 3600 x (N*1200) x 12 heads x 2B. N=21 -> 2.18GB, N=18 ->
+# 1.87GB (still ~1.7GB over). N=15 (5 blocks x 3) -> ~1.24GB, clears it with headroom. 15
+# is a multiple of num_frame_per_block(3); the flat 3group trainer rolls out exactly N
+# frames (no [21,N] sampling), so N just needs %3==0. SD lever 02fa0bf (fewer frames = less
+# activation). Tradeoff: 15-frame rollout vs deploy's up-to-24; fine for the T=4 PoC.
+num_training_frames: 6
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0

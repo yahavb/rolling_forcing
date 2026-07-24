@@ -1,0 +1,629 @@
+"""Three-group DMD distillation trainer (flat loop, ported from StreamDiffusionV2's
+distill_sdv2.py main()). Replaces the encapsulated single-rank DMD path when
+DISTILL_THREE_GROUP=1.
+
+WHY: with all three nets (14B teacher + 1.3B student + 1.3B critic) FSDP-sharded onto
+ALL 16 ranks, each core holds ~11.2GB of co-resident model shards; the rollout's fused
+NEFF then needs ~1.5GB more scratchpad than the ~24GB/core budget -> OOM. SD's proven
+fix (three_group=True): give EACH net its own tp-rank group so a core holds ONE model.
+Cross-group transfer is via GLOBAL broadcast (Neuron supports broadcast, not P2P):
+  (a) student rolls out x0 (its group)          -> bcast x_t, t, x0 to all
+  (c) teacher scores x_t (its group)            -> bcast real_pred back
+  (d) critic scores x_t (its group)             -> bcast fake_pred back
+  (e) student DMD update (its group)
+  (f) critic diffusion update (its group)
+Every rank calls every broadcast in lockstep (collective requirement); only the src
+group provides real data, the rest send/recv zeros.
+
+This uses RF's OWN model APIs (WanDiffusionWrapper scorers + RollingForcingTrainingPipeline
+rollout + RF's DMD normalizer), NOT SD's single-block causal scorer — only the placement
++ broadcast skeleton is from SD.
+"""
+import gc
+import os
+import time
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from omegaconf import OmegaConf
+
+from utils.distributed import fsdp_wrap, fsdp2_wrap_student, make_distill_groups, launch_distributed_job
+from utils.misc import set_seed
+from utils.wan_wrapper import WanDiffusionWrapper
+from pipeline import RollingForcingTrainingPipeline
+from wan.modules.causal_model import CausalWanAttentionBlock
+from wan.modules.model import WanAttentionBlock
+
+_WAN_BLOCKS = {CausalWanAttentionBlock, WanAttentionBlock}
+
+
+class Trainer:
+    def __init__(self, config):
+        self.config = config
+        self.step = 0
+        launch_distributed_job()
+        # ASYMMETRIC groups: the 14B teacher needs more ranks than the 1.3B student/critic
+        # (RF's FSDP teacher holds full activations per rank, so 4 OOMs). Default:
+        # teacher=8, student=4, critic=4 -> all 16 cores, 14B bf16/8 = 3.5GB/core.
+        self.groups = make_distill_groups(
+            int(getattr(config, "tp_degree", 4)),
+            teacher_tp=int(getattr(config, "teacher_tp", 8)),
+            student_tp=int(getattr(config, "student_tp", 4)),
+            fake_tp=int(getattr(config, "fake_tp", 4)))
+        g = self.groups
+        self.my_rank = g["my_rank"]
+        self.world_size = g["world_size"]
+        self.in_teacher, self.in_student, self.in_fake = g["in_teacher"], g["in_student"], g["in_fake"]
+        self.tsrc, self.ssrc, self.fsrc = g["tsrc"], g["ssrc"], g["fsrc"]
+        self.is_main_process = self.my_rank == 0
+        self.device = torch.device("neuron")
+        self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
+
+        if config.seed == 0:
+            rs = torch.randint(0, 10000000, (1,), device=self.device)
+            dist.broadcast(rs, src=0)
+            config.seed = rs.item()
+        set_seed(config.seed + self.my_rank)
+
+        self._log(f"placement: world={self.world_size} "
+                  f"teacher_ranks={g['teacher_ranks']} student_ranks={g['student_ranks']} fake_ranks={g['fake_ranks']} "
+                  f"rank={self.my_rank} teacher={self.in_teacher} student={self.in_student} fake={self.in_fake}")
+
+        # ── precomputed embeds (no T5 on device) ──
+        self.embeds_by_prompt = None
+        self.neg_embed = None
+        emb_path = os.environ.get("PRECOMPUTED_EMBEDS")
+        assert emb_path and os.path.exists(emb_path), (
+            "three-group trainer requires PRECOMPUTED_EMBEDS (no in-loop T5)")
+        payload = torch.load(emb_path, map_location="cpu")
+        self.embeds_by_prompt = payload["prompt_embeds"]
+        self.neg_embed = payload["negative_prompt_embeds"]
+
+        # ── prompts ──
+        with open(config.data_path) as f:
+            self.prompts = [ln.strip() for ln in f if ln.strip()]
+        self._log(f"{len(self.prompts)} prompt(s) from {config.data_path}")
+
+        # ── DMD hyperparameters ──
+        self.num_frame_per_block = getattr(config, "num_frame_per_block", 3)
+        self.num_training_frames = getattr(config, "num_training_frames", 21)
+        self.guidance_scale = getattr(config, "guidance_scale", 3.0)
+        self.dfake_gen_update_ratio = getattr(config, "dfake_gen_update_ratio", 5)
+        self.warmup = int(getattr(config, "warmup", 10))
+        self.grad_accum = max(1, int(getattr(config, "grad_accum", 4)))
+        self.iters = int(getattr(config, "iters", 10000))
+        self.save_every = int(getattr(config, "save_every", 200))
+        self.timestep_shift = getattr(config, "timestep_shift", 5.0)
+        # EMA of the generator weights (upstream configs/rolling_forcing_dmd.yaml:
+        # ema_weight=0.99, ema_start_step=200). DMD is adversarial-like: the raw
+        # generator loss OSCILLATES around an equilibrium and never monotonically
+        # decreases — you ship the EMA-averaged weights, NOT the raw snapshot. This is
+        # what the shipped inference ckpt's `generator_ema` key is, and why raw-weight
+        # checkpoints render blurry (a noisy point on the oscillation). We maintain
+        # generator_ema on the student's ssrc rank and save it alongside `generator`.
+        self.ema_weight = float(getattr(config, "ema_weight", 0.99))
+        self.ema_start_step = int(getattr(config, "ema_start_step", 200))
+        self._ema_state = None  # dict[name -> cpu fp32 tensor]; lazy-init at ema_start_step
+        self.num_train_timestep = getattr(config, "num_train_timestep", 1000)
+        self.min_step = int(0.02 * self.num_train_timestep)
+        self.max_step = int(0.98 * self.num_train_timestep)
+        # Fixed DMD timestep buckets (SD 86cb4d3): sample the critic/DMD noise level from
+        # this SMALL set instead of a continuous randint, so torch.compile reuses a BOUNDED
+        # set of NEFFs instead of loading a new module.neff per distinct timestep ->
+        # the iter-~12 scratchpad creep-OOM.
+        #
+        # CONVERGENCE FIX (blurry iter200 + late dmdnorm_avg50 rise 0.47->0.79 + loss_fake
+        # 0.03->1.0): the original 8 buckets over [100,900] starved the critic — it only
+        # ever learned to denoise at 8 noise levels, and the DMD gradient only queried
+        # those 8, vs upstream dmd.py which samples ~continuously over the full
+        # [min_step, max_step]. Too few levels caps high-freq detail (=blur) and narrows
+        # the critic's learning signal (=staleness -> late divergence). Widen 8->16 levels
+        # spanning the FULL [min_step, max_step]=[20,980] range (upstream bounds), still a
+        # bounded NEFF set (~2x, watch the it<=18 memprobe for creep across G-steps).
+        self._DMD_TIMESTEPS = torch.linspace(
+            self.min_step, self.max_step, 16, device=self.device).round().long()
+        _b, _f, _c, _h, _w = config.image_or_video_shape
+        self.lat_shape = (1, self.num_training_frames, _c, _h, _w)
+        # frame_seq = patchified tokens/frame (patch (1,2,2) -> (H//2)*(W//2)). The
+        # non-causal scorers (WanModel) PAD the input up to self.seq_len and run one
+        # full-sequence SDPA at that size. The wrapper hardcodes seq_len=32760 (=21*1560,
+        # the 480x832 default) -> our 15*1200=18000-token x_t gets padded to 32760 and
+        # the SDPA compile fails at bf16[1,32760,40,128]. Set seq_len to the ACTUAL
+        # num_training_frames * frame_seq so there is no oversized pad.
+        self.frame_seq = (_h // 2) * (_w // 2)
+        self.score_seq_len = self.num_training_frames * self.frame_seq
+
+        # ── build ONLY this rank's model, sharded within its own group ──
+        self.generator = self.real_score = self.fake_score = None
+        self.opt_g = self.opt_f = None
+        self.scheduler = None
+        self._build_group_model(config)
+
+        self._g_since_step = 0
+        self._dmdnorm_hist = []
+        self.mirror_dir = os.environ.get("CKPT_MIRROR_DIR", "").strip()
+        self.output_path = config.logdir
+
+    def _log(self, msg):
+        if self.is_main_process:
+            print(msg, flush=True)
+
+    def _rlog(self, msg):
+        # per-rank timestamped diagnostic (build/it0 markers). [dbg] tag = greppable.
+        import time as _t
+        print(f"[dbg r{self.my_rank} {_t.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    def _gstep_probe(self, it, tag):
+        # [dbg] device-tensor count+MB at a point INSIDE the G-step, so we see WHICH
+        # sub-step (rollout / backward / opt.step / del) adds the leaked tensors.
+        # Student src rank, only iters 9-17 (spans the first two G-steps).
+        if not (self.my_rank == self.ssrc and 9 <= it <= 17):
+            return
+        import gc as _gc
+        n = mb = 0
+        for o in _gc.get_objects():
+            try:
+                if torch.is_tensor(o) and o.device.type == "neuron":
+                    n += 1; mb += o.numel() * o.element_size() / 1e6
+            except Exception:
+                pass
+        print(f"[dbg gstep it{it}] {tag}: dev_tensors={n} dev_MB={mb:.0f}", flush=True)
+
+    def _build_group_model(self, config):
+        real_name = getattr(config, "real_name", "Wan2.1-T2V-1.3B")
+        if self.in_student:
+            self._rlog("student: START from_pretrained(1.3B causal)...")
+            self.generator = WanDiffusionWrapper(**getattr(config, "model_kwargs", {}), is_causal=True)
+            self._rlog("student: from_pretrained DONE")
+            self.generator.model.requires_grad_(True)
+            # NOTE: do NOT call enable_gradient_checkpointing() here — fsdp2_wrap_student
+            # applies per-block NO_REENTRANT checkpoint_wrapper itself (SD path). The
+            # diffusers-native grad-ckpt (self.gradient_checkpointing flag) would double-
+            # wrap. FSDP2 fully_shard + its checkpoint is the ONLY checkpointing now.
+            self.scheduler = self.generator.get_scheduler()
+            self.scheduler.timesteps = self.scheduler.timesteps.to(self.device)
+            if getattr(config, "alphas_cumprod", None) is None and getattr(self.scheduler, "alphas_cumprod", None) is not None:
+                self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
+            if getattr(config, "generator_ckpt", False):
+                self._log(f"loading student init from {config.generator_ckpt}")
+                sd = torch.load(config.generator_ckpt, map_location="cpu")
+                # ode_init.pt's "generator" dict is keyed for the WRAPPER
+                # (model.patch_embedding.weight, ...), so load into self.generator
+                # (WanDiffusionWrapper), NOT self.generator.model — exactly as the
+                # original trainer (distillation.py) does.
+                if "generator" in sd:
+                    sd = sd["generator"]
+                elif "model" in sd:
+                    sd = sd["model"]
+                self.generator.load_state_dict(sd, strict=True)
+            self._rlog("student: START FSDP2 fully_shard...")
+            # FSDP2 fully_shard (SD 5d90c6b) — reshard_after_forward=True frees the DMD
+            # G-step backward graph that FSDP1 retained (+10GB/G-step -> OOM). Student only.
+            self.generator = fsdp2_wrap_student(
+                self.generator, self.groups["student_ranks"], _WAN_BLOCKS)
+            self._rlog("student: FSDP2 fully_shard DONE")
+            self.opt_g = torch.optim.AdamW(
+                [p for p in self.generator.parameters() if p.requires_grad],
+                lr=config.lr, betas=(config.beta1, config.beta2),
+                weight_decay=config.weight_decay)
+
+        if self.in_fake:
+            self._rlog("critic: START from_pretrained(1.3B)...")
+            self.fake_score = WanDiffusionWrapper(model_name=getattr(config, "fake_name", "Wan2.1-T2V-1.3B"), is_causal=False)
+            self._rlog("critic: from_pretrained DONE")
+            self.fake_score.seq_len = self.score_seq_len  # actual res, not the 32760 default (avoids pad-to-32760 SDPA)
+            self.fake_score.model.requires_grad_(True)
+            if getattr(config, "gradient_checkpointing", False):
+                self.fake_score.enable_gradient_checkpointing()
+            self.scheduler_fake = self.fake_score.get_scheduler()
+            self.scheduler_fake.timesteps = self.scheduler_fake.timesteps.to(self.device)
+            self.fake_score = fsdp_wrap(
+                self.fake_score, sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision, wrap_strategy="transformer",
+                transformer_module=_WAN_BLOCKS, process_group=self.groups["fake_pg"])
+            self.opt_f = torch.optim.AdamW(
+                [p for p in self.fake_score.parameters() if p.requires_grad],
+                lr=getattr(config, "lr_critic", config.lr),
+                betas=(config.beta1_critic, config.beta2_critic),
+                weight_decay=config.weight_decay)
+
+        if self.in_teacher:
+            self._rlog(f"teacher: START from_pretrained({real_name}) bf16...")
+            # Load the frozen 14B in bf16 (torch_dtype) via the PLAIN from_pretrained path
+            # that worked in earlier runs. NOT low_cpu_mem_usage=True: that (accelerate
+            # meta-device init) HUNG for 25min+ with 8 teacher ranks on the Neuron eager
+            # backend. Host RAM is now 1900Gi, so the bf16 load (no fp32->330GB spike since
+            # torch_dtype loads bf16 directly) fits comfortably without the meta-device path.
+            self.real_score = WanDiffusionWrapper(
+                model_name=real_name, is_causal=False,
+                load_dtype=torch.bfloat16)
+            self._rlog("teacher: from_pretrained DONE; requires_grad_(False)...")
+            self.real_score.seq_len = self.score_seq_len
+            self.real_score.model.requires_grad_(False)
+            self._rlog("teacher: START fsdp_wrap (shard over teacher_pg)...")
+            self.real_score = fsdp_wrap(
+                self.real_score, sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision, wrap_strategy="transformer",
+                transformer_module=_WAN_BLOCKS, process_group=self.groups["teacher_pg"])
+            self._rlog("teacher: fsdp_wrap DONE.")
+
+        # student needs the rollout pipeline; wire its collectives to the student group
+        self.pipeline = None
+        if self.in_student:
+            dsl = torch.tensor(config.denoising_step_list, dtype=torch.long)
+            if getattr(config, "warp_denoising_step", False):
+                ts = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
+                dsl = ts[1000 - dsl]
+            self.pipeline = RollingForcingTrainingPipeline(
+                denoising_step_list=dsl, scheduler=self.scheduler, generator=self.generator,
+                num_frame_per_block=self.num_frame_per_block,
+                independent_first_frame=getattr(config, "independent_first_frame", False),
+                same_step_across_blocks=getattr(config, "same_step_across_blocks", True),
+                last_step_only=getattr(config, "last_step_only", False),
+                num_max_frames=self.num_training_frames,
+                context_noise=getattr(config, "context_noise", 0),
+                sync_group=self.groups["student_pg"], sync_src=self.ssrc)
+
+    # ── broadcast helper: every rank calls in lockstep ──
+    def _bcast(self, t, src):
+        t = t.contiguous()
+        dist.broadcast(t, src=src)
+        return t
+
+    def _cond(self, prompt):
+        e = self.embeds_by_prompt[prompt].to(device=self.device, dtype=self.dtype)
+        return {"prompt_embeds": e}
+
+    def _sample_timestep(self, b, num_frame):
+        # DISCRETE timestep buckets (SD 86cb4d3 — THE iter-~10/12 OOM fix). A random
+        # CONTINUOUS value every iter (the old torch.randint(min,max)) makes torch.compile
+        # trace a NEW graph each time -> a new module.neff loads and NEVER unloads ->
+        # scratchpad creeps monotonically -> OOM ~iter 12. This is a NEFF-accumulation
+        # CREEP, not a memory peak (frames/res cuts move the peak but not this leak).
+        # Sample from a FIXED 8-bucket set so NEFFs repeat and the loaded set stays bounded.
+        idx = torch.randint(0, self._DMD_TIMESTEPS.shape[0], (b, 1), device=self.device).repeat(1, num_frame)
+        t = self._DMD_TIMESTEPS[idx]
+        if self.timestep_shift > 1:
+            t = self.timestep_shift * (t / 1000) / (1 + (self.timestep_shift - 1) * (t / 1000)) * 1000
+        return t.clamp(self.min_step, self.max_step)
+
+    def train(self):
+        for it in range(self.iters):
+            prompt = self.prompts[it % len(self.prompts)]
+            cond = self._cond(prompt)
+            emb_shape = cond["prompt_embeds"].shape
+
+            def zeros_lat():
+                return torch.zeros(self.lat_shape, dtype=self.dtype, device=self.device)
+
+            if it == 0:
+                self._rlog(f"it0 (a): {'STUDENT rollout START' if self.in_student else 'non-student -> straight to bcast wait'}")
+            # (a) student rollout under no_grad -> detached x0 + its x_t/timestep.
+            # Fix the rollout noise ONCE so the (e) with_grad recompute reproduces THIS x0
+            # (SD 5d90c6b): the DMD grad (fake-real) is computed on this x0, so (e) must
+            # recompute the same one.
+            _rollout_noise = None
+            if self.in_student:
+                _rollout_noise = torch.randn(self.lat_shape, dtype=self.dtype, device=self.device)
+                x0_det, x_t, tt, num_frame = self._student_rollout(it, cond, noise=_rollout_noise)
+                if it == 0:
+                    self._rlog("it0 (a): STUDENT rollout DONE")
+            else:
+                x0_det = x_t = tt = num_frame = None
+
+            # (b) broadcast x_t/t/x0/embeds to all
+            if self.in_student:
+                embeds = cond["prompt_embeds"]
+                x0_send = x0_det
+            else:
+                x_t = zeros_lat(); tt = torch.zeros((1, self.num_training_frames), dtype=torch.int64, device=self.device)
+                embeds = torch.zeros(emb_shape, dtype=self.dtype, device=self.device); x0_send = zeros_lat()
+            if it == 0:
+                self._rlog("it0 (b): ENTER world bcast x_t (all 16 ranks must arrive)")
+            x_t = self._bcast(x_t, self.ssrc)
+            tt = self._bcast(tt.to(torch.int64), self.ssrc)
+            embeds = self._bcast(embeds, self.ssrc)
+            x0_send = self._bcast(x0_send, self.ssrc)
+            if it == 0:
+                self._rlog("it0 (b): bcasts DONE")
+            condb = {"prompt_embeds": embeds}
+            neg = self.neg_embed.to(device=self.device, dtype=self.dtype).repeat(x_t.shape[0], 1, 1)
+            uncondb = {"prompt_embeds": neg}
+
+            # (c) teacher scores x_t -> real_pred (CFG)
+            if it == 0 and self.in_teacher:
+                self._rlog("it0 (c): TEACHER score START [first call -> 14B NKI-attn COMPILE, SLOW]")
+            real_pred = zeros_lat()
+            if self.in_teacher:
+                with torch.no_grad():
+                    _, real_cond = self.real_score(noisy_image_or_video=x_t, conditional_dict=condb, timestep=tt)
+                    _, real_unc = self.real_score(noisy_image_or_video=x_t, conditional_dict=uncondb, timestep=tt)
+                    real_pred = real_cond + (real_cond - real_unc) * self.guidance_scale
+                if it == 0:
+                    self._rlog("it0 (c): TEACHER score DONE")
+            real_pred = self._bcast(real_pred, self.tsrc)
+
+            # (d) critic scores x_t -> fake_pred
+            if it == 0 and self.in_fake:
+                self._rlog("it0 (d): CRITIC score START [first call -> 1.3B compile]")
+            fake_pred = zeros_lat()
+            if self.in_fake:
+                with torch.no_grad():
+                    _, fake_pred = self.fake_score(noisy_image_or_video=x_t, conditional_dict=condb, timestep=tt)
+                if it == 0:
+                    self._rlog("it0 (d): CRITIC score DONE")
+            fake_pred = self._bcast(fake_pred, self.fsrc)
+            if it == 0:
+                self._rlog("it0 (c/d): scores broadcast DONE -> entering (e) student DMD update")
+
+            # (e) student DMD update — recompute forward WITH grad
+            dmdnorm = float("nan")
+            do_g = (it >= self.warmup) and (it % self.dfake_gen_update_ratio == 0)
+            if self.in_student and do_g:
+                self._gstep_probe(it, "e0: before with_grad rollout")
+                # SD 5d90c6b: recompute with the SAME fixed noise as (a) so x0_grad == x0_det.
+                x0_grad, _, _, _ = self._student_rollout(it, cond, with_grad=True, noise=_rollout_noise)
+                self._gstep_probe(it, "e1: after with_grad rollout")
+                grad = (fake_pred - real_pred)
+                normalizer = torch.abs(x0_grad - real_pred).mean(
+                    dim=list(range(1, x0_grad.dim())), keepdim=True)
+                grad = torch.nan_to_num(grad / (normalizer + 1e-8))
+                dmdnorm = float(torch.mean(torch.abs(grad)).detach())
+                target = (x0_grad - grad).detach()
+                if self._g_since_step == 0:
+                    self.opt_g.zero_grad(set_to_none=True)
+                loss_g = 0.5 * F.mse_loss(x0_grad.double(), target.double()) / self.grad_accum
+                self._gstep_probe(it, "e2: before backward")
+                loss_g.backward()
+                self._gstep_probe(it, "e3: after backward")
+                self._g_since_step += 1
+                if self._g_since_step >= self.grad_accum:
+                    # FSDP2 fully_shard modules have NO .clip_grad_norm_ method (that is
+                    # FSDP1). Clip the params directly (SD path); DTensor grads clip correctly.
+                    gn = float(torch.nn.utils.clip_grad_norm_(
+                        [p for p in self.generator.parameters() if p.requires_grad], 10.0))
+                    if gn != gn or gn == float("inf"):
+                        self._log(f"  [grad] it {it}: NON-FINITE grad_norm={gn} -> SKIP step")
+                    else:
+                        self.opt_g.step()
+                        if self.my_rank == self.ssrc:
+                            print(f"[grad] it {it}: grad_norm={gn:.6e}", flush=True)
+                        # EMA update AFTER a real optimizer step (upstream: start at
+                        # ema_start_step, w=0.99). Kept on the LOCAL sharded params (cheap,
+                        # no gather per step); materialized to full only at save time.
+                        self._ema_update(it)
+                    self._g_since_step = 0
+                    # FREE THE GRADS NOW, not at the next G-step. The probe showed .grad
+                    # (full fp32 grads on every student param) + FSDP backward buffers
+                    # persist from this G-step through the following critic-only iters and
+                    # only cleared at the NEXT G-step's zero_grad -> +10GB retained across
+                    # G-steps -> OOM. set_to_none=True actually releases the tensors.
+                    self.opt_g.zero_grad(set_to_none=True)
+                self._gstep_probe(it, "e4: after opt.step+zero_grad")
+                del grad, target, x0_grad, loss_g
+                # STRUCTURAL free of the G-step rollout graph, RIGHT HERE (SD 5d90c6b free
+                # sequence), not deferred to end-of-iter. memtop proved the with_grad
+                # rollout's 30-block activations + KV cache (1,3600,1536)/(1,7200,12,128)
+                # stay pinned per G-step. The pipeline holds the KV cache it built during
+                # the grad rollout; null it + its cross/kv2 + force gc + neuron.synchronize
+                # BEFORE the next allocation so the graph actually releases.
+                if self.pipeline is not None:
+                    self.pipeline.kv_cache_clean = None
+                    self.pipeline.crossattn_cache = None
+                    self.pipeline.kv_cache2 = None
+                gc.collect()
+                if hasattr(torch, "neuron") and hasattr(torch.neuron, "synchronize"):
+                    try:
+                        torch.neuron.synchronize()
+                    except Exception:
+                        pass
+                self._gstep_probe(it, "e6: after pipeline-cache null + gc + sync")
+
+            # (f) critic diffusion (flow) update on x0_send
+            lf = float("nan")
+            if self.in_fake:
+                bb, nf = x0_send.shape[0], x0_send.shape[1]
+                tf = self._sample_timestep(bb, nf)
+                noise_f = torch.randn_like(x0_send)
+                xtf = self.scheduler_fake.add_noise(
+                    x0_send.flatten(0, 1), noise_f.flatten(0, 1), tf.flatten(0, 1)
+                ).unflatten(0, (bb, nf))
+                flow_pred, _ = self.fake_score(noisy_image_or_video=xtf, conditional_dict=condb, timestep=tf)
+                # flow-matching target: noise - x0 (velocity)
+                flow_tgt = (noise_f - x0_send)
+                loss_f = F.mse_loss(flow_pred.float(), flow_tgt.float())
+                self.opt_f.zero_grad(set_to_none=True)
+                loss_f.backward()
+                fn = float(self.fake_score.clip_grad_norm_(10.0))
+                if fn != fn or fn == float("inf"):
+                    self._log(f"  [grad] it {it}: NON-FINITE critic grad_norm={fn} -> SKIP step")
+                    self.opt_f.zero_grad(set_to_none=True)
+                else:
+                    self.opt_f.step()
+                lf = float(loss_f.detach())
+                del flow_pred, flow_tgt, loss_f, xtf, noise_f
+
+            # logging
+            if self.in_student and dmdnorm == dmdnorm:
+                self._dmdnorm_hist.append(dmdnorm)
+                if len(self._dmdnorm_hist) > 50:
+                    self._dmdnorm_hist.pop(0)
+            if self.my_rank == self.ssrc:
+                avg = sum(self._dmdnorm_hist) / len(self._dmdnorm_hist) if self._dmdnorm_hist else float("nan")
+                phase = "warmup" if it < self.warmup else ("G-step" if do_g else "critic-only")
+                print(f"it {it}/{self.iters} [{phase}] dmdnorm={dmdnorm:.4f} dmdnorm_avg50={avg:.4f}", flush=True)
+            if self.my_rank == self.fsrc:
+                print(f"it {it}/{self.iters}  loss_fake={lf:.4f}", flush=True)
+
+            self.step = it
+
+            # PER-ITER DEVICE-MEM PROBE (SD e9fc1d2 discipline: MEASURE creep vs peak, don't
+            # guess). Only student src rank, only early iters, to avoid spam. Tensors was
+            # 22.4GB resident at the iter-15 OOM. If dev_MB GROWS each G-step (10,15,20,25)
+            # -> creep (structural). If FLAT-high -> the resident grad-rollout graph peak
+            # (SD 5d90c6b two-forward territory).
+            if self.my_rank == self.ssrc and it <= 18:
+                import gc as _gc
+                from collections import Counter as _Counter
+                n = mb = 0
+                shape_mb = _Counter(); shape_ct = _Counter(); grad_ct = 0
+                for o in _gc.get_objects():
+                    try:
+                        if torch.is_tensor(o) and o.device.type == "neuron":
+                            n += 1
+                            _mb = o.numel() * o.element_size() / 1e6
+                            mb += _mb
+                            key = f"{tuple(o.shape)}:{o.dtype}"
+                            shape_mb[key] += _mb; shape_ct[key] += 1
+                            if o.requires_grad or o.grad_fn is not None:
+                                grad_ct += 1
+                    except Exception:
+                        pass
+                print(f"[dbg memprobe it{it}] dev_tensors={n} dev_MB={mb:.0f} do_g={do_g} grad_tensors={grad_ct}", flush=True)
+                # On the iters right after a G-step (11,16), dump the top retained tensor
+                # shapes by total MB — this NAMES what is leaking instead of guessing.
+                if it in (9, 11, 16):
+                    top = shape_mb.most_common(12)
+                    for k, v in top:
+                        print(f"[dbg memtop it{it}] {v:8.0f} MB  x{shape_ct[k]:4d}  {k}", flush=True)
+
+            if it > 0 and it % self.save_every == 0:
+                self._save_ckpt(it)
+
+            # free per-iter graph/tensors before the next iter allocates
+            x0_det = x_t = real_pred = fake_pred = x0_send = None
+            # THE per-G-step leak (memprobe: +8GB/945 tensors each G-step, NOT freed by
+            # grad_accum=1). The pipeline's _initialize_kv_cache allocates a FRESH KV cache
+            # every rollout and stores it on self.pipeline.kv_cache_clean/crossattn_cache.
+            # During the with-grad G-step, that cache is written INSIDE the autograd graph,
+            # so the persistent pipeline refs PIN the whole grad graph -> del x0_grad/loss_g
+            # can't free it. SD nulls student.kv_cache1/crossattn_cache/shared_buffers each
+            # iter for exactly this. Null RF's pipeline caches too.
+            if self.in_student and self.pipeline is not None:
+                self.pipeline.kv_cache_clean = None
+                self.pipeline.crossattn_cache = None
+                self.pipeline.kv_cache2 = None
+            gc.collect()
+            if hasattr(torch, "neuron") and hasattr(torch.neuron, "synchronize"):
+                try:
+                    torch.neuron.synchronize()
+                except Exception:
+                    pass
+
+        self._save_ckpt(self.iters)
+        self._log("done.")
+
+    def _student_rollout(self, it, cond, with_grad=False, noise=None):
+        """Run the RF rollout on the student group. Returns (x0, x_t, tt, num_frame).
+        no_grad by default; with_grad=True rebuilds the graph for the single backward.
+        SD 5d90c6b: the (a) no_grad and (e) with_grad rollouts MUST reuse the SAME noise
+        so the recompute reproduces the same x0 the teacher/critic scored — else the DMD
+        gradient (fake-real, computed on the (a) x0) is applied to a DIFFERENT (e) x0."""
+        if noise is None:
+            noise = torch.randn(self.lat_shape, dtype=self.dtype, device=self.device)
+        ctx = torch.enable_grad() if with_grad else torch.no_grad()
+        if it == 0:
+            self._rlog(f"  rollout it0: inference_with_self_forcing START (with_grad={with_grad}) "
+                       f"[first call -> DiT+NKI COMPILE, minutes]")
+        with ctx:
+            out, _, _ = self.pipeline.inference_with_self_forcing(noise=noise, **cond)
+        if it == 0:
+            self._rlog("  rollout it0: inference_with_self_forcing DONE")
+        # out: [B, F, C, H, W] x0 prediction (last-21 handled inside for >21; here ==21)
+        x0 = out
+        num_frame = x0.shape[1]
+        b = x0.shape[0]
+        tt = self._sample_timestep(b, num_frame)
+        if with_grad:
+            return x0, None, None, num_frame
+        # build x_t from detached x0 for the scorers
+        x0d = x0.detach()
+        noise_t = torch.randn_like(x0d)
+        x_t = self.scheduler.add_noise(
+            x0d.flatten(0, 1), noise_t.flatten(0, 1), tt.flatten(0, 1)
+        ).unflatten(0, (b, num_frame))
+        return x0d, x_t, tt, num_frame
+
+    def _ema_update(self, it):
+        # Maintain an exponential moving average of the generator weights (upstream
+        # ema_weight/ema_start_step). Only the student ranks hold generator params.
+        # Kept as fp32 clones of each param's LOCAL shard, updated in-place per G-step
+        # (cheap, no cross-rank gather) — materialized to full only in _save_ckpt.
+        if not self.in_student or it < self.ema_start_step:
+            return
+        w = self.ema_weight
+        if self._ema_state is None:
+            # lazy-init from the current weights at ema_start_step (upstream: EMA begins
+            # tracking here, so the average is over the CONVERGED-region oscillation, not
+            # the noisy warmup/descent).
+            self._ema_state = {}
+            for name, p in self.generator.named_parameters():
+                self._ema_state[name] = p.detach().float().clone()
+            if self.my_rank == self.ssrc:
+                print(f"[ema] init at it {it} (w={w}, {len(self._ema_state)} params)", flush=True)
+            return
+        for name, p in self.generator.named_parameters():
+            e = self._ema_state.get(name)
+            if e is None:
+                self._ema_state[name] = p.detach().float().clone()
+            else:
+                e.mul_(w).add_(p.detach().float(), alpha=1.0 - w)
+
+    def _save_ckpt(self, it):
+        # FSDP2 (fully_shard) student: gather the full state_dict via
+        # get_model_state_dict(full_state_dict=True, cpu_offload=True) (SD save_ckpt path),
+        # NOT FSDP1 fsdp_state_dict. Fallback materializes DTensor shards to full tensors.
+        if not self.in_student:
+            if dist.is_initialized():
+                dist.barrier()
+            return
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+        from torch.distributed.tensor import DTensor
+        full = get_model_state_dict(
+            self.generator, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+        if len(full) == 0:
+            raw = self.generator.state_dict()
+            full = {}
+            for k, v in raw.items():
+                if isinstance(v, DTensor):
+                    v = v.full_tensor()
+                full[k] = v.detach().to("cpu")
+        # Materialize the EMA to FULL tensors the same way (each EMA entry mirrors a
+        # generator param's sharding, so full_tensor() gathers it). All student ranks must
+        # participate in full_tensor() collectives; only ssrc keeps the result.
+        ema_full = {}
+        if self._ema_state is not None:
+            for name, e in self._ema_state.items():
+                v = e.full_tensor() if isinstance(e, DTensor) else e
+                ema_full[name] = v.detach().to("cpu")
+        if dist.is_initialized():
+            dist.barrier()
+        if self.my_rank == self.ssrc:
+            def _clean(k):
+                return (k.replace("_fsdp_wrapped_module.", "").replace("_checkpoint_wrapped_module.", "")
+                        .replace("_orig_mod.", "").replace("_checkpoint_wrapped_module", ""))
+            payload = {"generator": {_clean(k): v for k, v in full.items()}, "distill_iter": it}
+            if ema_full:
+                payload["generator_ema"] = {_clean(k): v for k, v in ema_full.items()}
+            out = os.path.join(self.output_path, f"model.iter{it}.pt")
+            torch.save(payload, out)
+            _ema_n = len(payload.get("generator_ema", {}))
+            print(f"[ckpt] wrote {out} ({len(payload['generator'])} tensors, "
+                  f"generator_ema={_ema_n} tensors)", flush=True)
+            if self.mirror_dir:
+                # SYNCHRONOUS copy-then-delete (was Popen/async — that raced: the slow 11GB
+                # S3-FUSE cp couldn't keep up, so local copies STACKED to 113GB -> node
+                # ephemeral-storage eviction after ~24h). Blocking here guarantees only ONE
+                # checkpoint is on local disk at a time: write to fast local `out`, cp to the
+                # PVC, delete local, THEN return. Only ssrc runs this (others passed the
+                # barrier above), so it just adds a brief per-save stall, no deadlock.
+                import subprocess
+                dst = os.path.join(self.mirror_dir, os.path.basename(out))
+                rc = subprocess.run(
+                    ["bash", "-c", f"mkdir -p '{self.mirror_dir}' && cp '{out}' '{dst}' && rm -f '{out}'"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+                if rc.returncode == 0:
+                    print(f"[ckpt] mirrored -> {dst} (local copy freed)", flush=True)
+                else:
+                    print(f"[ckpt] WARN mirror cp failed rc={rc.returncode}; local {out} kept", flush=True)
