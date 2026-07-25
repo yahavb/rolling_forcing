@@ -81,7 +81,7 @@ spec:
               test -f "$WAN13_TAR" || { echo "MISSING $WAN13_TAR on PVC"; exit 1; }
               mkdir -p wan_models && tar xf "$WAN13_TAR" -C wan_models/
 
-              CONFIG="${CONFIG:-../configs/rolling_forcing_dmd_t5.yaml}"
+              CONFIG="${CONFIG:-../configs/rolling_forcing_dmd_distill.yaml}"
               cd training
               for d in prompts checkpoints wan_models; do ln -sfn ../$d ./$d; done
 
@@ -117,7 +117,7 @@ spec:
             - name: BRANCH
               value: "rf-distill-trn3-pin-neuronx"
             - name: CONFIG
-              value: "../configs/rolling_forcing_dmd_t5.yaml"
+              value: "../configs/rolling_forcing_dmd_distill.yaml"
             - name: SEED
               value: "0"
             # - name: EMA

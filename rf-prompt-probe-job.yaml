@@ -113,7 +113,7 @@ spec:
               fi
               PROMPT_FILE=$(python3 -c "from omegaconf import OmegaConf; import os; \
                 b=OmegaConf.load('configs/default_config.yaml'); \
-                c=OmegaConf.merge(b, OmegaConf.load('configs/rolling_forcing_dmd_t5.yaml')); \
+                c=OmegaConf.merge(b, OmegaConf.load('configs/rolling_forcing_dmd_distill.yaml')); \
                 print(c.data_path)")
               test -f "$PROMPT_FILE" || { echo "PROMPT FILE MISSING: $PROMPT_FILE"; exit 1; }
               echo "Weights + prompts ready: $(wc -l < "$PROMPT_FILE") prompt(s) from $PROMPT_FILE"
@@ -165,7 +165,7 @@ spec:
                 python3 -c "
               from omegaconf import OmegaConf
               b=OmegaConf.load('../configs/default_config.yaml')
-              c=OmegaConf.merge(b, OmegaConf.load('../configs/rolling_forcing_dmd_t5.yaml'))
+              c=OmegaConf.merge(b, OmegaConf.load('../configs/rolling_forcing_dmd_distill.yaml'))
               c.data_path='${PF}'
               c.iters=${PROBE_ITERS}
               c.save_every=10**9          # never checkpoint (probe only)
@@ -232,7 +232,7 @@ spec:
             # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
             - name: NPROC
               value: "16"            # all 16 NeuronCores (2 chips x 8, LNC=1)
-            # denoising_step_list (T=4) lives in configs/rolling_forcing_dmd_t5.yaml.
+            # denoising_step_list (T=4) lives in configs/rolling_forcing_dmd_distill.yaml.
             # Everything else (lr 1.5e-6 / lr_critic 4e-7 / dfake_gen_update_ratio 5 /
             # guidance_scale 3.0 / ema 0.99 from step 200 / batch 1-per-rank) is in that config.
             # ── Neuron runtime (mirrors this repo's inference jobs). NO NEURON_LOGICAL_NC_CONFIG. ──

@@ -14,7 +14,7 @@ arg. Run it from cwd=training/ so that `configs/default_config.yaml` and a
 
 Usage (from training/):
   python3 precompute_embeds.py \
-    --config_path ../configs/rolling_forcing_dmd_t5.yaml \
+    --config_path ../configs/rolling_forcing_dmd_distill.yaml \
     --out /tmp/embeds.pt
 
 Output (torch.save):

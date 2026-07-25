@@ -116,7 +116,7 @@ spec:
               fi
               PROMPT_FILE=$(python3 -c "from omegaconf import OmegaConf; import os; \
                 b=OmegaConf.load('configs/default_config.yaml'); \
-                c=OmegaConf.merge(b, OmegaConf.load('configs/rolling_forcing_dmd_t5.yaml')); \
+                c=OmegaConf.merge(b, OmegaConf.load('configs/rolling_forcing_dmd_distill.yaml')); \
                 print(c.data_path)")
               test -f "$PROMPT_FILE" || { echo "PROMPT FILE MISSING: $PROMPT_FILE"; exit 1; }
               echo "Weights + prompts ready: $(wc -l < "$PROMPT_FILE") prompt(s) from $PROMPT_FILE"
@@ -157,7 +157,7 @@ spec:
 
               # ─── DMD distillation train ───
               # torchrun over all 16 ranks. Training entrypoint is the vendored training/train.py.
-              # Config = T=5 (configs/rolling_forcing_dmd_t5.yaml): the 5-entry denoising_step_list
+              # Config = T=5 (configs/rolling_forcing_dmd_distill.yaml): the 5-entry denoising_step_list
               # [1000,800,600,400,200] — the proven-fast serving point (T<=4 hits the ~5 fps cliff).
               export PRECOMPUTED_EMBEDS="$EMB"
               torchrun \
@@ -212,7 +212,7 @@ spec:
             # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
             - name: NPROC
               value: "20"            # BISECTION: teacher8+student8+fake4
-            # denoising_step_list (T=5) lives in configs/rolling_forcing_dmd_t5.yaml.
+            # denoising_step_list (T=5) lives in configs/rolling_forcing_dmd_distill.yaml.
             # Everything else (lr 1.5e-6 / lr_critic 4e-7 / dfake_gen_update_ratio 5 /
             # guidance_scale 3.0 / ema 0.99 from step 200 / batch 1-per-rank) is in that config.
             # ── Neuron runtime (mirrors this repo's inference jobs). NO NEURON_LOGICAL_NC_CONFIG. ──
