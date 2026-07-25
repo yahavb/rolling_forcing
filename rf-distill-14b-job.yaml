@@ -18,8 +18,11 @@ spec:
           resourceClaimTemplateName: xl-lnc2
       containers:
         - name: rf-distill
-          #image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
-          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          # Match the WORKING 1.3B job (main:rf-distill-job.yaml): the concourse image
+          # predates SDK 2.31 / torch-neuronx 1417, which is what wedges the 14B FSDP2
+          # student shard (docs/FSDP2_TRN3_WEDGE.md). SDK-2.31 native image commented below.
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          #image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash
