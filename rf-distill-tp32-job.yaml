@@ -18,7 +18,7 @@ spec:
           resourceClaimTemplateName: xl-lnc2
       containers:
         - name: rf-distill
-          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          image: 048894428923.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-private:private-torch-neuronx-main-20260720-030850-88263232684
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash
