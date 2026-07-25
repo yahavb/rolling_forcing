@@ -196,7 +196,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "main"
+              value: "rf-distill-fsdp2-fix"
             # THREE-GROUP placement (SD's proven co-residency fix): teacher on ranks 0-3,
             # student 4-7, critic 8-11 (tp_degree=4), ranks 12-15 idle-but-lockstep. Each
             # core holds ONE model instead of all three (11.2GB) -> the rollout's ~1.5GB

@@ -201,7 +201,8 @@ class Trainer:
             # FSDP2 fully_shard (SD 5d90c6b) — reshard_after_forward=True frees the DMD
             # G-step backward graph that FSDP1 retained (+10GB/G-step -> OOM). Student only.
             self.generator = fsdp2_wrap_student(
-                self.generator, self.groups["student_ranks"], _WAN_BLOCKS)
+                self.generator, self.groups["student_ranks"], _WAN_BLOCKS,
+                student_pg=self.groups["student_pg"])
             self._rlog("student: FSDP2 fully_shard DONE")
             self.opt_g = torch.optim.AdamW(
                 [p for p in self.generator.parameters() if p.requires_grad],
