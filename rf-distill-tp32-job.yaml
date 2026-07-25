@@ -180,13 +180,13 @@ spec:
             claims:
               - name: neurons
             requests:
-              cpu: 50
-              memory: 500Gi
-              ephemeral-storage: 500Gi
+              cpu: 100
+              memory: 1000Gi
+              ephemeral-storage: 1000Gi
             limits:
-              cpu: 50
-              memory: 500Gi
-              ephemeral-storage: 500Gi
+              cpu: 100
+              memory: 1000Gi
+              ephemeral-storage: 1000Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
