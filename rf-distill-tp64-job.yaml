@@ -179,14 +179,17 @@ spec:
           resources:
             claims:
               - name: neurons
+            # Whole node (xxl-lnc2 = all 16 devices). Node -189 allocatable: ~191 cpu,
+            # ~1998Gi mem, ~1842Gi ephemeral. Sized near-full with headroom for system
+            # daemonsets (fluent-bit/aws-node/kube-proxy/s3-csi).
             requests:
-              cpu: 50
-              memory: 500Gi
-              ephemeral-storage: 500Gi
+              cpu: 180
+              memory: 1900Gi
+              ephemeral-storage: 1700Gi
             limits:
-              cpu: 50
-              memory: 500Gi
-              ephemeral-storage: 500Gi
+              cpu: 180
+              memory: 1900Gi
+              ephemeral-storage: 1700Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
