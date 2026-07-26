@@ -57,16 +57,17 @@ beta1_critic: 0.0
 beta2_critic: 0.999
 # ── three-group flat trainer (distillation_3group.py) knobs ──
 tp_degree: 4                                       # legacy default; per-group tp below overrides
-# 32-core LNC2 (HALF node, xl-lnc2). Same three-group DMD as the world=64 config but
-# squeezed onto 32 ranks. The 14B STUDENT is the memory-dominant net (trainable:
-# weights+grads+Adam+rollout activations) so it gets the most ranks to shard thinnest;
-# the frozen 14B teacher needs >=8 (tp4 OOMs — full activations per rank); the critic is
-# only 1.3B so 4 ranks is plenty (1.3B bf16/4 ~3.5GB/core). teacher8+student20+fake4=32.
-# NOTE: student_tp 32->20 ~doubles the 14B student's static state to ~12.6GB/core (vs
-# ~7.9 at 32); the first G-step backward is the OOM watch point on this layout.
+# 32-core LNC2 (HALF node, xl-lnc2). Same three-group DMD as the world=64 config, on 32.
+# HARD NEURON CONSTRAINT: every group_size MUST DIVIDE world_size (the backend tiles the
+# world into contiguous replica groups; group not dividing world -> "Cannot create global
+# replica groups: world_size (32) not divisible by group_size (N)"). Divisors of 32 are
+# {1,2,4,8,16,32}. The frozen 14B teacher needs >=8 (tp4 OOMs), so teacher in {8,16}; that
+# caps the STUDENT at 16 (next divisor 32 is too big). Only valid near-balanced split:
+# teacher8 + student16 + fake8 = 32. (student_tp 32->16 ~doubles the 14B student's static
+# state to ~15.8GB/core vs ~7.9 at 32 -> the first G-step backward is the OOM watch point.)
 teacher_tp: 8
-student_tp: 20
-fake_tp: 4
+student_tp: 16
+fake_tp: 8
 iters: 10000                                       # SD long-run recipe (gentle lr + grad-accum)
 save_every: 200
 warmup: 10                                         # critic-only iters before G updates (critic leads)
