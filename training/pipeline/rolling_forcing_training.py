@@ -24,8 +24,11 @@ class RollingForcingTrainingPipeline:
         if self.denoising_step_list[-1] == 0:
             self.denoising_step_list = self.denoising_step_list[:-1]  # remove the zero timestep for inference
 
-        # Wan specific hyperparameters
-        self.num_transformer_blocks = 30
+        # Wan specific hyperparameters. DERIVE block count from the ACTUAL generator model
+        # instead of hardcoding 30 (the 1.3B value). The 14B student has 40 blocks; a
+        # hardcoded 30 would allocate/iterate the wrong number of KV-cache entries. Mirrors
+        # the resolution derivation in _sync_frame_seq_length.
+        self.num_transformer_blocks = len(self.generator.model.blocks)
         # frame_seq_length is DERIVED from the actual latent resolution at rollout
         # time (see _sync_frame_seq_length), NOT hardcoded. Hardcoding 1560 (480x832)
         # while training at 480x640 (1200) over-allocated the KV cache
@@ -493,10 +496,16 @@ class RollingForcingTrainingPipeline:
         """
         kv_cache_clean = []
 
+        # DERIVE (num_heads, head_dim) from the actual generator model, not hardcoded 12/128
+        # (the 1.3B values). The 14B student has 40 heads (dim 5120), so a hardcoded 12
+        # mismatches the model's Q/K/V at the in-place cache write ("expanded size (12) must
+        # match existing size (40)"). head_dim is 128 for both, but derive it too for safety.
+        n_heads = self.generator.model.num_heads
+        head_dim = self.generator.model.dim // n_heads
         for _ in range(self.num_transformer_blocks):
             kv_cache_clean.append({
-                "k": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, self.kv_cache_size, n_heads, head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, self.kv_cache_size, n_heads, head_dim], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
             })
@@ -509,10 +518,13 @@ class RollingForcingTrainingPipeline:
         """
         crossattn_cache = []
 
+        # Same head derivation as _initialize_kv_cache (14B: 40 heads, not the 1.3B 12).
+        n_heads = self.generator.model.num_heads
+        head_dim = self.generator.model.dim // n_heads
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, 512, n_heads, head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, 512, n_heads, head_dim], dtype=dtype, device=device),
                 "is_init": False
             })
         self.crossattn_cache = crossattn_cache
