@@ -55,16 +55,21 @@ tp_degree: 4                                       # ranks per group: teacher 0-
 iters: 10000                                       # SD long-run recipe (gentle lr + grad-accum)
 save_every: 200
 warmup: 10                                         # critic-only iters before G updates (critic leads)
-grad_accum: 1                                      # step+zero_grad EVERY G-step (was 4).
-                                                   # PROVEN by the memprobe: dev_MB jumps 19GB->34GB
-                                                   # at the first G-step (it10) and STAYS at 39GB
-                                                   # through it11-14 — the G-step grad buffers are
-                                                   # NOT freed because with accum=4, zero_grad/step
-                                                   # only fire every 4th G-step (first at it25). The
-                                                   # 2nd G-step (it15) stacks another ~20GB -> OOM.
-                                                   # accum=1 frees the grads each G-step so they can't
-                                                   # stack. (Effective batch drops 4->1; revisit for
-                                                   # final quality, but PoC needs it to survive first.)
+grad_accum: 4                                      # RECIPE FIX (2026-07, DISTILL_DIVERGENCE_ROOTCAUSE):
+                                                   # restore upstream effective batch. grad_accum=1 was
+                                                   # the PRIME divergence cause — the render sweep showed
+                                                   # quality DEGRADES with training (iter200 best -> iter4000
+                                                   # noise) while dmdnorm_avg50 stayed flat ~0.5 and hid it.
+                                                   # DMD's critic/generator balance is tuned for batch=4;
+                                                   # at batch=1 the gradient is too noisy, the critic can't
+                                                   # track the generator, the pair diverges. The batch=1
+                                                   # dodge was for the 14B G-step OOM — the 1.3B (student=4
+                                                   # here) is expected to afford batch=4. MEMORY WATCH: the
+                                                   # old comment measured a stacking-grad OOM at accum=4
+                                                   # (grads freed only every 4th G-step). If it OOMs on this
+                                                   # world=16/student=4 layout, lever = more student ranks or
+                                                   # fewer num_training_frames. 14B still needs a real memory
+                                                   # fix before it can take accum=4 (do NOT copy this there yet).
 data_path: prompts/distill_poc_single.txt         # PROOF-OF-CONCEPT: single prompt (example 000,
                                                   # the western/horse shot). Data-free DMD; a student
                                                   # specialized to ONE prompt tolerates fewer steps
@@ -87,8 +92,11 @@ batch_size: 1
 # full gather happens only at save time via full_tensor() -> CPU (same as `generator`).
 # So the "full unsharded fp32 never co-resides on-device" rule still holds; cost is only
 # ~1.3GB/rank of sharded fp32 state. Watch the it<=18 memprobe for creep.
-# ema_weight=0.999: slightly longer averaging window than upstream's 0.99.
-ema_weight: 0.999
+# RECIPE FIX (2026-07): ema_weight 0.999 -> 0.99 (match upstream good recipe).
+# 0.999 is a 10x LONGER averaging window (NOT "slightly longer" as the old comment
+# claimed) — by late iters the EMA had averaged in thousands of DEGRADING raw weights,
+# baking the divergence into the shipped EMA. See DISTILL_DIVERGENCE_ROOTCAUSE.md.
+ema_weight: 0.99
 ema_start_step: 200
 total_batch_size: 64
 log_iters: 100
