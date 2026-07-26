@@ -151,7 +151,7 @@ spec:
               ls -ld prompts checkpoints wan_models
               EMB=/tmp/embeds.pt
               python3 precompute_embeds.py \
-                --config_path ../configs/rolling_forcing_dmd_tp32.yaml \
+                --config_path ../configs/rolling_forcing_dmd_14b_tp32.yaml \
                 --out "$EMB" \
                 || { echo "EMBEDS PRECOMPUTE FAILED"; exit 1; }
 
@@ -165,7 +165,7 @@ spec:
                 --rdzv_backend=c10d \
                 --rdzv_endpoint "${MASTER_ADDR:-127.0.0.1}:${MASTER_PORT:-29500}" \
                 train.py \
-                --config_path ../configs/rolling_forcing_dmd_tp32.yaml \
+                --config_path ../configs/rolling_forcing_dmd_14b_tp32.yaml \
                 --logdir "$RUN" \
                 --disable-wandb \
                 --no_visualize \
