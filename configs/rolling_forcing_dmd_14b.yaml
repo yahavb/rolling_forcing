@@ -66,16 +66,16 @@ fake_tp: 16
 iters: 10000                                       # SD long-run recipe (gentle lr + grad-accum)
 save_every: 200
 warmup: 10                                         # critic-only iters before G updates (critic leads)
-grad_accum: 1                                      # step+zero_grad EVERY G-step (was 4).
-                                                   # PROVEN by the memprobe: dev_MB jumps 19GB->34GB
-                                                   # at the first G-step (it10) and STAYS at 39GB
-                                                   # through it11-14 — the G-step grad buffers are
-                                                   # NOT freed because with accum=4, zero_grad/step
-                                                   # only fire every 4th G-step (first at it25). The
-                                                   # 2nd G-step (it15) stacks another ~20GB -> OOM.
-                                                   # accum=1 frees the grads each G-step so they can't
-                                                   # stack. (Effective batch drops 4->1; revisit for
-                                                   # final quality, but PoC needs it to survive first.)
+grad_accum: 4                                      # RECIPE FIX: match upstream effective batch.
+                                                   # grad_accum=1 diverges (proven on the 1.3B: the
+                                                   # render was blurry until grad_accum 1->4 made it
+                                                   # visibly better — DISTILL_DIVERGENCE_ROOTCAUSE).
+                                                   # This is world=64 / student_tp=32 (full node), which
+                                                   # gives the HBM headroom the world=32/student=16 run
+                                                   # lacked — accum=4 stacks grads across 4 G-steps, so
+                                                   # it needs the thinner per-rank shard to fit. WATCH the
+                                                   # it<=25 memprobe: the 2nd G-step (it15) is where the
+                                                   # accum=4 grad-stacking OOM'd the tighter layout.
 data_path: prompts/distill_poc_prompt003.txt      # 14B on prompt_003 (boxing-kangaroo gym).
                                                   # Chosen over prompt_000: 003 has the smaller DMD
                                                   # distribution gap (dmdnorm_avg50 ~0.30 vs ~0.50 at
@@ -96,8 +96,9 @@ batch_size: 1
 # full gather happens only at save time via full_tensor() -> CPU (same as `generator`).
 # So the "full unsharded fp32 never co-resides on-device" rule still holds; cost is only
 # ~1.3GB/rank of sharded fp32 state. Watch the it<=18 memprobe for creep.
-# ema_weight=0.999: slightly longer averaging window than upstream's 0.99.
-ema_weight: 0.999
+# RECIPE FIX: ema_weight 0.999 -> 0.99 (match upstream). 0.999 is a 10x longer window
+# that bakes degrading late weights into the EMA (see DISTILL_DIVERGENCE_ROOTCAUSE).
+ema_weight: 0.99
 ema_start_step: 200
 total_batch_size: 64
 log_iters: 100
