@@ -176,12 +176,17 @@ spec:
           resources:
             claims:
               - name: xxl-trn2
+            # WHOLE NODE (ip-192-168-192-189 allocatable: 191 cpu / ~1998Gi mem /
+            # ~1842Gi ephemeral). Sized near-full with headroom for system daemonsets
+            # (fluent-bit/aws-node/kube-proxy/s3-csi).
             requests:
-              cpu: 190
-              memory: 1900Gi
+              cpu: 188
+              memory: 1950Gi
+              ephemeral-storage: 1750Gi
             limits:
-              cpu: 190
-              memory: 1900Gi
+              cpu: 188
+              memory: 1950Gi
+              ephemeral-storage: 1750Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
