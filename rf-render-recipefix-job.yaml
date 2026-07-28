@@ -1,40 +1,6 @@
-# Rolling Forcing — Neuron 3-run benchmark, TP4 x CP4 (16 ranks)
-#
-# Runs ONE topology: TP=4 x CP=4 = 16 ranks on m-lnc1-trn2 (2 chips x 8 cores, LNC=1).
-# tp_degree is pinned at 4 (Wan2.1-1.3B has 12 heads; only 4 divides them and is a legal
-# collective group); the other axis is CP=4 (context parallel). Runs at 480x640
-# (latent_w=80, frame_seqlen=1200) so every F*frame_seqlen is divisible by 16.
-#   - CP query path : each rank gathers Q over the attn-tp group only and RoPEs just its
-#                     own shard (never materializes the full Q). K/V still gather the full
-#                     KV window. This is the CP code on branch cp-impl (== main HEAD).
-#   - Entry    : e2e_pipeline.py (T5 -> DiT -> VAE fused). Emits per-stage "T5: <N> ms" +
-#                per-block "block N: DiT.. VAE.. <fps> fps" and tflops_report.json.
-#   - Profiler : native torch_neuronx NeuronProfiler (PROFILE_E2E_PIPELINE=1) + per-NEFF
-#                neuron-profile CLI.
-#
-# Model under test:
-#   - DiT base : Wan-AI/Wan2.1-T2V-1.3B  (T5 encoder + VAE decoder)
-#   - DiT ckpt : TencentARC/RollingForcing -> checkpoints/rolling_forcing_dmd.pt (default study ckpt)
-#   - Runtime  : TP-4 x CP-4 (16 NeuronCores, LNC=1), bf16, eager + NKI kernels
-#   - Shape    : num_output_frames=21, chunk-size=3, fps=16, latent 60x80 (480x640)
-#
-# Mandatory 3-run methodology (ONE pod):
-#   [1/3] WARMUP  : compile-if-cold / load NEFFs (not timed)
-#   [2/3] CLEAN   : NO profiler -> per-block fps + tflops_report.json (REAL latency)
-#   [3/3] PROFILED: native Neuron profiler on -> NEFF+NTFF pairs -> per-NEFF engine shares
-#
-# Launch:
-#   kubectl delete job rf-tp4cp4 --ignore-not-found
-#   kubectl apply -f rf-tp4cp4-job.yaml
-#   kubectl logs -f job/rf-tp4cp4
 apiVersion: batch/v1
 kind: Job
 metadata:
-  # Renders one T=5 distilled checkpoint (ITER env selects 1000 vs 1200). Run the two
-  # A/B renders by overriding name+ITER at apply time, e.g.:
-  #   kubectl create job rf-render-1200 --from-cronjob=... NO — use:
-  #   sed 's/RENDER_ITER/1200/' then apply, OR set ITER env + a unique name per run.
-  # Simplest: edit ITER (env below) + this name, apply, wait, repeat for the other.
   name: rf-render-recipefix
   namespace: default
 spec:
@@ -46,14 +12,14 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        node-type: trn2
+        node-type: trn3-dev1
       resourceClaims:
         # 16 NeuronCores (2 chips x 8, LNC=1) for the TP4xCP4 16-rank run.
-        - name: m-lnc1-trn2
-          resourceClaimTemplateName: m-lnc1-trn2
+        - name: neurons
+          resourceClaimTemplateName: m-lnc1
       containers:
         - name: bench
-          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          image: 048894428923.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-private:private-torch-neuronx-main-20260720-030850-88263232684
           imagePullPolicy: IfNotPresent
           command:
             - /bin/bash
@@ -336,7 +302,7 @@ spec:
 
               echo "════════════ NEURON 3-RUN BENCHMARK (Rolling Forcing) ════════════"
               echo "  model    : Wan2.1-T2V-1.3B + RollingForcing DMD ckpt, TP4xCP4 (16 cores), bf16, 21 frames"
-              echo "  topology : TP=4 x CP=4 = 16 ranks (m-lnc1-trn2 claim), 480x640 / frame_seqlen 1200"
+              echo "  topology : TP=4 x CP=4 = 16 ranks (m-lnc1 claim), 480x640 / frame_seqlen 1200"
               echo "=================================================================="
 
               echo "=== [1/3] WARMUP (compile-if-cold / load NEFFs; not timed) ==="
@@ -494,17 +460,13 @@ spec:
               echo "═══════════════════════════════════════════"
           resources:
             claims:
-              - name: m-lnc1-trn2
-            # Sized to fit the tighter node (ip-...-107-10: ~82Gi mem / ~48 vCPU free).
-            # RF's host-memory footprint is small — weights live in Neuron HBM, not host
-            # RAM — so the old 256Gi request only ever fit the roomier node. 64Gi limit
-            # minus the 24Gi memory-backed /dev/shm leaves ~40Gi for the process.
+              - name: neurons
             requests:
-              cpu: 70
-              memory: 640Gi
+              cpu: 50
+              memory: 500Gi
             limits:
-              cpu: 70
-              memory: 640Gi
+              cpu: 50
+              memory: 500Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -518,7 +480,7 @@ spec:
             # Bump to ~1000-1200 once the p003 distill (nrsbx) has trained that far, to match
             # the iter the 000-ckpt was rendered at for a fair 003-vs-000 A/B.
             - name: ITER
-              value: "1000"
+              value: "3400"
             - name: BRANCH
               value: "main"
             # main runs TP4xCP4 WITH ring attention (RF_RING=1) — the validated 14fps path.
