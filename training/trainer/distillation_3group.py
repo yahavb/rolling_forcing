@@ -767,3 +767,38 @@ class Trainer:
                     print(f"[ckpt] mirrored -> {dst} (local copy freed)", flush=True)
                 else:
                     print(f"[ckpt] WARN mirror cp failed rc={rc.returncode}; local {out} kept", flush=True)
+                # ── ROTATION + DISK TELEMETRY (2026-07-29 eviction fix) ──────────────
+                # The 14B run was EVICTED after 2d: "Pod ephemeral local storage usage
+                # exceeds the total limit of containers 1800Gi". The cp&&rm above frees
+                # the local ckpt ONLY when the cp SUCCEEDS — on any failure the local
+                # copy is kept by design, and at 14B each full-state save is ~56GB, so a
+                # handful of failed mirrors fills the disk. Belt-and-braces:
+                #   1) keep at most CKPT_KEEP_LOCAL (default 1) model.iter*.pt locally
+                #   2) PRINT the real /tmp consumers every save, so the NEXT eviction is
+                #      diagnosable from the log instead of guesswork (we could not tell
+                #      whether it was ckpts, the never-pruned NEFF cache, or the
+                #      extracted wan_models tars).
+                try:
+                    import glob as _glob
+                    keep = int(os.environ.get("CKPT_KEEP_LOCAL", "1"))
+                    local_ckpts = sorted(
+                        _glob.glob(os.path.join(self.output_path, "model.iter*.pt")),
+                        key=lambda p: os.path.getmtime(p))
+                    for old in local_ckpts[:max(0, len(local_ckpts) - keep)]:
+                        sz = os.path.getsize(old) / 1e9
+                        os.remove(old)
+                        print(f"[ckpt] rotated OUT local {os.path.basename(old)} "
+                              f"({sz:.1f}GB freed; keep={keep})", flush=True)
+                except Exception as e:
+                    print(f"[ckpt] rotation skipped: {e}", flush=True)
+                try:
+                    du = subprocess.run(
+                        ["bash", "-c",
+                         "df -h /tmp | tail -1; "
+                         "du -sh /tmp/neff_cache /tmp/REPO/wan_models "
+                         f"'{self.output_path}' 2>/dev/null | sort -h"],
+                        capture_output=True, text=True, timeout=120).stdout.strip()
+                    for ln in du.splitlines():
+                        print(f"[disk] {ln}", flush=True)
+                except Exception as e:
+                    print(f"[disk] probe skipped: {e}", flush=True)

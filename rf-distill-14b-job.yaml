@@ -143,6 +143,21 @@ spec:
 
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
 
+              # ─── DISK BUDGET (2026-07-29: this job was EVICTED at 2d02h — "Pod ephemeral
+              # local storage usage exceeds the total limit of containers 1800Gi") ───
+              # /tmp IS the ephemeral storage the limit counts. Three consumers:
+              #   1) checkpoints (~56GB each at 14B) — the trainer cp's to $FINAL then rm's
+              #      the local copy ONLY on cp success; now also ROTATED to CKPT_KEEP_LOCAL.
+              #   2) /tmp/neff_cache — never pruned, and 14B compiles many graphs.
+              #   3) /tmp/REPO/wan_models — extracted 1.3B + 14B weights (~30GB), one-time.
+              # The trainer prints a [disk] df/du breakdown at EVERY save, so the next
+              # eviction is diagnosable from the log instead of guessed at.
+              echo "=== disk budget at start (ephemeral limit 1800Gi) ==="
+              df -h /tmp | tail -1
+              du -sh /tmp/neff_cache /tmp/REPO/wan_models 2>/dev/null | sort -h || true
+              # Drop the staging tars once wan_models/ is extracted (re-fetchable from PVC).
+              rm -f /tmp/w13.tar /tmp/w14.tar 2>/dev/null || true
+
               # ─── PRECOMPUTE T5 prompt embeds ONCE (CPU, 1 proc) — no T5 in training ───
               # Frees ~9.6GB HBM by removing the T5 encoder (and its FSDP wrap/collective)
               # from the 16-rank training job, leaving room for the frozen 14B teacher.
@@ -201,8 +216,11 @@ spec:
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
+            # rf-distill-fsdp2-fix is already merged to main and served its purpose; the
+            # next merge target is rf-sharpness-metric, so the 14B run validates the
+            # sharpness monitor + ckpt rotation together with the 14B student.
             - name: BRANCH
-              value: "rf-distill-fsdp2-fix"
+              value: "rf-sharpness-metric"
             # Max local (in-pod) model.iter*.pt kept at once — bounds the ephemeral-storage
             # term that got this job EVICTED at 2d02h ("Pod ephemeral local storage usage
             # exceeds the total limit of containers 1800Gi"). The PVC copy is the archive;
