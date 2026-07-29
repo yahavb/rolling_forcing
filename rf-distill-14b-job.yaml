@@ -203,6 +203,16 @@ spec:
               value: "1"
             - name: BRANCH
               value: "rf-distill-fsdp2-fix"
+            # Max local (in-pod) model.iter*.pt kept at once — bounds the ephemeral-storage
+            # term that got this job EVICTED at 2d02h ("Pod ephemeral local storage usage
+            # exceeds the total limit of containers 1800Gi"). The PVC copy is the archive;
+            # local is only the staging area for the S3 cp. The trainer's cp&&rm frees the
+            # local file ONLY when the cp succeeds, so without this a few failed mirrors
+            # accumulate ~56GB each at 14B. Cross-check: main's 1.3B job has byte-identical
+            # disk handling and survives 2d23h -- it just has 500Gi/11GB (45 ckpts of
+            # headroom) vs 14B's 1750Gi/56GB (31), so the same leak kills 14B first.
+            - name: CKPT_KEEP_LOCAL
+              value: "1"
             - name: DISTILL_THREE_GROUP
               value: "1"
             # Functional (out-of-place, single-block) self-attn on the STUDENT grad rollout
