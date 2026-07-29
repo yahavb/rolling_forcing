@@ -134,6 +134,25 @@ spec:
 
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
 
+              # ─── DISK BUDGET (2026-07-29: this job was EVICTED after 2d — "Pod ephemeral
+              # local storage usage exceeds the total limit of containers 1800Gi") ───
+              # Everything below lives in the pod's EPHEMERAL storage (/tmp), which is what
+              # the 1800Gi limit counts. The three consumers:
+              #   1) checkpoints  — the trainer cp's each save to $FINAL then rm's the local
+              #      copy, but ONLY if the cp succeeded; a failed mirror keeps it. At 14B a
+              #      full-state save is ~56GB, so a few failures fill the disk. The trainer
+              #      now also ROTATES local ckpts to CKPT_KEEP_LOCAL (env below).
+              #   2) /tmp/neff_cache — NEVER pruned and the 14B compiles many graphs.
+              #   3) /tmp/REPO/wan_models — the extracted 1.3B + 14B weights (~30GB), one-time.
+              # The trainer prints a [disk] df/du breakdown at every save so the next
+              # eviction is diagnosable from the log rather than guessed at.
+              echo "=== disk budget at start (limit 1800Gi ephemeral) ==="
+              df -h /tmp | tail -1
+              du -sh /tmp/neff_cache /tmp/REPO/wan_models 2>/dev/null | sort -h || true
+              # Drop the model TARS after extraction — they are re-downloadable from the PVC
+              # and only waste local disk once wan_models/ exists.
+              rm -f /tmp/w13.tar /tmp/w14.tar 2>/dev/null || true
+
               # ─── PRECOMPUTE T5 prompt embeds ONCE (CPU, 1 proc) — no T5 in training ───
               # Frees ~9.6GB HBM by removing the T5 encoder (and its FSDP wrap/collective)
               # from the 16-rank training job, leaving room for the frozen 14B teacher.
@@ -197,6 +216,11 @@ spec:
               value: "1"
             - name: BRANCH
               value: "rf-distill-fsdp2-fix"
+            # Max local (in-pod) model.iter*.pt kept at once. The PVC copy is the
+            # archive; local is just the staging area for the S3 cp. 1 = keep only the
+            # newest. Raise ONLY if you need a local fallback when the mirror cp fails.
+            - name: CKPT_KEEP_LOCAL
+              value: "1"
             # THREE-GROUP placement (SD's proven co-residency fix): each core holds ONE
             # model instead of all three. 64-core LNC2 layout (config teacher_tp/student_tp/
             # fake_tp = 16/32/16): teacher ranks 0-15, student 16-47, critic 48-63. Student
