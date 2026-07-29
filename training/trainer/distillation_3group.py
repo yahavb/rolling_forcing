@@ -165,7 +165,7 @@ class Trainer:
         # running a fixed 10000 iters past the peak.
         self.sharp_patience = int(os.environ.get("SHARP_PATIENCE", "0"))
         self.sharp_min_delta = float(os.environ.get("SHARP_MIN_DELTA", "0.0"))
-        self._sharp_hist = []       # (it, raw, ema) every sharp_every iters
+        self._sharp_hist = []       # (it, raw, ema, best, best_it, stale) per check
         self._sharp_ema = None
         self._sharp_best = float("-inf")
         self._sharp_best_it = -1
@@ -212,26 +212,38 @@ class Trainer:
             return False
         self._sharp_ema = raw if self._sharp_ema is None else 0.9 * self._sharp_ema + 0.1 * raw
         ema = self._sharp_ema
-        self._sharp_hist.append((it, raw, ema))
         improved = ema > self._sharp_best + self.sharp_min_delta
         if improved:
             self._sharp_best, self._sharp_best_it, self._sharp_stale = ema, it, 0
         else:
             self._sharp_stale += 1
+        # record best/stale AS OF THIS CHECK so the csv keeps real history per row
+        self._sharp_hist.append((it, raw, ema, self._sharp_best,
+                                 self._sharp_best_it, self._sharp_stale))
         if self.my_rank == self.ssrc:
             print(f"[sharp] it {it}: sharpness={raw:.5f} ema={ema:.5f} "
                   f"best={self._sharp_best:.5f}@it{self._sharp_best_it} "
                   f"stale={self._sharp_stale}{' IMPROVED' if improved else ''}", flush=True)
             if self.sharp_csv:
+                # /var/mdl is S3-FUSE: an S3 object CANNOT be appended to (open(...,"a")
+                # succeeds on create then fails EPERM on the 2nd write). So build the WHOLE
+                # csv locally and OVERWRITE the PVC copy each time (S3 supports full-object
+                # PUT). Local write is the source of truth; the PVC copy is the readable
+                # mirror. Failures here are logged and IGNORED — never kill training for a
+                # metrics write.
                 try:
-                    new = not os.path.exists(self.sharp_csv)
-                    with open(self.sharp_csv, "a") as fh:
-                        if new:
-                            fh.write("iter,sharpness,ema,best,best_iter,stale\n")
-                        fh.write(f"{it},{raw:.6f},{ema:.6f},{self._sharp_best:.6f},"
-                                 f"{self._sharp_best_it},{self._sharp_stale}\n")
+                    hdr = "iter,sharpness,ema,best,best_iter,stale\n"
+                    body = "".join(
+                        f"{i},{r:.6f},{e:.6f},{b:.6f},{bi},{st}\n"
+                        for (i, r, e, b, bi, st) in self._sharp_hist)
+                    local = os.path.join("/tmp", os.path.basename(self.sharp_csv))
+                    with open(local, "w") as fh:
+                        fh.write(hdr + body)
+                    if os.path.dirname(self.sharp_csv) not in ("", "/tmp"):
+                        import shutil
+                        shutil.copyfile(local, self.sharp_csv)   # full overwrite, S3-safe
                 except Exception as e:
-                    print(f"[sharp] csv write failed: {e}", flush=True)
+                    print(f"[sharp] csv write failed (metric still in log): {e}", flush=True)
         if self.sharp_patience > 0 and self._sharp_stale >= self.sharp_patience:
             self._log(f"[sharp] EARLY STOP at it {it}: no EMA improvement > "
                       f"{self.sharp_min_delta} for {self._sharp_stale} checks "
