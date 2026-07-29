@@ -14,7 +14,6 @@ spec:
       nodeSelector:
         node-type: trn3-dev1
       resourceClaims:
-        # 16 NeuronCores (2 chips x 8, LNC=1) for the TP4xCP4 16-rank run.
         - name: neurons
           resourceClaimTemplateName: m-lnc1
       containers:
@@ -406,6 +405,69 @@ spec:
                 echo "  ACC: skipped — REF exists=$([[ -f $REF ]] && echo yes || echo no), GEN=$GEN" | tee "$LOCAL_RESULTS/accuracy.txt"
               fi
 
+              # ─── SHARPNESS: no-reference quality metric, one row per checkpoint ───
+              # Variance of the 3x3 Laplacian, averaged over every frame of every prompt.
+              # Blur -> LOW, sharp -> HIGH. This is the ONLY metric validated against
+              # human ranking of three renders of prompt_000 (2026-07-28):
+              #   reference(perfect) 321.9  >  iter1000(blurry) 40.0  >  iter3400(worse) 28.4
+              # Two other candidates were TESTED AND REJECTED on that same data because
+              # they inverted the human ranking: FFT high-freq ratio (0.4851 vs 0.4865)
+              # and mean inter-frame abs diff (3.325 vs 3.441 — it tracks MOTION, not
+              # quality: the perfect video scores "worst" because it moves more).
+              # Appends to ONE csv on the PVC so successive ITER runs build the curve
+              # that decides "still improving" vs "peaked and degrading".
+              echo "=== SHARPNESS (Laplacian variance; higher = sharper) ==="
+              cat > /tmp/sharpness.py <<'PYSHARP'
+              import glob, os, sys
+              try:
+                  import av, numpy as np
+              except Exception as e:
+                  print(f"  SHARP: cannot import av/numpy ({e}) — skipped"); sys.exit(0)
+
+              def lap_var(f):
+                  # 3x3 Laplacian on a float32 luma plane; .var() over interior pixels
+                  lap = (-4.0 * f[1:-1, 1:-1]
+                         + f[:-2, 1:-1] + f[2:, 1:-1]
+                         + f[1:-1, :-2] + f[1:-1, 2:])
+                  return float(lap.var())
+
+              def video_sharpness(mp4):
+                  c = av.open(mp4)
+                  vals = []
+                  for fr in c.decode(video=0):
+                      g = fr.to_ndarray(format="gray").astype(np.float32)
+                      vals.append(lap_var(g))
+                  c.close()
+                  return (float(np.mean(vals)), len(vals)) if vals else (float("nan"), 0)
+
+              outdir, iter_no, csv = sys.argv[1], sys.argv[2], sys.argv[3]
+              rows = []
+              for mp4 in sorted(glob.glob(os.path.join(outdir, "*.mp4"))):
+                  s, n = video_sharpness(mp4)
+                  rows.append((os.path.basename(mp4), s, n))
+                  print(f"  {os.path.basename(mp4):24} frames={n:>3}  sharpness={s:8.1f}")
+              if not rows:
+                  print("  SHARP: no mp4 found"); sys.exit(0)
+              vals = [s for _, s, _ in rows if s == s]
+              mean_s = sum(vals) / len(vals) if vals else float("nan")
+              print(f"  MEAN over {len(vals)} prompt(s): sharpness={mean_s:.1f}")
+              # one append-only row per render: iter, mean, per-prompt values
+              newfile = not os.path.exists(csv)
+              with open(csv, "a") as fh:
+                  if newfile:
+                      fh.write("iter,mean_sharpness,n_prompts,per_prompt\n")
+                  per = ";".join(f"{n}={s:.1f}" for n, s, _ in rows)
+                  fh.write(f"{iter_no},{mean_s:.2f},{len(vals)},{per}\n")
+              print(f"  appended -> {csv}")
+              PYSHARP
+              # de-indent the heredoc (it was indented to match the YAML block)
+              sed -i 's/^              //' /tmp/sharpness.py
+              SHARP_CSV="/var/mdl/rolling-forcing/runs/sharpness_202607252050.csv"
+              python3 /tmp/sharpness.py "$LOCAL_RESULTS/clean_out" "$ITER" "$SHARP_CSV" \
+                2>&1 | tee "$LOCAL_RESULTS/sharpness.txt"
+              echo "--- sharpness curve so far (all renders of run 202607252050) ---"
+              cat "$SHARP_CSV" 2>/dev/null || true
+
               # ─── persist EVERYTHING to one timestamped run dir on /var/mdl (S3) ───
               # /var/mdl/rolling-forcing/runs/<ddmmyyHHMMSS>/
               #   frames/                  <- ALL generated mp4s (clean + profiled runs)
@@ -434,6 +496,7 @@ spec:
               cp "$LOCAL_RESULTS/profiled.txt"       "$OUT/" 2>/dev/null || true
               cp "$LOCAL_RESULTS/main_fps.txt"       "$OUT/" 2>/dev/null || true
               cp "$LOCAL_RESULTS/accuracy.txt"       "$OUT/" 2>/dev/null || true
+              cp "$LOCAL_RESULTS/sharpness.txt"      "$OUT/" 2>/dev/null || true
               # 3b) Neuron HBM breakdown tables (only exist if a run OOM'd) — the
               # per-category tensor/scratchpad/constant split that tells us the exact
               # culprit instead of inferring from overshoot deltas. Harmless if absent.
@@ -463,10 +526,10 @@ spec:
               - name: neurons
             requests:
               cpu: 50
-              memory: 500Gi
+              memory: 350Gi
             limits:
               cpu: 50
-              memory: 500Gi
+              memory: 350Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
