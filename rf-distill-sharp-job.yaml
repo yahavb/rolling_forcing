@@ -1,14 +1,14 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: rf-distill
+  name: rf-distill-sharp
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: rf-distill
+        app: rf-distill-sharp
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -34,7 +34,7 @@ spec:
               # ── PROVENANCE ──
               GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
               echo "┌── PROVENANCE ──"
-              echo "│ JOB    : rf-distill (T=5 DMD distillation)  pod=$(hostname)"
+              echo "│ JOB    : rf-distill-sharp (T=5 DMD distillation + sharpness monitor)  pod=$(hostname)"
               echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
               echo "│ commit : $GIT_SHA"
               echo "│ subject: $(git log -1 --pretty=%s)"
@@ -129,8 +129,8 @@ spec:
               # node ephemeral-storage eviction (Exit 137) after ~24h. Sync guarantees only ONE
               # 11GB ckpt on local disk at a time (write -> cp -> rm -> return).
               TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
-              RUN=/tmp/rf-distill/$TS; mkdir -p "$RUN"
-              FINAL=/var/mdl/rolling_forcing/distill/$TS; mkdir -p "$FINAL"
+              RUN=/tmp/rf-distill/sharp_$TS; mkdir -p "$RUN"
+              FINAL=/var/mdl/rolling_forcing/distill/sharp_$TS; mkdir -p "$FINAL"
               export CKPT_MIRROR_DIR="$FINAL"    # trainer sync-copies each ckpt here, frees local
               # ── SHARPNESS curve: written STRAIGHT to the PVC so it survives the pod and
               # is readable WHILE training runs (cat it any time; no kubectl logs grep).
@@ -183,7 +183,7 @@ spec:
               cd ..
 
               # ─── copy the local train.log to the PVC (ckpts are already there) ───
-              cp "/tmp/rf-distill/$TS/train.log" "$FINAL/train.log" 2>&1 || echo "train.log copy failed"
+              cp "$RUN/train.log" "$FINAL/train.log" 2>&1 || echo "train.log copy failed"
               echo "=== DONE. checkpoints under $FINAL/ (use the EMA weights: inference --use_ema) ==="
               ls -lhR "$FINAL" | head -60
           resources:
@@ -206,7 +206,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "main"
+              value: "rf-sharpness-metric"
             # THREE-GROUP placement (SD's proven co-residency fix): teacher on ranks 0-3,
             # student 4-7, critic 8-11 (tp_degree=4), ranks 12-15 idle-but-lockstep. Each
             # core holds ONE model instead of all three (11.2GB) -> the rollout's ~1.5GB

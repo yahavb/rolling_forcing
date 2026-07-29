@@ -1,21 +1,21 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: rf-distill
+  name: rf-distill-tp32-sharp
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: rf-distill
+        app: rf-distill-tp32-sharp
     spec:
       restartPolicy: Never
       nodeSelector:
         node-type: trn3-dev1
       resourceClaims:
         - name: neurons
-          resourceClaimTemplateName: l-lnc2
+          resourceClaimTemplateName: xl-lnc2
       containers:
         - name: rf-distill
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -116,7 +116,7 @@ spec:
               fi
               PROMPT_FILE=$(python3 -c "from omegaconf import OmegaConf; import os; \
                 b=OmegaConf.load('configs/default_config.yaml'); \
-                c=OmegaConf.merge(b, OmegaConf.load('configs/rolling_forcing_dmd_distill.yaml')); \
+                c=OmegaConf.merge(b, OmegaConf.load('configs/rolling_forcing_dmd_tp32.yaml')); \
                 print(c.data_path)")
               test -f "$PROMPT_FILE" || { echo "PROMPT FILE MISSING: $PROMPT_FILE"; exit 1; }
               echo "Weights + prompts ready: $(wc -l < "$PROMPT_FILE") prompt(s) from $PROMPT_FILE"
@@ -129,8 +129,8 @@ spec:
               # node ephemeral-storage eviction (Exit 137) after ~24h. Sync guarantees only ONE
               # 11GB ckpt on local disk at a time (write -> cp -> rm -> return).
               TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
-              RUN=/tmp/rf-distill/$TS; mkdir -p "$RUN"
-              FINAL=/var/mdl/rolling_forcing/distill/$TS; mkdir -p "$FINAL"
+              RUN=/tmp/rf-distill/tp32sharp_$TS; mkdir -p "$RUN"
+              FINAL=/var/mdl/rolling_forcing/distill/tp32sharp_$TS; mkdir -p "$FINAL"
               export CKPT_MIRROR_DIR="$FINAL"    # trainer sync-copies each ckpt here, frees local
               # ── SHARPNESS curve: written STRAIGHT to the PVC so it survives the pod and
               # is readable WHILE training runs (cat it any time; no kubectl logs grep).
@@ -161,13 +161,13 @@ spec:
               ls -ld prompts checkpoints wan_models
               EMB=/tmp/embeds.pt
               python3 precompute_embeds.py \
-                --config_path ../configs/rolling_forcing_dmd_distill.yaml \
+                --config_path ../configs/rolling_forcing_dmd_tp32.yaml \
                 --out "$EMB" \
                 || { echo "EMBEDS PRECOMPUTE FAILED"; exit 1; }
 
               # ─── DMD distillation train ───
               # torchrun over all 16 ranks. Training entrypoint is the vendored training/train.py.
-              # Config = T=5 (configs/rolling_forcing_dmd_distill.yaml): the 5-entry denoising_step_list
+              # Config = T=5 (configs/rolling_forcing_dmd_tp32.yaml): the 5-entry denoising_step_list
               # [1000,800,600,400,200] — the proven-fast serving point (T<=4 hits the ~5 fps cliff).
               export PRECOMPUTED_EMBEDS="$EMB"
               torchrun \
@@ -175,7 +175,7 @@ spec:
                 --rdzv_backend=c10d \
                 --rdzv_endpoint "${MASTER_ADDR:-127.0.0.1}:${MASTER_PORT:-29500}" \
                 train.py \
-                --config_path ../configs/rolling_forcing_dmd_distill.yaml \
+                --config_path ../configs/rolling_forcing_dmd_tp32.yaml \
                 --logdir "$RUN" \
                 --disable-wandb \
                 --no_visualize \
@@ -183,20 +183,20 @@ spec:
               cd ..
 
               # ─── copy the local train.log to the PVC (ckpts are already there) ───
-              cp "/tmp/rf-distill/$TS/train.log" "$FINAL/train.log" 2>&1 || echo "train.log copy failed"
+              cp "$RUN/train.log" "$FINAL/train.log" 2>&1 || echo "train.log copy failed"
               echo "=== DONE. checkpoints under $FINAL/ (use the EMA weights: inference --use_ema) ==="
               ls -lhR "$FINAL" | head -60
           resources:
             claims:
               - name: neurons
             requests:
-              cpu: 50
-              memory: 500Gi
-              ephemeral-storage: 500Gi
+              cpu: 100
+              memory: 1000Gi
+              ephemeral-storage: 1000Gi
             limits:
-              cpu: 50
-              memory: 500Gi
-              ephemeral-storage: 500Gi
+              cpu: 100
+              memory: 1000Gi
+              ephemeral-storage: 1000Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -206,7 +206,7 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: BRANCH
-              value: "main"
+              value: "rf-sharpness-metric"
             # THREE-GROUP placement (SD's proven co-residency fix): teacher on ranks 0-3,
             # student 4-7, critic 8-11 (tp_degree=4), ranks 12-15 idle-but-lockstep. Each
             # core holds ONE model instead of all three (11.2GB) -> the rollout's ~1.5GB
@@ -221,8 +221,8 @@ spec:
               value: "1"
             # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
             - name: NPROC
-              value: "16"            # all 16 NeuronCores (2 chips x 8, LNC=1)
-            # denoising_step_list (T=5) lives in configs/rolling_forcing_dmd_distill.yaml.
+              value: "32"            # HALF NODE: 32 NeuronCores (xl-lnc2)
+            # denoising_step_list (T=5) lives in configs/rolling_forcing_dmd_tp32.yaml.
             # Everything else (lr 1.5e-6 / lr_critic 4e-7 / dfake_gen_update_ratio 5 /
             # guidance_scale 3.0 / ema 0.99 from step 200 / batch 1-per-rank) is in that config.
             # ── SHARPNESS MONITOR: the convergence signal (dmdnorm/grad_norm only show

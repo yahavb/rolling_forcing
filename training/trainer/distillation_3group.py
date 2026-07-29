@@ -145,9 +145,100 @@ class Trainer:
         self.mirror_dir = os.environ.get("CKPT_MIRROR_DIR", "").strip()
         self.output_path = config.logdir
 
+        # ── LATENT SHARPNESS MONITOR (the convergence signal) ──────────────
+        # dmdnorm/grad_norm only prove "not diverging"; they went on looking healthy
+        # for 2 days while render quality DEGRADED (iter1000 -> iter3400). Sharpness
+        # is the quantity that tracked human ranking of three prompt_000 renders:
+        #   reference 321.9 > iter1000 40.0 > iter3400 28.4   (pixel Laplacian var)
+        # Measured 2026-07-28 on the SAME videos downsampled 8x to latent resolution,
+        # the ranking still holds (and separates BETTER when variance-normalized):
+        #   ds8_norm  0.40433 > 0.07993 > 0.03015     <- what we compute here
+        # So NO VAE decode is needed: we score the student's x0 latent directly.
+        # Two other candidates were rejected for INVERTING the human ranking:
+        # FFT high-freq ratio (0.4851 vs 0.4865) and inter-frame abs diff (3.325 vs
+        # 3.441 — that tracks MOTION, not quality).
+        self.sharp_every = int(os.environ.get("SHARP_EVERY", "20"))
+        self.sharp_csv = os.environ.get("SHARP_CSV", "").strip()
+        # early-stop: halt when the EMA-smoothed sharpness has not beaten its best
+        # by >SHARP_MIN_DELTA for SHARP_PATIENCE consecutive checkpoints. 0 = off
+        # (measure-only). This is what makes the job GOVERN its own loop instead of
+        # running a fixed 10000 iters past the peak.
+        self.sharp_patience = int(os.environ.get("SHARP_PATIENCE", "0"))
+        self.sharp_min_delta = float(os.environ.get("SHARP_MIN_DELTA", "0.0"))
+        self._sharp_hist = []       # (it, raw, ema) every sharp_every iters
+        self._sharp_ema = None
+        self._sharp_best = float("-inf")
+        self._sharp_best_it = -1
+        self._sharp_stale = 0       # consecutive checkpoints with no improvement
+
     def _log(self, msg):
         if self.is_main_process:
             print(msg, flush=True)
+
+    @staticmethod
+    def _lap_var_norm(lat):
+        """Variance-normalized 3x3 Laplacian variance of a latent, on-device.
+
+        lat: (B, F, C, H, W) or (B, F, H, W) student x0. Spatial dims are the last
+        two. Returns a single float: mean over batch/frame/channel of
+            var(Laplacian(x)) / var(x)
+        Normalizing by var(x) makes it contrast/scale independent, which matters
+        because the latent's absolute scale drifts over training (an unnormalized
+        rise could be "louder", not "sharper"). Higher = more high-frequency
+        detail = sharper. Blur -> low.
+        """
+        x = lat.detach().float()
+        if x.dim() < 4:
+            return float("nan")
+        x = x.reshape(-1, x.shape[-2], x.shape[-1])   # (N, H, W)
+        if x.shape[-1] < 3 or x.shape[-2] < 3:
+            return float("nan")
+        lap = (-4.0 * x[:, 1:-1, 1:-1]
+               + x[:, :-2, 1:-1] + x[:, 2:, 1:-1]
+               + x[:, 1:-1, :-2] + x[:, 1:-1, 2:])
+        num = lap.reshape(lap.shape[0], -1).var(dim=1)
+        den = x.reshape(x.shape[0], -1).var(dim=1) + 1e-8
+        return float((num / den).mean())
+
+    def _sharp_update(self, it, lat):
+        """Score this iter's x0 latent, EMA-smooth it, log, and track staleness.
+
+        Per-iteration sharpness is noisy (different prompt/noise each step), so the
+        stop decision uses an EMA, not the raw value. Returns True if training
+        should STOP (patience exhausted), else False.
+        """
+        raw = self._lap_var_norm(lat)
+        if raw != raw:                      # NaN -> ignore, never stop on a bad read
+            return False
+        self._sharp_ema = raw if self._sharp_ema is None else 0.9 * self._sharp_ema + 0.1 * raw
+        ema = self._sharp_ema
+        self._sharp_hist.append((it, raw, ema))
+        improved = ema > self._sharp_best + self.sharp_min_delta
+        if improved:
+            self._sharp_best, self._sharp_best_it, self._sharp_stale = ema, it, 0
+        else:
+            self._sharp_stale += 1
+        if self.my_rank == self.ssrc:
+            print(f"[sharp] it {it}: sharpness={raw:.5f} ema={ema:.5f} "
+                  f"best={self._sharp_best:.5f}@it{self._sharp_best_it} "
+                  f"stale={self._sharp_stale}{' IMPROVED' if improved else ''}", flush=True)
+            if self.sharp_csv:
+                try:
+                    new = not os.path.exists(self.sharp_csv)
+                    with open(self.sharp_csv, "a") as fh:
+                        if new:
+                            fh.write("iter,sharpness,ema,best,best_iter,stale\n")
+                        fh.write(f"{it},{raw:.6f},{ema:.6f},{self._sharp_best:.6f},"
+                                 f"{self._sharp_best_it},{self._sharp_stale}\n")
+                except Exception as e:
+                    print(f"[sharp] csv write failed: {e}", flush=True)
+        if self.sharp_patience > 0 and self._sharp_stale >= self.sharp_patience:
+            self._log(f"[sharp] EARLY STOP at it {it}: no EMA improvement > "
+                      f"{self.sharp_min_delta} for {self._sharp_stale} checks "
+                      f"(best {self._sharp_best:.5f} @ it {self._sharp_best_it}). "
+                      f"Peak checkpoint = model.iter{self._sharp_best_it}.pt (nearest save).")
+            return True
+        return False
 
     def _rlog(self, msg):
         # per-rank timestamped diagnostic (build/it0 markers). [dbg] tag = greppable.
@@ -489,8 +580,30 @@ class Trainer:
                     for k, v in top:
                         print(f"[dbg memtop it{it}] {v:8.0f} MB  x{shape_ct[k]:4d}  {k}", flush=True)
 
+            # ── SHARPNESS on the student's x0 latent (the convergence signal) ──
+            # Runs on x0_send (== x0_det on ssrc, already broadcast so it is a live
+            # tensor on every rank) BEFORE the frees below. The stop decision is made
+            # on ssrc and BROADCAST: all ranks must leave the loop on the same iter or
+            # the next collective deadlocks.
+            _stop = False
+            if self.sharp_every > 0 and it > 0 and it % self.sharp_every == 0:
+                if self.my_rank == self.ssrc:
+                    _stop = self._sharp_update(it, x0_send)
+                if dist.is_initialized():
+                    _f = torch.tensor([1.0 if _stop else 0.0], device=self.device)
+                    dist.broadcast(_f, src=self.ssrc)
+                    _stop = bool(_f.item() > 0.5)
+
             if it > 0 and it % self.save_every == 0:
                 self._save_ckpt(it)
+
+            if _stop:
+                # save the final state, then leave the loop on EVERY rank together
+                if it % self.save_every != 0:
+                    self._save_ckpt(it)
+                self._log(f"[sharp] stopping training at it {it} (peak was it "
+                          f"{self._sharp_best_it}); {len(self._sharp_hist)} sharpness samples")
+                break
 
             # free per-iter graph/tensors before the next iter allocates
             x0_det = x_t = real_pred = fake_pred = x0_send = None

@@ -12,10 +12,10 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        node-type: trn2
+        node-type: trn3-dev1
       resourceClaims:
-        - name: xxl-trn2
-          resourceClaimTemplateName: xxl-trn2
+        - name: neurons
+          resourceClaimTemplateName: xxl-lnc2
       containers:
         - name: rf-distill
           image: 048894428923.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-private:private-torch-neuronx-main-20260720-030850-88263232684
@@ -129,8 +129,17 @@ spec:
               RUN=/tmp/rf-distill/14b_prompt003_$TS; mkdir -p "$RUN"
               FINAL=/var/mdl/rolling_forcing/distill/14b_prompt003_$TS; mkdir -p "$FINAL"
               export CKPT_MIRROR_DIR="$FINAL"    # trainer sync-copies each ckpt here, frees local
+              # ── SHARPNESS curve: written STRAIGHT to the PVC so it survives the pod and
+              # is readable WHILE training runs. Same metric/env as rf-distill-job.yaml.
+              export SHARP_CSV="$FINAL/sharpness.csv"
               exec > >(tee "$RUN/train.log") 2>&1
               echo "RUN=$RUN  (local; each ckpt sync-copied to $FINAL then local freed)"
+              echo "SHARP: csv=$SHARP_CSV every=${SHARP_EVERY:-20} patience=${SHARP_PATIENCE:-0} min_delta=${SHARP_MIN_DELTA:-0.0}"
+              if [[ "${SHARP_PATIENCE:-0}" == "0" ]]; then
+                echo "SHARP: patience=0 -> MEASURE ONLY (job runs the full schedule; you decide when to stop)"
+              else
+                echo "SHARP: patience=${SHARP_PATIENCE} -> job SELF-STOPS when the sharpness EMA stops improving"
+              fi
 
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
 
@@ -175,18 +184,15 @@ spec:
               ls -lhR "$FINAL" | head -60
           resources:
             claims:
-              - name: xxl-trn2
-            # WHOLE NODE (ip-192-168-192-189 allocatable: 191 cpu / ~1998Gi mem /
-            # ~1842Gi ephemeral). Sized near-full with headroom for system daemonsets
-            # (fluent-bit/aws-node/kube-proxy/s3-csi).
+              - name: neurons
             requests:
               cpu: 188
-              memory: 1950Gi
-              ephemeral-storage: 1750Gi
+              memory: 1800Gi
+              ephemeral-storage: 1800Gi
             limits:
               cpu: 188
-              memory: 1950Gi
-              ephemeral-storage: 1750Gi
+              memory: 1800Gi
+              ephemeral-storage: 1800Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -197,11 +203,6 @@ spec:
               value: "1"
             - name: BRANCH
               value: "rf-distill-fsdp2-fix"
-            # THREE-GROUP placement (SD's proven co-residency fix): each core holds ONE
-            # model instead of all three. 64-core LNC2 layout (config teacher_tp/student_tp/
-            # fake_tp = 16/32/16): teacher ranks 0-15, student 16-47, critic 48-63. Student
-            # (trainable 14B) gets the most ranks to shard its weights+grads+Adam+activations
-            # thinnest. Selects trainer/distillation_3group.py.
             - name: DISTILL_THREE_GROUP
               value: "1"
             # Functional (out-of-place, single-block) self-attn on the STUDENT grad rollout
@@ -216,6 +217,16 @@ spec:
             # denoising_step_list (T=5) lives in configs/rolling_forcing_dmd_14b.yaml.
             # Everything else (lr 1.5e-6 / lr_critic 4e-7 / dfake_gen_update_ratio 5 /
             # guidance_scale 3.0 / ema 0.99 from step 200 / batch 1-per-rank) is in that config.
+            # ── SHARPNESS MONITOR (see rf-distill-job.yaml for the validation numbers).
+            # Scored on the student's x0 LATENT — no VAE, no render. Curve -> PVC csv.
+            # Sharpness is NOT comparable across student sizes/resolutions in absolute
+            # terms; compare each run against ITS OWN curve (rising vs falling).
+            - name: SHARP_EVERY
+              value: "20"
+            - name: SHARP_PATIENCE
+              value: "0"               # 0 = measure only; >0 = self-stop when EMA plateaus
+            - name: SHARP_MIN_DELTA
+              value: "0.0"
             # ── Neuron runtime (mirrors this repo's inference jobs). NO NEURON_LOGICAL_NC_CONFIG. ──
             - name: NEURON_FALLBACK_ENABLED
               value: "0"
