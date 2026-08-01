@@ -66,7 +66,17 @@ fake_tp: 16
 iters: 10000                                       # SD long-run recipe (gentle lr + grad-accum)
 save_every: 200
 warmup: 10                                         # critic-only iters before G updates (critic leads)
-grad_accum: 4                                      # RECIPE FIX: match upstream effective batch.
+grad_accum: 4                                      # ⚠ "match upstream effective batch" is FALSE — see
+                                                   # docs/DISTILL_REFERENCE_RECIPE.md §0-2. Upstream has NO
+                                                   # gradient accumulation and reaches batch 64 by DATA
+                                                   # PARALLELISM; with student_tp=32 of world 64 our
+                                                   # data-parallel width is 1, so this is effective batch 4,
+                                                   # ~16x under every shipped recipe. accum=64 would reach 64
+                                                   # at ~zero memory cost (one grad buffer regardless) but
+                                                   # 5x64=320 iters per optimizer step — rescale save_every
+                                                   # and SHARP_EVERY if you do it. Also: no published
+                                                   # 14B-STUDENT recipe exists at all.
+                                                   # ── original (partly wrong) note follows ──
                                                    # grad_accum=1 diverges (proven on the 1.3B: the
                                                    # render was blurry until grad_accum 1->4 made it
                                                    # visibly better — DISTILL_DIVERGENCE_ROOTCAUSE).

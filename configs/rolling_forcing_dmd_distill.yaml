@@ -55,7 +55,21 @@ tp_degree: 4                                       # ranks per group: teacher 0-
 iters: 10000                                       # SD long-run recipe (gentle lr + grad-accum)
 save_every: 200
 warmup: 10                                         # critic-only iters before G updates (critic leads)
-grad_accum: 4                                      # RECIPE FIX (2026-07, DISTILL_DIVERGENCE_ROOTCAUSE):
+grad_accum: 4                                      # ⚠ CORRECTION 2026-08-01, see docs/DISTILL_REFERENCE_RECIPE.md:
+                                                   # the claim below that accum=4 "restores upstream effective
+                                                   # batch" is FALSE. Upstream has NO gradient accumulation at
+                                                   # all (its trainer/distillation.py never reads
+                                                   # total_batch_size; only trainer/ode.py asserts accum is
+                                                   # ABSENT) and reaches batch 64 purely by DATA PARALLELISM.
+                                                   # Three-group placement gives the student its own rank
+                                                   # group, so our data-parallel width is 1 and effective
+                                                   # batch = batch_size x grad_accum = 4, ~16x under every
+                                                   # shipped recipe (Self-Forcing Table 3 = 64; RF yaml = 64;
+                                                   # LongLive = 64). `total_batch_size: 64` below is a NO-OP.
+                                                   # BUT: the rf-sharpness-metric run improved 5.2x at
+                                                   # effective batch 4, so batch is not the whole story —
+                                                   # render before changing this. See doc §8.
+                                                   # ── original (partly wrong) note follows ──
                                                    # restore upstream effective batch. grad_accum=1 was
                                                    # the PRIME divergence cause — the render sweep showed
                                                    # quality DEGRADES with training (iter200 best -> iter4000
