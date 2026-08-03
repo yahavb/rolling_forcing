@@ -211,8 +211,12 @@ spec:
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
+            # The pod CLONES this branch from GitHub — the local working tree is NOT used.
+            # Must be rf-distill-1.3b (the grad_accum=64 + cadence-fix commit); on `main`
+            # this job silently runs the OLD batch-4 recipe and looks like it worked.
+            # The branch has to be PUSHED before this resolves.
             - name: BRANCH
-              value: "main"
+              value: "rf-distill-1.3b"
             # THREE-GROUP placement (SD's proven co-residency fix): teacher on ranks 0-3,
             # student 4-7, critic 8-11 (tp_degree=4), ranks 12-15 idle-but-lockstep. Each
             # core holds ONE model instead of all three (11.2GB) -> the rollout's ~1.5GB
