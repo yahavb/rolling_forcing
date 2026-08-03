@@ -52,10 +52,60 @@ beta1_critic: 0.0
 beta2_critic: 0.999
 # ── three-group flat trainer (distillation_3group.py) knobs ──
 tp_degree: 4                                       # ranks per group: teacher 0-3, student 4-7, critic 8-11
-iters: 10000                                       # SD long-run recipe (gentle lr + grad-accum)
-save_every: 200
+# ── ITER UNITS (2026-08-02): `it` counts CRITIC steps, not weight updates. ──
+# distillation_3group.py:363 gates a G-step on `it % dfake_gen_update_ratio == 0` (=5) and
+# :382 gates the optimizer step on `_g_since_step >= grad_accum`. So:
+#     1 weight update = dfake_gen_update_ratio x grad_accum = 5 x 64 = 320 iters
+# EVERY iter-denominated cadence below (save_every, ema_start_step, iters, log_iters) is in
+# CRITIC-STEP units and must be a multiple of 320, or it fires between weight updates and
+# measures/saves identical weights (doc §7, the "cadence trap").
+iters: 192000                                      # = 600 weight updates x 320. Self-Forcing
+                                                   # converges in 600 UPDATES (Table 3); at accum
+                                                   # 64 that is 192k critic steps. The old 10000
+                                                   # = only 31 updates at accum 64 — too few to
+                                                   # converge at ANY batch.
+                                                   # ⚠ WALL-CLOCK: the sharp_202607300331 run did
+                                                   # it2605 in ~48-72h => 36-54 iters/h => 192000
+                                                   # iters is 150-220 DAYS. This ceiling is NOT
+                                                   # reachable and is set here only so the run
+                                                   # does not self-terminate early. YOU decide
+                                                   # when to stop it, off the ckpt renders.
+                                                   # Buying batch 64 with pure accumulation costs
+                                                   # 16x the wall-clock of batch 4 for the same
+                                                   # update count — Self-Forcing bought batch 64
+                                                   # with 64-WIDE data parallelism instead (§1).
+                                                   # The real fix is DP width, which this
+                                                   # three-group placement cannot give (§2).
+save_every: 1600                                   # = every 5 weight updates (was 200 = 0.6 of
+                                                   # an update: 1.6 ckpts per update, all of the
+                                                   # SAME weights). Measured rate ~36-54 iters/h
+                                                   # => a renderable ckpt every ~30-45h. This run
+                                                   # WILL be killed early (see grad_accum note),
+                                                   # so save often enough to have something to
+                                                   # render when you stop it.
 warmup: 10                                         # critic-only iters before G updates (critic leads)
-grad_accum: 4                                      # ⚠ CORRECTION 2026-08-01, see docs/DISTILL_REFERENCE_RECIPE.md:
+grad_accum: 64                                     # ── CHANGED 2026-08-02: 4 -> 64. ──
+                                                   # THE RENDER EVIDENCE that forced this: prompt_000
+                                                   # pixel sharpness is FLAT at ~40 across 2200 iters
+                                                   # (sharp_202607300331 iter400=43.4, iter2600=40.7)
+                                                   # and ~7.5x below the RELEASED reference (321.9).
+                                                   # Blur is present at the FIRST EMA ckpt -> not
+                                                   # undertraining. Effective batch = batch_size x
+                                                   # grad_accum = 64 now matches every shipped recipe.
+                                                   # NOTE doc §8 argues batch is "not the whole story"
+                                                   # because latent sharpness rose 5.2x at batch 4 —
+                                                   # but that 5.2x latent gain produced ZERO pixel gain,
+                                                   # so the latent metric did not transfer and §8's
+                                                   # inference does not survive the render. Batch is the
+                                                   # best-evidenced remaining lever (doc §1/§3).
+                                                   # STILL UNFIXED: the broken ode_init (doc §3b) —
+                                                   # thu-ml found a mathematical fallacy in it and doc
+                                                   # §3b warns "fixing our batch may NOT be sufficient".
+                                                   # MEMORY: accum only accumulates GRADS (one .backward
+                                                   # per G-step, freed at the step) — peak HBM is
+                                                   # unchanged from accum=4; only the step CADENCE moves.
+                                                   # ── superseded note follows ──
+                                                   # ⚠ CORRECTION 2026-08-01, see docs/DISTILL_REFERENCE_RECIPE.md:
                                                    # the claim below that accum=4 "restores upstream effective
                                                    # batch" is FALSE. Upstream has NO gradient accumulation at
                                                    # all (its trainer/distillation.py never reads
@@ -111,9 +161,18 @@ batch_size: 1
 # claimed) — by late iters the EMA had averaged in thousands of DEGRADING raw weights,
 # baking the divergence into the shipped EMA. See DISTILL_DIVERGENCE_ROOTCAUSE.md.
 ema_weight: 0.99
-ema_start_step: 200
-total_batch_size: 64
-log_iters: 100
+# CADENCE FIX 2026-08-02 (accum 4 -> 64): ema_start_step is compared against `it` (critic
+# steps) at distillation_3group.py:554, so at 320 iters/update the old 200 started EMA
+# BEFORE the first weight update ever landed — and every render since used an EMA whose
+# first sample was the ODE init. 320 = start at weight-update 1, the earliest honest point.
+# NOTE ema_weight 0.99 gives a ~100-UPDATE averaging window (1/(1-w)); at 320 iters/update
+# the EMA needs ~32k iters to be fully warmed, so early ckpts are thin-EMA by construction.
+ema_start_step: 320
+total_batch_size: 64                               # NO-OP: read only by trainer/ode.py:96-98 as
+                                                   # an assertion that accum is ABSENT; the DMD
+                                                   # trainer never reads it. Kept for provenance.
+log_iters: 100                                     # NO-OP for distillation_3group.py (grep: only
+                                                   # gan/diffusion/ode/distillation read it).
 negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
 dfake_gen_update_ratio: 5                          # generator updated once per 5 critic steps
 # Train at the resolution we DEPLOY (480x640, latent 60x80) — NOT the upstream

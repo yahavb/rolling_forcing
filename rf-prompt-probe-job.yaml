@@ -170,6 +170,12 @@ spec:
               c.iters=${PROBE_ITERS}
               c.save_every=10**9          # never checkpoint (probe only)
               c.ema_start_step=10**9      # no EMA state either
+              # PIN grad_accum for the probe (2026-08-02): the shared distill config moved to
+              # grad_accum=64, where ONE weight update costs 5x64=320 iters — a 60-iter probe
+              # would do ZERO optimizer steps and report a flat, meaningless dmdnorm. The probe
+              # ranks prompt DIFFICULTY, so it only needs frequent cheap steps, not a converging
+              # batch. 4 = the value this probe's published rankings were measured at.
+              c.grad_accum=4
               OmegaConf.save(c,'../configs/probe_${PIDX}.yaml')
               "
                 EMB=/tmp/embeds_${PIDX}.pt

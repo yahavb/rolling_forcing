@@ -128,12 +128,28 @@ spec:
               # async Popen). Async raced — the slow 11GB cp let local copies STACK to 113GB ->
               # node ephemeral-storage eviction (Exit 137) after ~24h. Sync guarantees only ONE
               # 11GB ckpt on local disk at a time (write -> cp -> rm -> return).
+              # Run tag carries the EXPERIMENT so ckpt dirs are self-describing on the PVC
+              # (bs64_<TS>) — this run is the effective-batch-64 test, not another batch-4 run.
               TS=$(TZ=America/Los_Angeles date +%Y%m%d%H%M)
-              RUN=/tmp/rf-distill/$TS; mkdir -p "$RUN"
-              FINAL=/var/mdl/rolling_forcing/distill/$TS; mkdir -p "$FINAL"
+              RUN_TAG="${RUN_TAG:-bs64}_$TS"
+              RUN=/tmp/rf-distill/$RUN_TAG; mkdir -p "$RUN"
+              FINAL=/var/mdl/rolling_forcing/distill/$RUN_TAG; mkdir -p "$FINAL"
               export CKPT_MIRROR_DIR="$FINAL"    # trainer sync-copies each ckpt here, frees local
               exec > >(tee "$RUN/train.log") 2>&1
               echo "RUN=$RUN  (local; each ckpt sync-copied to $FINAL then local freed)"
+              # ── EXPERIMENT BANNER: what changed and what stopping rule applies ──
+              echo "┌── EXPERIMENT: effective batch 4 -> 64 (grad_accum 64) ──"
+              echo "│ WHY   : prompt_000 sharpness FLAT ~40 over 2200 iters, 7.5x under the"
+              echo "│         released reference (321.9). Blur present at the FIRST EMA ckpt."
+              echo "│ UNITS : 1 weight update = dfake_gen_update_ratio(5) x grad_accum(64) = 320 iters"
+              echo "│ RATE  : ~36-54 iters/h measured => ~6-9h PER WEIGHT UPDATE"
+              echo "│ CKPT  : save_every=1600 = every 5 updates = a renderable ckpt per ~30-45h"
+              echo "│ STOP  : iters=192000 (600 updates) is 150-220 DAYS and NOT reachable."
+              echo "│         Render ckpts as they land; kill the job on the verdict."
+              echo "│ OPEN  : the broken ode_init (doc §3b) is NOT fixed here — thu-ml's"
+              echo "│         corrected causal init could not be located (HF 401). Batch may"
+              echo "│         not be sufficient on its own."
+              echo "└──────────"
 
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache; mkdir -p /tmp/neff_cache
 
@@ -173,7 +189,7 @@ spec:
               cd ..
 
               # ─── copy the local train.log to the PVC (ckpts are already there) ───
-              cp "/tmp/rf-distill/$TS/train.log" "$FINAL/train.log" 2>&1 || echo "train.log copy failed"
+              cp "$RUN/train.log" "$FINAL/train.log" 2>&1 || echo "train.log copy failed"
               echo "=== DONE. checkpoints under $FINAL/ (use the EMA weights: inference --use_ema) ==="
               ls -lhR "$FINAL" | head -60
           resources:
@@ -212,6 +228,10 @@ spec:
             # ── Training knobs (override per run). Defaults follow the upstream RF recipe. ──
             - name: NPROC
               value: "16"            # all 16 NeuronCores (2 chips x 8, LNC=1)
+            # Ckpt dir on the PVC becomes distill/<RUN_TAG>_<TS>. bs64 = the
+            # effective-batch-64 experiment (grad_accum 64 in the config).
+            - name: RUN_TAG
+              value: "bs64"
             # denoising_step_list (T=5) lives in configs/rolling_forcing_dmd_distill.yaml.
             # Everything else (lr 1.5e-6 / lr_critic 4e-7 / dfake_gen_update_ratio 5 /
             # guidance_scale 3.0 / ema 0.99 from step 200 / batch 1-per-rank) is in that config.
